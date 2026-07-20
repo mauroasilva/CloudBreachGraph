@@ -136,7 +136,8 @@ cloudbreachgraph --from-cache tests/fixtures --output-dir out/
 - `graph.dot` — Graphviz DOT: nodes colored/shaped by type, subnets and ENIs grouped
   inside their VPC via `subgraph cluster_*`, edges labeled by relationship (load-balancer
   attachment edges also show the `match_rule` that resolved them). ENI labels include
-  their `Private IP` and `Public IP` (when the ENI has an Elastic/public IP).
+  their `Private IP` and `Public IP` (when the ENI has an Elastic/public IP); any ENI with
+  a public IP is also linked to a generic `Internet` node to highlight internet exposure.
 - `graph.<fmt>` — only with `--render`; requires `dot`. If `dot` is absent the tool warns
   and still writes the `.dot`.
 

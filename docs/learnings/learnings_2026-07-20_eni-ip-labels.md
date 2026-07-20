@@ -16,6 +16,11 @@
 - `output/dot_export.py` — `_node_lines` now emits `Private IP: <ips>` and `Public IP: <ips>`
   lines on ENI labels (comma-joined when multiple). The ENI branch became a nested `if`
   block; the following `elif` chain for other node types is unchanged and still valid.
+- `output/dot_export.py` — `_dot_lines` now also draws a single generic top-level `Internet`
+  node (`doubleoctagon`, light-red fill) and connects every ENI that has a `public_ips`
+  attribute to it with a `public_ip`-labeled edge. **DOT-only** — the `Internet` node is
+  synthesized in the exporter, not a real graph `Node`, so it does **not** appear in
+  `graph.json`. If nothing is public, the node/edges are omitted entirely.
 - Fixture `tests/fixtures/ec2_describe-network-interfaces.json` — the first (instance-attached)
   ENI now carries an `Association` (interface-level) and a per-address `Association`, both
   with `PublicIp: 54.10.20.30`, so tests exercise the public-IP + de-dup path.
