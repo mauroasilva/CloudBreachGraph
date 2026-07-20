@@ -16,8 +16,20 @@
         "DeviceIndex": 0,
         "Status": "attached"
       },
+      "Association": {
+        "PublicIp": "54.10.20.30",
+        "PublicDnsName": "ec2-54-10-20-30.compute-1.amazonaws.com",
+        "IpOwnerId": "111111111111"
+      },
       "PrivateIpAddresses": [
-        {"PrivateIpAddress": "10.0.1.10", "Primary": true}
+        {
+          "PrivateIpAddress": "10.0.1.10",
+          "Primary": true,
+          "Association": {
+            "PublicIp": "54.10.20.30",
+            "IpOwnerId": "111111111111"
+          }
+        }
       ],
       "Groups": [{"GroupId": "sg-0aaa0001", "GroupName": "web"}]
     },

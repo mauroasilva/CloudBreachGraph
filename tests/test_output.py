@@ -87,6 +87,9 @@ def test_write_dot_wellformed(graph, tmp_path):
     # An ENI has no Name tag -> id only, no bracketed name.
     assert "eni-00instance0000001\\ninterface" in text
     assert "eni-00instance0000001 [" not in text
+    # ENI labels carry Private IP / Public IP sections.
+    assert "Private IP: 10.0.1.10" in text
+    assert "Public IP: 54.10.20.30" in text
     # Nodes colored by type (a couple of representative fills).
     assert 'fillcolor="#E8F5E9"' in text  # eni
     assert 'fillcolor="#E3F2FD"' in text  # subnet

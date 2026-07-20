@@ -34,6 +34,8 @@ def test_eni_from_collected_instance_attached():
     assert eni.interface_type == "interface"
     assert eni.attachment_instance_id == "i-0abc0000000000001"
     assert eni.private_ips == ["10.0.1.10"]
+    # Public IP is de-duplicated across the interface-level and per-address Associations.
+    assert eni.public_ips == ["54.10.20.30"]
     assert eni.security_groups == ["sg-0aaa0001"]
 
 
@@ -45,6 +47,8 @@ def test_eni_from_collected_service_managed_has_no_instance():
     # Service-managed ELB ENI: no InstanceId, description carries the ELB token.
     assert eni.attachment_instance_id is None
     assert eni.description == "ELB app/my-alb/50dc6c495c0c9188"
+    # No Association block -> no public IP.
+    assert eni.public_ips == []
 
 
 def test_ec2_instance_from_collected_uses_name_tag():

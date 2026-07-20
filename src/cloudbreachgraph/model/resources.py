@@ -42,6 +42,7 @@ class Eni:
     requester_managed: bool | None
     attachment_instance_id: str | None
     private_ips: list[str] = field(default_factory=list)
+    public_ips: list[str] = field(default_factory=list)
     security_groups: list[str] = field(default_factory=list)
 
     @classmethod
@@ -52,6 +53,19 @@ class Eni:
             for ip in d.get("PrivateIpAddresses", [])
             if ip.get("PrivateIpAddress")
         ]
+        # Public IPs come from the ``Association`` blocks: one per private IP that has an
+        # Elastic/public IP, plus the interface-level ``Association`` for the primary IP.
+        # De-duplicate while preserving first-seen order (an EIP appears both places).
+        public_ips: list[str] = []
+        for candidate in [
+            (d.get("Association") or {}).get("PublicIp"),
+            *(
+                (ip.get("Association") or {}).get("PublicIp")
+                for ip in d.get("PrivateIpAddresses", [])
+            ),
+        ]:
+            if candidate and candidate not in public_ips:
+                public_ips.append(candidate)
         groups = [g.get("GroupId") for g in d.get("Groups", []) if g.get("GroupId")]
         return cls(
             id=d.get("NetworkInterfaceId"),
@@ -65,6 +79,7 @@ class Eni:
             requester_managed=d.get("RequesterManaged"),
             attachment_instance_id=attachment.get("InstanceId"),
             private_ips=private_ips,
+            public_ips=public_ips,
             security_groups=groups,
         )
 

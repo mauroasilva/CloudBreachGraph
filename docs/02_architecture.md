@@ -94,6 +94,7 @@ Notes for the collection layer (Phase 1):
 - `Description` — free-text; **critical** for load balancer attribution (see §5)
 - `RequesterId`, `RequesterManaged` — service-managed ENIs (ELB, NAT, RDS, etc.)
 - `PrivateIpAddresses[]`, `Groups[]` (security groups) — useful node metadata
+- `Association.PublicIp` (interface-level, and per-address under `PrivateIpAddresses[].Association.PublicIp`) — the Elastic/public IP(s) for the ENI, surfaced as `public_ips`
 
 **EC2 Instance** (`.Reservations[].Instances[]`):
 - `InstanceId`, `State.Name`, `InstanceType`, `Tags[]` (Name), `VpcId`, `SubnetId`

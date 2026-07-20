@@ -83,6 +83,7 @@ def _eni_node(eni: Eni) -> Node:
             "requester_id": eni.requester_id,
             "requester_managed": eni.requester_managed,
             "private_ips": eni.private_ips,
+            "public_ips": eni.public_ips,
             "security_groups": eni.security_groups,
         },
     )

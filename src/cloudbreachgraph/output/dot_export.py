@@ -88,8 +88,13 @@ def _node_lines(node: Node) -> list[str]:
     identity = f"{node.id} [{node.label}]" if named else node.id
     lines = [f"[{node.type}]", identity]
     attrs = node.attributes
-    if node.type == "eni" and attrs.get("interface_type"):
-        lines.append(str(attrs["interface_type"]))
+    if node.type == "eni":
+        if attrs.get("interface_type"):
+            lines.append(str(attrs["interface_type"]))
+        if attrs.get("private_ips"):
+            lines.append("Private IP: " + ", ".join(attrs["private_ips"]))
+        if attrs.get("public_ips"):
+            lines.append("Public IP: " + ", ".join(attrs["public_ips"]))
     elif node.type == "load_balancer" and attrs.get("lb_type"):
         lines.append(str(attrs["lb_type"]))
     elif node.type == "subnet" and attrs.get("cidr"):
