@@ -33,17 +33,23 @@ compatible without constant re-reading.
 - Push when the phase's deliverables and its `learnings_phaseX.md` are complete.
 - Do **not** open a pull request unless explicitly asked.
 
-## The `learnings_phaseX.md` file — REQUIRED output of every phase
+## The learnings file — REQUIRED output of every session
 
-Every phase ends by writing `learnings_phaseX.md`. Put it in **`docs/learnings/`**
-(`docs/learnings/learnings_phase1.md`, `docs/learnings/learnings_phase2.md`,
-`docs/learnings/learnings_phase3.md`) and commit it with the phase's code. Its job: tell the
-*next* agent everything it needs that isn't obvious from the code alone.
+**Every Claude Code session that changes this repo ends by writing exactly one learnings file
+in `docs/learnings/`**, committed alongside that session's code. Its job: tell the *next* agent
+everything it needs that isn't obvious from the code alone. This applies to the original build
+phases **and** to every later change session.
 
-Use this template:
+Naming (see `docs/learnings/README.md`):
+- **Build phases:** `learnings_phase1.md`, `learnings_phase2.md`, `learnings_phase3.md`.
+- **Every other change session:** `learnings_<YYYY-MM-DD>_<change-slug>.md` — date-prefixed so
+  files sort chronologically, plus a short kebab-case slug (e.g.
+  `learnings_2026-07-20_csv-output.md`). Add `-2`, `-3`, … to disambiguate same-day collisions.
+
+Use this template (say "Change: <name>" instead of "Phase X" for change sessions):
 
 ```markdown
-# Learnings — Phase X (<theme>)
+# Learnings — Phase X (<theme>)   ← or:  # Learnings — <YYYY-MM-DD> <change-slug>
 
 ## 1. What this phase delivered
 - Bullet list of modules/functions/files added and what they do.
