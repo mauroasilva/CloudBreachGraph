@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cloudbreachgraph"
+version = "0.1.0"
+description = "Map an AWS account's network topology (ENIs -> EC2/LB -> subnets -> VPCs) using the AWS CLI."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "CloudBreachGraph" }]
+keywords = ["aws", "network", "graph", "security", "inventory"]
+classifiers = [
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Security",
+    "Topic :: System :: Networking",
+]
+# Zero required third-party runtime dependencies: everything runs on the stdlib
+# (subprocess + tomllib). The AWS CLI v2 is invoked as an external subprocess.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "ruff>=0.1"]
+# `dot` rendering convenience (never required); Phase 3 keeps this optional.
+graphviz = ["graphviz>=0.20"]
+
+[project.scripts]
+# Wired up in Phase 3 (cli.py); declared now so the console entry point is stable.
+cloudbreachgraph = "cloudbreachgraph.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+cloudbreachgraph = ["py.typed"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,12 @@
+{
+  "LoadBalancerDescriptions": [
+    {
+      "LoadBalancerName": "legacy-classic-elb",
+      "DNSName": "legacy-classic-elb-987654321.us-east-1.elb.amazonaws.com",
+      "VPCId": "vpc-0aaaaaaaaaaaaaaaa",
+      "Scheme": "internet-facing",
+      "Subnets": ["subnet-011111111111111"],
+      "SecurityGroups": ["sg-0aaa0003"]
+    }
+  ]
+}

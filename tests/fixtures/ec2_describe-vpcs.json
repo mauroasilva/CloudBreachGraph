@@ -1,0 +1,16 @@
+{
+  "Vpcs": [
+    {
+      "VpcId": "vpc-0aaaaaaaaaaaaaaaa",
+      "CidrBlock": "10.0.0.0/16",
+      "IsDefault": false,
+      "Tags": [{"Key": "Name", "Value": "primary-vpc"}]
+    },
+    {
+      "VpcId": "vpc-0defdefdefdefdefd",
+      "CidrBlock": "172.31.0.0/16",
+      "IsDefault": true,
+      "Tags": []
+    }
+  ]
+}

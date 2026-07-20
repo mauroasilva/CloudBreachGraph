@@ -1,0 +1,18 @@
+{
+  "Subnets": [
+    {
+      "SubnetId": "subnet-011111111111111",
+      "VpcId": "vpc-0aaaaaaaaaaaaaaaa",
+      "CidrBlock": "10.0.1.0/24",
+      "AvailabilityZone": "us-east-1a",
+      "Tags": [{"Key": "Name", "Value": "public-1a"}]
+    },
+    {
+      "SubnetId": "subnet-022222222222222",
+      "VpcId": "vpc-0aaaaaaaaaaaaaaaa",
+      "CidrBlock": "10.0.2.0/24",
+      "AvailabilityZone": "us-east-1b",
+      "Tags": [{"Key": "Name", "Value": "private-1b"}]
+    }
+  ]
+}

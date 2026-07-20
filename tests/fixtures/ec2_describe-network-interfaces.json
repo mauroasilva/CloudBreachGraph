@@ -1,0 +1,84 @@
+{
+  "NetworkInterfaces": [
+    {
+      "NetworkInterfaceId": "eni-00instance0000001",
+      "SubnetId": "subnet-011111111111111",
+      "VpcId": "vpc-0aaaaaaaaaaaaaaaa",
+      "AvailabilityZone": "us-east-1a",
+      "InterfaceType": "interface",
+      "Description": "primary network interface",
+      "Status": "in-use",
+      "RequesterManaged": false,
+      "Attachment": {
+        "AttachmentId": "eni-attach-0abc0001",
+        "InstanceId": "i-0abc0000000000001",
+        "InstanceOwnerId": "111111111111",
+        "DeviceIndex": 0,
+        "Status": "attached"
+      },
+      "PrivateIpAddresses": [
+        {"PrivateIpAddress": "10.0.1.10", "Primary": true}
+      ],
+      "Groups": [{"GroupId": "sg-0aaa0001", "GroupName": "web"}]
+    },
+    {
+      "NetworkInterfaceId": "eni-00alb00000000002",
+      "SubnetId": "subnet-011111111111111",
+      "VpcId": "vpc-0aaaaaaaaaaaaaaaa",
+      "AvailabilityZone": "us-east-1a",
+      "InterfaceType": "interface",
+      "Description": "ELB app/my-alb/50dc6c495c0c9188",
+      "Status": "in-use",
+      "RequesterId": "amazon-elb",
+      "RequesterManaged": true,
+      "Attachment": {
+        "AttachmentId": "eni-attach-0abc0002",
+        "InstanceOwnerId": "amazon-elb",
+        "DeviceIndex": 1,
+        "Status": "attached"
+      },
+      "PrivateIpAddresses": [
+        {"PrivateIpAddress": "10.0.1.20", "Primary": true}
+      ],
+      "Groups": [{"GroupId": "sg-0aaa0002", "GroupName": "alb-sg"}]
+    },
+    {
+      "NetworkInterfaceId": "eni-00nlb00000000003",
+      "SubnetId": "subnet-022222222222222",
+      "VpcId": "vpc-0aaaaaaaaaaaaaaaa",
+      "AvailabilityZone": "us-east-1b",
+      "InterfaceType": "network_load_balancer",
+      "Description": "ELB net/my-nlb/1a2b3c4d5e6f7a8b",
+      "Status": "in-use",
+      "RequesterId": "amazon-aws",
+      "RequesterManaged": true,
+      "Attachment": {
+        "InstanceOwnerId": "amazon-aws",
+        "Status": "attached"
+      },
+      "PrivateIpAddresses": [
+        {"PrivateIpAddress": "10.0.2.30", "Primary": true}
+      ],
+      "Groups": []
+    },
+    {
+      "NetworkInterfaceId": "eni-00natgw000000004",
+      "SubnetId": "subnet-022222222222222",
+      "VpcId": "vpc-0aaaaaaaaaaaaaaaa",
+      "AvailabilityZone": "us-east-1b",
+      "InterfaceType": "nat_gateway",
+      "Description": "Interface for NAT Gateway nat-0abc00000000005",
+      "Status": "in-use",
+      "RequesterId": "amazon-aws",
+      "RequesterManaged": true,
+      "Attachment": {
+        "InstanceOwnerId": "amazon-aws",
+        "Status": "attached"
+      },
+      "PrivateIpAddresses": [
+        {"PrivateIpAddress": "10.0.2.40", "Primary": true}
+      ],
+      "Groups": []
+    }
+  ]
+}
