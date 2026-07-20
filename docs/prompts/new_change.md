@@ -105,21 +105,32 @@ matching fixture in `tests/fixtures/` (follow the `service_command[.variant].jso
 ### 6. Docs to keep in sync
 Update whatever your change makes stale — usually one or more of: `README.md` (flags/outputs),
 `docs/02_architecture.md` (design/rules), `docs/05_roadmap.md` (if you advanced a future role),
-and `docs/examples/cloudbreachgraph.example.toml` (if config changed). If you make a notable
-design decision or hit an AWS quirk worth remembering, record it — either extend the relevant
-`docs/learnings/` note or add a short `docs/learnings/learnings_<change-slug>.md` using the
-template in `docs/04_conventions.md`.
+and `docs/examples/cloudbreachgraph.example.toml` (if config changed).
 
-### 7. Git
+### 7. REQUIRED final step — write your learnings file
+Before you finish, create **exactly one** learnings file for this session in `docs/learnings/`,
+named **`learnings_<YYYY-MM-DD>_<change-slug>.md`** (e.g. `learnings_2026-07-20_csv-output.md`;
+use today's date and a short kebab-case slug for the change). This is **mandatory**, even for
+small changes. Use the template in `docs/04_conventions.md` and capture, concretely:
+- What you changed (files/functions) and why.
+- Any interface/contract change the next session must know about.
+- Decisions & rationale, and any deviation from the docs.
+- Gotchas / AWS quirks you hit.
+- Known gaps / follow-ups you're leaving.
+- Exact commands to run the tests and reproduce the result.
+Commit it together with your code. See `docs/learnings/README.md` for the naming rules.
+
+### 8. Git
 - Work on the branch you were told to use for this change (create it from the latest `main` if
   it doesn't exist). Commit in logical chunks with clear messages, then push.
 - **Do not open a pull request unless explicitly asked.**
 
-### 8. Definition of done
+### 9. Definition of done
 - [ ] Change implemented per the CHANGE REQUEST, matching existing structure and the hard rules.
 - [ ] `pytest` passes offline; new/updated tests cover the change.
 - [ ] `ruff check` + `ruff format --check` clean.
 - [ ] Verified end-to-end via `--from-cache tests/fixtures` (or a live run if you have creds).
 - [ ] Read-only guarantee still holds (no mutating AWS calls).
-- [ ] Affected docs updated; notable decisions/quirks captured in `docs/learnings/`.
+- [ ] Affected docs updated.
+- [ ] **`docs/learnings/learnings_<YYYY-MM-DD>_<change-slug>.md` written** and committed with the code.
 - [ ] Committed and pushed to the working branch.
