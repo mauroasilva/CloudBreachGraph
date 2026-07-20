@@ -1,0 +1,31 @@
+# CloudBreachGraph account -> profile mapping
+#
+# Copy this to ./cloudbreachgraph.toml (next to where you run the tool) or to
+# ~/.config/cloudbreachgraph/config.toml, then edit for your accounts.
+#
+# The tool lets you say "for account X use profile Y": you select an account by
+# its alias (the [accounts.<alias>] key) or by its 12-digit account_id, and the
+# tool uses the matching AWS CLI profile for every `aws` call.
+#
+# Resolution precedence (first match wins):
+#   1. --profile <name>         explicit CLI override, ignores this file
+#   2. --account <alias|id>     looked up here -> uses that account's profile
+#   3. neither given            uses default_account below, else the AWS CLI default profile
+
+# Optional: which account to use when --account is omitted.
+default_account = "prod"
+
+[accounts.prod]
+account_id = "111111111111"
+profile    = "prod-audit"
+region     = "us-east-1"     # optional per-account default region
+
+[accounts.staging]
+account_id = "222222222222"
+profile    = "staging-audit"
+region     = "us-west-2"
+
+[accounts.sandbox]
+account_id = "333333333333"
+profile    = "sandbox-ro"
+# region omitted -> falls back to --region or the profile's configured region

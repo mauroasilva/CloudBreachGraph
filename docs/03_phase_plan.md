@@ -18,6 +18,11 @@ If a phase must deviate from a contract, it records the deviation in `learnings_
 - `pyproject.toml`, package skeleton under `src/cloudbreachgraph/`, `README.md` stub.
 - `aws/runner.py`: a subprocess wrapper that runs `aws <args> --output json --no-cli-pager`,
   threads through `--region`/`--profile`, parses JSON, and raises a clear error on failure.
+- `config.py`: the account→profile mapping loader/resolver described in `02_architecture.md §10`
+  — `load_config(path)` (TOML via stdlib `tomllib`, with the discovery order) and
+  `resolve_profile(cfg, account=..., profile_override=...)` applying the precedence
+  (`--profile` override → `--account` lookup → CLI default). Also a helper to run
+  `sts get-caller-identity` and verify the resolved profile matches the expected account id.
 - `aws/collectors.py`: functions returning normalized lists:
   - `collect_network_interfaces(...) -> list[dict]`
   - `collect_ec2_instances(...) -> list[dict]`  (flattened out of Reservations)
@@ -29,11 +34,15 @@ If a phase must deviate from a contract, it records the deviation in `learnings_
 - Optional `--cache-dir` raw-JSON dump.
 - `tests/fixtures/` with at least one recorded/representative JSON sample per command, plus
   unit tests that mock `subprocess` and assert the collectors normalize correctly.
+- Tests for `config.py`: alias lookup, account-id lookup, `--profile` override precedence,
+  missing-config fallback, and unresolvable `--account` error. Parse the shipped
+  `docs/examples/cloudbreachgraph.example.toml` in a test so the example stays valid.
 
 **Acceptance criteria**
 - `pip install -e .` works; `python -c "import cloudbreachgraph"` works.
 - Collectors run against fixtures without touching the network in tests.
 - Runner surfaces AWS CLI stderr on non-zero exit.
+- `resolve_profile` honors the precedence in `02_architecture.md §10`.
 - `learnings_phase1.md` written (see `04_conventions.md` template).
 
 **Interface contract exposed to Phase 2** — `collect_all()` returns exactly:
@@ -51,6 +60,11 @@ If a phase must deviate from a contract, it records the deviation in `learnings_
 Each normalized dict **must** preserve the fields listed in `02_architecture.md §4`
 (at minimum the id + the fields used for mapping). Phase 1 documents the exact normalized
 shape it settled on in `learnings_phase1.md` — Phase 2 codes against that.
+
+**Interface contract exposed to Phase 3** — the `config.py` resolution API (`load_config`,
+`resolve_profile`, account-verification helper) from `02_architecture.md §10`, plus the
+`collect_all(region=..., profile=...)` signature. Phase 3's CLI wires user flags into these.
+Phase 1 records the exact function signatures it settled on in `learnings_phase1.md`.
 
 ---
 
@@ -98,9 +112,12 @@ shape it settled on in `learnings_phase1.md` — Phase 2 codes against that.
 - `output/json_export.py`: `write_json(graph, path)`.
 - `output/dot_export.py`: `write_dot(graph, path)` — nodes colored by type, VPC clustering,
   relationship-labeled edges; optional `render(dot_path, fmt)` shelling out to `dot`.
-- `cli.py`: argparse entrypoint wiring `collect_all` → `build_graph` → writers.
-  Flags: `--region`, `--profile`, `--cache-dir`, `--output-dir`, `--render {png,svg}`,
-  `--from-cache <dir>` (build from previously cached JSON with no live calls).
+- `cli.py`: argparse entrypoint wiring `config.resolve_profile` → `collect_all` → `build_graph`
+  → writers. Flags: `--account <alias|id>` and `--config <path>` (account→profile mapping, §10),
+  `--profile <name>` (direct override), `--verify-account/--no-verify-account`, `--region`,
+  `--cache-dir`, `--output-dir`, `--render {png,svg}`, `--from-cache <dir>` (build from
+  previously cached JSON with no live calls), and optional `--all-accounts` (loop over configured
+  accounts, one graph each — §10.4 stretch goal).
 - `pyproject.toml` console-script entry `cloudbreachgraph = cloudbreachgraph.cli:main`.
 - End-to-end test: fixtures → CLI (with `--from-cache`) → assert `graph.json` and
   `graph.dot` are produced and well-formed.
@@ -109,6 +126,8 @@ shape it settled on in `learnings_phase1.md` — Phase 2 codes against that.
 **Acceptance criteria**
 - `cloudbreachgraph --from-cache tests/fixtures/... --output-dir out/` produces
   `graph.json` + `graph.dot` offline.
+- `cloudbreachgraph --account <alias>` resolves and uses the mapped profile; `--profile`
+  overrides it; account verification catches a profile/account mismatch.
 - Graceful degradation when `dot` is not installed (still writes `.dot`, warns on render).
 - Read-only guarantee holds (no mutating calls anywhere).
 - `learnings_phase3.md` written, including final CLI surface and any follow-up ideas.

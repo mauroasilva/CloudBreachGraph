@@ -26,14 +26,23 @@ Deliver the project scaffolding and the **AWS CLI data-collection layer**:
 2. `aws/runner.py` — a subprocess wrapper that runs
    `aws <args> --output json --no-cli-pager`, threads through `--region` and optional
    `--profile`, parses JSON stdout, and raises a clear error (surfacing stderr) on non-zero exit.
-3. `aws/collectors.py` — the collector functions and `collect_all(...)` returning the exact
+3. `config.py` — the **account→profile mapping** loader/resolver from `docs/02_architecture.md §10`.
+   The operator keeps one AWS CLI profile per account and wants to say "for account X use
+   profile Y". Implement `load_config(path)` (TOML via stdlib `tomllib`, with the documented
+   discovery order) and `resolve_profile(cfg, account=..., profile_override=...)` applying the
+   precedence (`--profile` override → `--account` alias/id lookup → CLI default), plus a helper
+   that runs `aws sts get-caller-identity` to verify the resolved profile matches the expected
+   account id. Do **not** build the CLI here (that's Phase 3) — just the loader/resolver API.
+4. `aws/collectors.py` — the collector functions and `collect_all(...)` returning the exact
    dict shape defined in the Phase 1 **interface contract** in `docs/03_phase_plan.md`.
    Normalize each resource to preserve the fields from `docs/02_architecture.md §4`
    (flatten EC2 instances out of `Reservations`). Handle empty load-balancer results
    gracefully (accounts may have none). Optionally support a `--cache-dir` raw-JSON dump.
-4. `tests/fixtures/` with a representative recorded JSON sample for **each** AWS command, and
+5. `tests/fixtures/` with a representative recorded JSON sample for **each** AWS command, and
    `pytest` tests that mock the subprocess boundary (the runner) and assert the collectors
-   normalize correctly. Tests must run **offline**.
+   normalize correctly, **plus** tests for `config.py` (alias lookup, account-id lookup,
+   `--profile` override precedence, missing-config fallback, unresolvable `--account` error,
+   and parsing `docs/examples/cloudbreachgraph.example.toml`). Tests must run **offline**.
 
 Stay strictly within scope. Do **not** implement `model/`, `mapping/`, or `output/` — those
 are Phases 2 and 3. Leave the layout ready for them.
@@ -53,6 +62,8 @@ Before you finish, create **`docs/learnings/learnings_phase1.md`** using the tem
 `docs/04_conventions.md`. It must capture everything Phase 2 needs, especially:
 - The **exact normalized dict shape** each collector returns and the keys of `collect_all()`
   (this is the contract Phase 2 codes against).
+- The **exact `config.py` signatures** (`load_config`, `resolve_profile`, the verify helper)
+  and the config file schema you settled on — this is the contract Phase 3's CLI wires into.
 - Any AWS CLI schema surprises, empty-result behavior, and pagination notes.
 - Any deviation from `docs/02_architecture.md §2` layout.
 - Exact commands to run the tests.

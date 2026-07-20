@@ -31,18 +31,31 @@ that uses the **AWS CLI** (not boto3) to map an AWS account's network topology. 
    Add an optional `render(dot_path, fmt)` that shells out to `dot -T<fmt>` **only if** the
    `dot` binary is on PATH; degrade gracefully (still write the `.dot`, warn on render) when
    it is absent.
-3. `cli.py` — an `argparse` entrypoint wiring `collect_all` → `build_graph` → writers, with
-   flags: `--region`, `--profile`, `--cache-dir`, `--output-dir`, `--render {png,svg}`, and
-   `--from-cache <dir>` (build from previously cached JSON with **no** live AWS calls).
-   Register the console script `cloudbreachgraph = cloudbreachgraph.cli:main` in
-   `pyproject.toml`.
+3. `cli.py` — an `argparse` entrypoint wiring the Phase 1 `config.resolve_profile` →
+   `collect_all` → `build_graph` → writers. This is where the operator's **"for account X use
+   profile Y"** requirement is surfaced. Flags:
+   - `--account <alias|id>` + `--config <path>` — select an account from the account→profile
+     mapping (`docs/02_architecture.md §10`); the resolved profile is passed to every AWS call.
+   - `--profile <name>` — direct override that bypasses the mapping.
+   - `--verify-account / --no-verify-account` — toggle the `sts get-caller-identity` check
+     (default on when the account id is known).
+   - `--region`, `--cache-dir`, `--output-dir`, `--render {png,svg}`, `--from-cache <dir>`
+     (build from previously cached JSON with **no** live AWS calls).
+   - optional `--all-accounts` — loop over every configured account, writing one graph each
+     (`graph.<alias>.json` / `.dot`); §10.4 stretch goal, skip if time-boxed and note in learnings.
+   Use the config `load_config`/`resolve_profile` API exactly as Phase 1 documented it in
+   `docs/learnings/learnings_phase1.md`. Register the console script
+   `cloudbreachgraph = cloudbreachgraph.cli:main` in `pyproject.toml`.
 4. End-to-end test: fixtures/cached JSON → CLI with `--from-cache` → assert `graph.json` and
-   `graph.dot` are produced and well-formed. Tests run offline.
-5. Update the user-facing `README.md` with real usage examples (live run and `--from-cache`).
+   `graph.dot` are produced and well-formed. Add a test that `--account <alias>` resolves the
+   mapped profile (mock the AWS boundary) and that `--profile` overrides it. Tests run offline.
+5. Update the user-facing `README.md` with real usage examples: the account→profile config
+   file, `--account <alias>`, `--profile` override, a live run, and `--from-cache`.
 
 ## Definition of done
 - `cloudbreachgraph --from-cache <fixtures> --output-dir out/` produces `graph.json` +
   `graph.dot` offline.
+- `cloudbreachgraph --account <alias>` resolves the mapped profile; `--profile` overrides it.
 - Missing `dot` binary degrades gracefully.
 - Read-only guarantee still holds across the whole tool (no mutating AWS calls anywhere).
 - `pytest` passes offline.

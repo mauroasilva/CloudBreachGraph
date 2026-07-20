@@ -15,6 +15,9 @@ in section 5 are the core of the application — read them carefully.
 - **Testing:** `pytest`. AWS CLI calls are mocked with recorded JSON fixtures so tests run
   offline. `pytest` is a dev dependency only.
 - **Style:** type hints everywhere, `dataclasses` for models, `ruff`-clean formatting.
+- **Config file format:** TOML, parsed with the stdlib `tomllib` (Python 3.11+, read-only) so
+  the account→profile mapping needs **no** third-party dependency. Do not use YAML (that would
+  pull in PyYAML). JSON may be accepted as a secondary format since it's also stdlib.
 
 ## 2. Suggested project layout
 
@@ -27,6 +30,7 @@ CloudBreachGraph/
 │       ├── __init__.py
 │       ├── __main__.py           # enables `python -m cloudbreachgraph`
 │       ├── cli.py                # argparse entrypoint  (Phase 3)
+│       ├── config.py             # account -> profile mapping loader/resolver  (Phase 1)
 │       ├── aws/
 │       │   ├── __init__.py
 │       │   ├── runner.py         # subprocess wrapper around `aws ...`  (Phase 1)
@@ -64,11 +68,13 @@ flags. The AWS CLI auto-paginates by default, returning the full result set.
 | Load Balancers (v1: Classic) | `aws elb describe-load-balancers --region <r>` | `.LoadBalancerDescriptions[]` |
 | Subnets | `aws ec2 describe-subnets --region <r>` | `.Subnets[]` |
 | VPCs | `aws ec2 describe-vpcs --region <r>` | `.Vpcs[]` |
+| Caller identity (account check) | `aws sts get-caller-identity` | `.Account`, `.Arn` |
 
 Notes for the collection layer (Phase 1):
 
 - Add `--no-cli-pager` to avoid the interactive pager blocking a subprocess.
-- Respect an optional `--profile <name>` by passing it through to every `aws` call.
+- Respect an optional `--profile <name>` by passing it through to **every** `aws` call. The
+  profile is resolved from the account→profile mapping (see §10) or from an explicit override.
 - Treat a non-zero exit code as a hard error with the captured stderr surfaced to the user
   (common causes: expired creds, missing permissions, wrong region).
 - `elb`/`elbv2` may be absent or return empty in accounts with no load balancers — handle
@@ -200,8 +206,84 @@ Requirements:
 
 ## 9. Error handling & safety
 
-- Read-only: the app must never call a mutating AWS API. Collectors only run `describe-*`.
+- Read-only: the app must never call a mutating AWS API. Collectors only run `describe-*` and
+  the read-only `sts get-caller-identity`.
 - Fail loudly on auth/permission errors with the AWS CLI's stderr shown to the user.
 - Partial data: if one collector fails but others succeed, prefer building a partial graph
   and clearly flagging what's missing over aborting — but make that behavior explicit and
   documented in learnings.
+
+## 10. Account → profile mapping (how to target an account)
+
+The operator keeps **one named AWS CLI profile per account**. CloudBreachGraph must let them
+say "for account X, use profile Y" so they select an account without memorizing which profile
+maps to it. There are two inputs, resolved in this precedence order (first match wins):
+
+1. **`--profile <name>` (explicit CLI override).** Skips the mapping entirely and uses that
+   profile directly. Always available as an escape hatch.
+2. **`--account <id-or-alias>` resolved against the config file.** Looks up the account in the
+   mapping and uses its `profile`.
+3. **Neither given:** fall back to the AWS CLI's own default profile/credentials (no
+   `--profile` flag passed), so the tool still works for someone with a single default account.
+
+### 10.1 Config file
+
+- **Format:** TOML (parsed with stdlib `tomllib`). Optional JSON support may mirror it.
+- **Discovery order** when `--config` is not given: `./cloudbreachgraph.toml`, then
+  `$XDG_CONFIG_HOME/cloudbreachgraph/config.toml` (default `~/.config/cloudbreachgraph/config.toml`).
+  A missing config file is **not** an error unless `--account` was requested and can't be resolved.
+- **Shape:** each account has a human alias (the table key), an `account_id`, a `profile`, and
+  an optional default `region`:
+
+```toml
+# cloudbreachgraph.toml
+default_account = "prod"        # optional: used when --account is omitted but a config exists
+
+[accounts.prod]
+account_id = "111111111111"
+profile    = "prod-audit"
+region     = "us-east-1"        # optional per-account default region
+
+[accounts.staging]
+account_id = "222222222222"
+profile    = "staging-audit"
+
+[accounts.sandbox]
+account_id = "333333333333"
+profile    = "sandbox-ro"
+```
+
+- `--account` accepts **either** an alias (`prod`) **or** a raw 12-digit account id
+  (`111111111111`); resolve by matching either the table key or the `account_id` field.
+- A canonical example ships at `docs/examples/cloudbreachgraph.example.toml`.
+
+### 10.2 Resolution API (Phase 1 owns this; Phase 3 CLI consumes it)
+
+`config.py` should expose roughly:
+
+```python
+def load_config(path: str | None) -> AccountConfig            # discovery + parse; empty if none
+def resolve_profile(cfg: AccountConfig, *, account: str | None,
+                    profile_override: str | None) -> Resolved  # -> {profile, account_id, region}
+```
+
+Where `Resolved.profile` may be `None` (meaning "use the CLI default"). The resolver applies
+the precedence above and raises a clear error if `--account` was given but matches nothing in
+the config.
+
+### 10.3 Account verification (recommended)
+
+After resolving a profile, run `aws sts get-caller-identity --profile <Y>` once and compare the
+returned `.Account` to the expected `account_id` from the mapping. On mismatch, **stop** with a
+clear error ("profile `prod-audit` resolves to account 999… but config says 111…") — this
+prevents mapping a graph while unknowingly pointed at the wrong account. Make this a
+`--verify-account/--no-verify-account` toggle (default on when an `account_id` is known). Record
+the resolved/verified account id in `Graph.meta`.
+
+### 10.4 Optional: map several accounts in one run
+
+Because the operator has many per-account profiles, a `--all-accounts` flag may iterate every
+account in the config, running the full collect→build→write pipeline per account and writing
+per-account outputs (e.g. `graph.<alias>.json` / `graph.<alias>.dot`). This stays within the
+single-account-per-graph model (no merged cross-account graph); it just loops. Treat it as a
+Phase 3 stretch goal — if not built in v1, note it as future work in learnings.
