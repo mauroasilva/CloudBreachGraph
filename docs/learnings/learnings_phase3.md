@@ -107,6 +107,13 @@ Output files (all in `--output-dir`): `graph.json`, `graph.dot`, and `graph.<fmt
   falling back to `attributes["vpc_id"]`. This means even synthetic subnets cluster
   correctly, and it needs no new data from Phase 2. Nodes with no resolvable VPC render at
   the top level rather than being dropped.
+- **Node labels are id-first: `<aws-id> [<name>]`, or just `<aws-id>` when unnamed.**
+  `_node_lines` surfaces the AWS id on every node and appends the `Name` tag in brackets
+  when there is one (`node.label != node.id` ⇒ named). ENIs (no `Name` tag) and synthetic
+  placeholders show the bare id. This keeps nodes self-identifying — a reader always sees
+  the `i-…`/`subnet-…`/`vpc-…`/ARN, not just a friendly name. (Load-balancer ids are ARNs,
+  so their identity line is long but unambiguous.) The `subgraph` header stays `VPC <name>`
+  (name-only) since the standalone VPC node already carries the id-annotated label.
 - **A VPC is its own top-level node, not swallowed by its cluster.** `_node_vpc` returns
   `None` for `vpc` nodes, so a VPC is drawn as a standalone node and each subnet's `in_vpc`
   edge visibly connects the subnet (inside the VPC's `cluster_*`) *up to* that VPC node.

@@ -80,6 +80,13 @@ def test_write_dot_wellformed(graph, tmp_path):
     assert '\n  "vpc-0aaaaaaaaaaaaaaaa" [' in text
     assert '\n    "vpc-0aaaaaaaaaaaaaaaa" [' not in text
     assert '"subnet-011111111111111" -> "vpc-0aaaaaaaaaaaaaaaa" [label="in_vpc"' in text
+    # Labels show "<aws-id> [<name>]" when named, and just "<aws-id>" when not.
+    assert "i-0abc0000000000001 [web-server-1]" in text  # named instance
+    assert "subnet-011111111111111 [public-1a]" in text  # named subnet
+    assert "vpc-0aaaaaaaaaaaaaaaa [primary-vpc]" in text  # named vpc
+    # An ENI has no Name tag -> id only, no bracketed name.
+    assert "eni-00instance0000001\\ninterface" in text
+    assert "eni-00instance0000001 [" not in text
     # Nodes colored by type (a couple of representative fills).
     assert 'fillcolor="#E8F5E9"' in text  # eni
     assert 'fillcolor="#E3F2FD"' in text  # subnet

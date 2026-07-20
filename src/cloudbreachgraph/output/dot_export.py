@@ -78,8 +78,15 @@ def _node_vpc(
 
 
 def _node_lines(node: Node) -> list[str]:
-    """The human-readable label lines for a node (type + label + a key attribute)."""
-    lines = [f"[{node.type}]", node.label]
+    """The human-readable label lines for a node (type + identity + a key attribute).
+
+    The identity line is the AWS id, annotated with the ``Name`` tag when the node has one:
+    ``"<aws-id> [<name>]"`` if named, else just ``"<aws-id>"``. (``node.label`` is the name
+    when present, otherwise a copy of ``node.id`` — so ``label == id`` means "no name".)
+    """
+    named = node.label not in ("", node.id)
+    identity = f"{node.id} [{node.label}]" if named else node.id
+    lines = [f"[{node.type}]", identity]
     attrs = node.attributes
     if node.type == "eni" and attrs.get("interface_type"):
         lines.append(str(attrs["interface_type"]))
