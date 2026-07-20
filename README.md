@@ -5,9 +5,8 @@ Interfaces (ENIs) → EC2 instances / load balancers → subnets → VPCs — us
 CLI** (not boto3) as its data source. Output is a graph you can serialize to JSON and
 render with Graphviz.
 
-> **Status:** Phase 1 (foundation + AWS CLI collection layer). The domain model, graph
-> construction, and the end-to-end CLI arrive in Phases 2 and 3. See `docs/` for the full
-> build plan.
+CloudBreachGraph is **read-only by construction**: it only ever runs AWS `describe-*`
+calls plus the read-only `sts get-caller-identity` check. It never mutates your account.
 
 ## Install
 
@@ -16,29 +15,146 @@ pip install -e .
 ```
 
 No required third-party runtime dependencies (stdlib `subprocess` + `tomllib`). The AWS
-CLI v2 must be installed and on `PATH`, with a read-only profile per account.
+CLI v2 must be installed and on `PATH`, with a read-only profile per account. To rasterize
+the graph to PNG/SVG you also need [Graphviz](https://graphviz.org/) (`dot`) on `PATH` —
+this is optional; without it the tool still writes the `.dot` file.
 
-## What Phase 1 provides
+## Quick start
 
-- `cloudbreachgraph.aws.runner.run_aws(...)` — subprocess wrapper around
-  `aws <args> --output json --no-cli-pager`, threading through `--region`/`--profile` and
-  surfacing stderr on failure.
-- `cloudbreachgraph.aws.collectors` — role-agnostic `collect_*` functions, the
-  `ROLE_COLLECTORS` / `ROLE_RESULT_KEYS` registry, and the `collect_all(resolved)` driver.
-- `cloudbreachgraph.config` — the account→profile + role/target loader/resolver
-  (`load_config`, `resolve_target`, `resolve_profile`, `verify_target`).
+Build a map of an account and write `graph.json` + `graph.dot` into `out/`:
+
+```bash
+cloudbreachgraph --account prod --output-dir out/
+```
+
+Then render it (optional; needs Graphviz):
+
+```bash
+cloudbreachgraph --account prod --output-dir out/ --render svg   # writes out/graph.svg
+# or, by hand:
+dot -Tsvg out/graph.dot -o out/graph.svg
+```
 
 ## Configuration
 
-CloudBreachGraph maps each AWS account to one named AWS CLI profile. Copy
-`docs/examples/cloudbreachgraph.example.toml` to `./cloudbreachgraph.toml` (or
-`~/.config/cloudbreachgraph/config.toml`) and edit it. See `docs/02_architecture.md`
-§10–§11 for the precedence rules and multi-account targets.
+CloudBreachGraph maps each AWS account to one named AWS CLI profile, so you say **"for
+account X, use profile Y"** without memorizing which profile is which. Copy the shipped
+example and edit it:
+
+```bash
+cp docs/examples/cloudbreachgraph.example.toml ./cloudbreachgraph.toml
+```
+
+Discovery order when `--config` is not given: `./cloudbreachgraph.toml`, then
+`$XDG_CONFIG_HOME/cloudbreachgraph/config.toml` (default
+`~/.config/cloudbreachgraph/config.toml`).
+
+```toml
+# cloudbreachgraph.toml
+default_target = "prod"          # used when neither --target nor --account is given
+
+# accounts are the atom: alias -> { account_id, profile, region? }
+[accounts.workload_prod]
+account_id = "111111111111"
+profile    = "prod-audit"
+region     = "us-east-1"
+
+[accounts.log_archive]           # a central logging account (for future flow_logs)
+account_id = "999999999999"
+profile    = "log-archive-ro"
+
+# a target binds resource roles to accounts (a named environment)
+[targets.prod]
+default_account = "workload_prod"   # every role uses this...
+[targets.prod.roles]
+flow_logs = "log_archive"           # ...except flow logs, from the logging account (future role)
+```
+
+## Selecting an account (precedence)
+
+First match wins (`docs/02_architecture.md §10–§11`):
+
+| Flag | Meaning |
+|------|---------|
+| `--profile <name>` | **Escape hatch.** Use this AWS CLI profile directly for every role, ignoring the config mapping. |
+| `--target <name>` | Select a config target that binds each resource *role* to an account (may span multiple accounts). |
+| `--account <alias\|id>` | Shorthand: a target whose every role is that one account (alias **or** 12-digit id). |
+| *(none)* | Fall back to `default_target` / `default_account` in the config, else the AWS CLI default credentials. |
+
+```bash
+cloudbreachgraph --target prod                 # multi-account target (roles bound per config)
+cloudbreachgraph --account workload_prod       # one account, by alias
+cloudbreachgraph --account 111111111111        # one account, by id
+cloudbreachgraph --account workload_prod --profile some-other-profile   # --profile wins
+```
+
+After resolving, the tool runs `sts get-caller-identity` once per distinct profile and
+checks the returned account against the config (`--verify-account`, default **on** when the
+account id is known). It stops with a clear error on a profile/account mismatch. Disable
+with `--no-verify-account`; note verification is a no-op under `--profile` (no expected id).
+
+## Offline: build from cached JSON
+
+`--cache-dir DIR` writes each raw AWS JSON response to disk during a live run.
+`--from-cache DIR` then rebuilds the graph from those files with **no** live AWS calls —
+handy for iterating on output, diffing over time, or working from a colleague's capture:
+
+```bash
+cloudbreachgraph --account prod --cache-dir captures/       # live run, also caches raw JSON
+cloudbreachgraph --from-cache captures/ --output-dir out/   # offline rebuild, no AWS calls
+```
+
+`--from-cache` also reads the repo's recorded fixtures directly, so you can try it with no
+AWS account at all:
+
+```bash
+cloudbreachgraph --from-cache tests/fixtures --output-dir out/
+```
+
+## All flags
+
+```
+--target NAME              config target binding roles to accounts
+--account ALIAS|ID         account alias or 12-digit id (shorthand target)
+--profile NAME             AWS CLI profile override (applies to all roles)
+--config PATH              path to the TOML config file
+--verify-account /         toggle the sts get-caller-identity check
+  --no-verify-account        (default: on when the account id is known)
+--all-accounts             loop over every configured account, one graph each
+--region REGION            AWS region (overrides the per-account default)
+--cache-dir DIR            also write raw AWS JSON responses here
+--from-cache DIR           build from cached AWS JSON in DIR, no live calls
+--include-orphans          also emit collected resources no ENI references
+--output-dir DIR           where to write outputs (default: .)
+--render {png,svg}         also rasterize the .dot with Graphviz (needs `dot`)
+```
+
+## Outputs
+
+- `graph.json` — the full graph (`meta`, `nodes`, `edges`), pretty-printed and
+  deterministic (stable ordering, no timestamps) so diffs are meaningful.
+- `graph.dot` — Graphviz DOT: nodes colored/shaped by type, subnets and ENIs grouped
+  inside their VPC via `subgraph cluster_*`, edges labeled by relationship (load-balancer
+  attachment edges also show the `match_rule` that resolved them).
+- `graph.<fmt>` — only with `--render`; requires `dot`. If `dot` is absent the tool warns
+  and still writes the `.dot`.
+
+With `--all-accounts` the files are named per account: `graph.<alias>.json` / `.dot`.
+
+## Future roles (flow logs, etc.)
+
+v1 maps the **`network`** role. VPC Flow Logs (`flow_logs`) — often published to a separate
+central logging account — are a **future role**: the config grammar, targets, and CLI are
+already designed for it, so binding `flow_logs = "log_archive"` in a target will "just work"
+once the collectors ship, with no CLI change. See
+[`docs/05_roadmap.md`](docs/05_roadmap.md) and `docs/02_architecture.md §11`.
 
 ## Development
 
 ```bash
 pip install -e '.[dev]'
 pytest        # runs fully offline against tests/fixtures/
-ruff check .
+ruff check . && ruff format --check .
 ```
+
+See `docs/` for the full build plan and the per-phase `docs/learnings/` notes.
