@@ -37,7 +37,7 @@
   implementing the §5 rules in the requested order, plus the `_LoadBalancerLike` protocol,
   `_parse_elb_description`, node factories, and the attribution helper.
 - **Tests** — `tests/test_resources.py` (8), `tests/test_graph.py` (5), `tests/test_builder.py`
-  (19). Total suite now **62 tests, fully offline** (30 Phase 1 + 32 Phase 2).
+  (22). Total suite now **65 tests, fully offline** (30 Phase 1 + 35 Phase 2).
 
 Layout matches `docs/02_architecture.md §2` exactly — no deviations. `model/` and `mapping/` were
 empty packages from Phase 1; `output/` and `cli.py` remain untouched (Phase 3).
@@ -99,12 +99,17 @@ Only load-balancer attachment edges carry `match_rule` — Phase 3 can label tho
 
 - **ENI-anchored graph by default, orphans opt-in via `include_orphans`.** Per
   `docs/01_overview.md` and §5, the ENI is the anchor: subnet nodes arise from ENI `SubnetId`
-  references (§5.1) and VPC nodes from those subnets (§5.2). By default a collected subnet/VPC
-  that **no ENI references is not emitted** — the graph is the reachability map around ENIs, not a
-  full inventory dump. `build_graph(collected, include_orphans=True)` flips this on: it *also*
-  emits every collected subnet (with its own `in_vpc` edge) and every collected VPC (as an
-  isolated node) that no ENI references. Either way the "every subnet node has exactly one
-  `in_vpc` edge" invariant holds. Phase 3 must surface this as a CLI flag — see §6.
+  references (§5.1) and VPC nodes from those subnets (§5.2). By default a collected resource that
+  **no ENI references is not emitted** — the graph is the reachability map around ENIs, not a
+  full inventory dump. `build_graph(collected, include_orphans=True)` flips this on for **every
+  resource type**: it *also* emits every collected subnet (with its own `in_vpc` edge), VPC,
+  EC2 instance and load balancer that no ENI references, as isolated nodes. Instances and LBs
+  have no outgoing edges in this model, so an orphan of either is a standalone node carrying its
+  own `subnet_id`/`vpc_id` (etc.) attributes. Implementation is idempotent: the orphan pass
+  re-adds *all* collected resources of each type and `add_node`'s merge makes re-adding an
+  already-referenced one a no-op, so only the unreferenced ones are actually new. Either way the
+  "every subnet node has exactly one `in_vpc` edge" invariant holds. Phase 3 must surface this as
+  a CLI flag — see §6.
 - **`match_rule` only on LB edges.** The docs mandate `match_rule` for load-balancer attribution
   (§5.4). Instance attachment (§5.3) is unambiguous, so its edge carries `{}` rather than a
   synthetic rule name — keeps the signal meaningful.
@@ -138,8 +143,9 @@ Only load-balancer attachment edges carry `match_rule` — Phase 3 can label tho
   (no `from_classic` overload). Both satisfy the `_LoadBalancerLike` protocol in `builder.py` and
   render to the single `load_balancer` graph node, so the Phase 3 node contract is unchanged.
 - **`build_graph` gained an `include_orphans` keyword** (default `False`) so the tool can show
-  subnets/VPCs with no matching ENI. This is a superset of the documented behavior — the default
-  is exactly the ENI-anchored graph the docs describe. Phase 3 wires it to a CLI flag (§6).
+  resources with no matching ENI — subnets, VPCs, EC2 instances **and** load balancers. This is a
+  superset of the documented behavior — the default is exactly the ENI-anchored graph the docs
+  describe. Phase 3 wires it to a CLI flag (§6).
 - Otherwise no deviations. Node/edge/`to_dict` shapes match `docs/02_architecture.md §6` and the
   `docs/03_phase_plan.md` Phase 2→3 contract.
 
@@ -176,10 +182,10 @@ Only load-balancer attachment edges carry `match_rule` — Phase 3 can label tho
   `build_graph` for determinism).
 - **Phase 3 — wire the orphan flag (requested).** `build_graph` already accepts
   `include_orphans: bool = False` (§3/§4). The CLI must expose it — recommended:
-  `--include-orphans` (store_true, default off) to show subnets/VPCs with no matching ENI,
-  passed straight through as `build_graph(collected, include_orphans=args.include_orphans)`.
-  Nothing else in the pipeline changes. Orphan EC2 instances / LBs are still not surfaced (only
-  subnets/VPCs, which is what the request covers); extend the same way if ever wanted.
+  `--include-orphans` (store_true, default off) to show **all** resources with no matching ENI
+  (subnets, VPCs, EC2 instances, load balancers), passed straight through as
+  `build_graph(collected, include_orphans=args.include_orphans)`. Nothing else in the pipeline
+  changes.
 - **Real-account ELB verification:** capture and add fixtures for a Classic-ELB ENI and a GWLB ENI
   to promote §5's Classic/GWLB rules from "unit-tested against synthetic data" to "verified".
 - `flow_logs` / other roles: unaffected — new node/edge types plug into the same `Graph` model.
@@ -188,7 +194,7 @@ Only load-balancer attachment edges carry `match_rule` — Phase 3 can label tho
 
 ```bash
 pip install -e '.[dev]'          # or: pip install pytest ruff
-python -m pytest -q              # 62 tests, fully offline via tests/fixtures/
+python -m pytest -q              # 65 tests, fully offline via tests/fixtures/
 python -m pytest tests/test_builder.py tests/test_graph.py tests/test_resources.py -q  # Phase 2 only
 ruff check . && ruff format --check .
 ```

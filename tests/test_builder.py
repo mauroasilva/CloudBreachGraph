@@ -367,6 +367,34 @@ def test_include_orphans_adds_unreferenced_subnet_with_vpc_edge():
         assert len(edges) == 1
 
 
+def test_orphan_instance_and_lb_hidden_by_default(full_bundle):
+    # Fixtures contain an instance (i-...002) and a Classic ELB (legacy-classic-elb) that no
+    # ENI references — both absent from the ENI-anchored graph.
+    graph = build_graph(full_bundle)
+    assert graph.get_node("i-0abc0000000000002") is None
+    assert graph.get_node("legacy-classic-elb") is None
+
+
+def test_include_orphans_adds_unreferenced_instance(full_bundle):
+    graph = build_graph(full_bundle, include_orphans=True)
+    orphan = graph.get_node("i-0abc0000000000002")
+    assert orphan is not None
+    assert orphan.type == "ec2_instance"
+    assert orphan.attributes["state"] == "stopped"
+    assert "synthetic" not in orphan.attributes  # a real, just-isolated node
+    # Isolated: nothing attaches to it.
+    assert [e for e in graph.edges if e.target == "i-0abc0000000000002"] == []
+
+
+def test_include_orphans_adds_unreferenced_load_balancer(full_bundle):
+    graph = build_graph(full_bundle, include_orphans=True)
+    orphan = graph.get_node("legacy-classic-elb")
+    assert orphan is not None
+    assert orphan.type == "load_balancer"
+    assert orphan.attributes["lb_type"] == "classic"
+    assert [e for e in graph.edges if e.target == "legacy-classic-elb"] == []
+
+
 def test_include_orphans_does_not_change_eni_anchored_edges(full_bundle):
     # Orphans only add isolated nodes/edges; the ENI-anchored core is unchanged.
     base = build_graph(full_bundle).to_dict()

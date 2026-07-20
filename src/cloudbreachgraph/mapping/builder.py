@@ -144,11 +144,11 @@ def _vpc_node(vpc: Vpc) -> Node:
 def build_graph(collected: dict[str, Any], *, include_orphans: bool = False) -> Graph:
     """Build the topology graph from a Phase 1 ``collect_all()`` bundle.
 
-    The graph is ENI-anchored: by default only the subnets and VPCs that an ENI (transitively)
-    references appear. Set ``include_orphans=True`` to *also* emit every collected subnet and
-    VPC that no ENI references — an orphan subnet still gets its ``in_vpc`` edge, and an orphan
-    VPC is added as an isolated node. Phase 3's CLI exposes this as ``--include-orphans``
-    (default off, matching the ENI-anchored view).
+    The graph is ENI-anchored: by default only the resources an ENI (transitively) references
+    appear. Set ``include_orphans=True`` to *also* emit every collected resource that no ENI
+    references — subnets (each still with its ``in_vpc`` edge), VPCs, EC2 instances and load
+    balancers — as isolated nodes. Phase 3's CLI exposes this as ``--include-orphans`` (default
+    off, matching the ENI-anchored view).
     """
     meta = dict(collected.get("meta", {}))
     meta.setdefault("tool_version", __version__)
@@ -203,10 +203,20 @@ def build_graph(collected: dict[str, Any], *, include_orphans: bool = False) -> 
         _ensure_vpc_node(graph, vpc_id, vpcs)
         graph.add_edge(Edge(source=subnet_id, target=vpc_id, relationship="in_vpc"))
 
-    # 5. Orphan VPCs (referenced by no subnet at all) — only when including orphans.
+    # 5. Orphans — only when requested: surface every collected resource that no ENI references,
+    #    as an isolated node. Re-adding an already-referenced resource is an idempotent merge, so
+    #    this cleanly adds just the unreferenced ones (VPCs with no subnet, instances with no ENI,
+    #    load balancers with no ENI). Instances and LBs have no outgoing edges in this model, so an
+    #    orphan of either is a standalone node carrying its own subnet/vpc metadata.
     if include_orphans:
-        for vpc_id in vpcs:
-            _ensure_vpc_node(graph, vpc_id, vpcs)
+        for vpc in vpcs.values():
+            _ensure_vpc_node(graph, vpc.id, vpcs)
+        for inst in instances.values():
+            if inst.id:
+                graph.add_node(_instance_node(inst))
+        for lb in (*elbv2, *classic):
+            if lb.node_id:
+                graph.add_node(_lb_node(lb))
 
     return graph
 
