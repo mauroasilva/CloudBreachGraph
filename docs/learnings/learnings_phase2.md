@@ -5,32 +5,39 @@
 
 ## 1. What this phase delivered
 
-- **`model/resources.py`** — five frozen-style dataclasses, each with a `from_collected(dict)`
-  classmethod consuming Phase 1's normalized dicts:
+- **`model/resources.py`** — one dataclass **per AWS resource type**, each with a
+  `from_collected(dict)` classmethod consuming Phase 1's normalized dicts:
   - `Eni` — `id, subnet_id, vpc_id, interface_type, description, status, availability_zone,
     requester_id, requester_managed, attachment_instance_id, private_ips, security_groups`.
     `private_ips`/`security_groups` are flattened to `list[str]` from the raw
     `PrivateIpAddresses[]`/`Groups[]`.
   - `Ec2Instance` — `id, state, instance_type, vpc_id, subnet_id, name` (`state` = `State.Name`;
     `name` = the `Name` tag or `None`).
-  - `LoadBalancer` — `node_id, name, lb_type, scheme, dns_name, vpc_id, arn`. **Two constructors**
-    because ELBv2 and Classic differ: `LoadBalancer.from_collected(elbv2_dict)` (ALB/NLB/GWLB,
-    `node_id = LoadBalancerArn`) and `LoadBalancer.from_classic(classic_dict)`
-    (`node_id = LoadBalancerName`, `lb_type = "classic"`, reads Classic's odd `VPCId` key).
-    `.elb_token` property returns the `app/<name>/<id>` (or `net/`,`gwy/`) ARN suffix for
-    description matching; `None` for Classic.
+  - `Elbv2LoadBalancer` — `arn, name, lb_type, scheme, dns_name, vpc_id`; `.node_id` property
+    (= `arn`) and `.elb_token` property (the `app/<name>/<id>` / `net/` / `gwy/` ARN suffix used
+    to match ENI descriptions). `from_collected` reads a `load_balancers_v2` dict.
+  - `ClassicLoadBalancer` — `name, scheme, dns_name, vpc_id`; `.node_id` property (= `name`),
+    `.lb_type` property (constant `"classic"`). `from_collected` reads a `load_balancers_classic`
+    dict, including Classic's odd `VPCId` (capital P-C) key. **No `elb_token`** — Classic ELBs
+    are matched by name, not ARN token.
   - `Subnet` — `id, vpc_id, cidr, availability_zone, name`.
   - `Vpc` — `id, cidr, is_default, name`.
+
+  **ELBv2 and Classic are two separate dataclasses on purpose** (they are two separate AWS APIs):
+  a schema change to one can't ripple into the other. The mapping layer treats them uniformly
+  through a small structural `Protocol` (`_LoadBalancerLike` in `builder.py`) — no shared base
+  class, so the two stay decoupled while both render to the single `load_balancer` node.
 - **`model/graph.py`** — `Node(id, type, label, attributes)`, `Edge(source, target, relationship,
   attributes)`, and `Graph`:
   - `add_node` merges attributes on duplicate id (incoming wins per-key), upgrades a placeholder
     label/type; `add_edge` de-dupes on `(source, target, relationship)` (first wins).
   - `nodes` sorted by `(type, id)`; `edges` sorted by `(source, target, relationship)`.
   - `get_node(id)` accessor; `to_dict()` returns the Phase 3 contract (see §2).
-- **`mapping/builder.py`** — `build_graph(collected: dict) -> Graph` implementing the §5 rules in
-  the requested order, plus `_parse_elb_description`, node factories, and the attribution helper.
+- **`mapping/builder.py`** — `build_graph(collected: dict, *, include_orphans=False) -> Graph`
+  implementing the §5 rules in the requested order, plus the `_LoadBalancerLike` protocol,
+  `_parse_elb_description`, node factories, and the attribution helper.
 - **Tests** — `tests/test_resources.py` (8), `tests/test_graph.py` (5), `tests/test_builder.py`
-  (15). Total suite now **58 tests, fully offline** (30 Phase 1 + 28 Phase 2).
+  (19). Total suite now **62 tests, fully offline** (30 Phase 1 + 32 Phase 2).
 
 Layout matches `docs/02_architecture.md §2` exactly — no deviations. `model/` and `mapping/` were
 empty packages from Phase 1; `output/` and `cli.py` remain untouched (Phase 3).
@@ -52,6 +59,13 @@ empty packages from Phase 1; `output/` and `cli.py` remain untouched (Phase 3).
   `accounts`) **plus** `tool_version` (from `cloudbreachgraph.__version__`).
 - **No `generated_at` is added** — that would break deterministic test output. Phase 3's JSON
   writer should stamp a timestamp at write time if it wants one, not `build_graph`.
+
+Entrypoint signature Phase 3 calls:
+
+```python
+from cloudbreachgraph.mapping.builder import build_graph
+build_graph(collected: dict, *, include_orphans: bool = False) -> Graph
+```
 
 ### 2b. Node `type` values and the `attributes` keys emitted per type
 
@@ -83,13 +97,14 @@ Only load-balancer attachment edges carry `match_rule` — Phase 3 can label tho
 
 ## 3. Decisions & rationale
 
-- **Referenced-only subnet/VPC nodes (ENI-anchored graph).** Per `docs/01_overview.md` and §5,
-  the ENI is the anchor: subnet nodes arise from ENI `SubnetId` references (§5.1) and VPC nodes
-  from those subnets (§5.2). A collected subnet/VPC that **no ENI references is not emitted** —
-  the graph is the reachability map around ENIs, not a full inventory dump. This keeps the
-  "every subnet has exactly one `in_vpc` edge" invariant trivially true (each subnet node comes
-  from the ENI loop and gets exactly one VPC edge). *If Phase 3 wants orphan subnets/VPCs shown,
-  that's a deliberate extension, not a bug.*
+- **ENI-anchored graph by default, orphans opt-in via `include_orphans`.** Per
+  `docs/01_overview.md` and §5, the ENI is the anchor: subnet nodes arise from ENI `SubnetId`
+  references (§5.1) and VPC nodes from those subnets (§5.2). By default a collected subnet/VPC
+  that **no ENI references is not emitted** — the graph is the reachability map around ENIs, not a
+  full inventory dump. `build_graph(collected, include_orphans=True)` flips this on: it *also*
+  emits every collected subnet (with its own `in_vpc` edge) and every collected VPC (as an
+  isolated node) that no ENI references. Either way the "every subnet node has exactly one
+  `in_vpc` edge" invariant holds. Phase 3 must surface this as a CLI flag — see §6.
 - **`match_rule` only on LB edges.** The docs mandate `match_rule` for load-balancer attribution
   (§5.4). Instance attachment (§5.3) is unambiguous, so its edge carries `{}` rather than a
   synthetic rule name — keeps the signal meaningful.
@@ -115,11 +130,16 @@ Only load-balancer attachment edges carry `match_rule` — Phase 3 can label tho
 
 ## 4. Deviations from the plan
 
-- **`LoadBalancer` has two constructors, not one.** `docs/03_phase_plan.md` says "each with a
-  `from_collected(dict)`". ELBv2 and Classic shapes differ too much (ARN vs. name, `VpcId` vs.
-  `VPCId`) for one constructor to be honest, so `from_collected` handles the ELBv2 shape and
-  `from_classic` handles Classic. Documented here so Phase 3 (and any test) knows both entry
-  points.
+- **Two load-balancer dataclasses instead of one `LoadBalancer`.** `docs/03_phase_plan.md` lists a
+  single `LoadBalancer` dataclass. Because ELBv2 and Classic ELB are separate AWS APIs with
+  materially different shapes (ARN vs. name identity, `VpcId` vs. `VPCId`, token vs. name
+  matching), they are split into `Elbv2LoadBalancer` and `ClassicLoadBalancer` so a future change
+  to one can't ripple into the other. Each honors the literal "one `from_collected(dict)`" contract
+  (no `from_classic` overload). Both satisfy the `_LoadBalancerLike` protocol in `builder.py` and
+  render to the single `load_balancer` graph node, so the Phase 3 node contract is unchanged.
+- **`build_graph` gained an `include_orphans` keyword** (default `False`) so the tool can show
+  subnets/VPCs with no matching ENI. This is a superset of the documented behavior — the default
+  is exactly the ENI-anchored graph the docs describe. Phase 3 wires it to a CLI flag (§6).
 - Otherwise no deviations. Node/edge/`to_dict` shapes match `docs/02_architecture.md §6` and the
   `docs/03_phase_plan.md` Phase 2→3 contract.
 
@@ -154,9 +174,12 @@ Only load-balancer attachment edges carry `match_rule` — Phase 3 can label tho
   distinctly (dashed); label LB edges with `attributes["match_rule"]`; cluster subnets/ENIs inside
   their VPC (`subgraph cluster_*`). Add `generated_at` at write time if desired (kept out of
   `build_graph` for determinism).
-- **Orphan resources:** collected subnets/VPCs/instances/LBs with **no** ENI reference are not in
-  the graph (see §3). If a full-inventory view is wanted, add them as isolated nodes — a conscious
-  Phase 3+ choice, not implied by v1.
+- **Phase 3 — wire the orphan flag (requested).** `build_graph` already accepts
+  `include_orphans: bool = False` (§3/§4). The CLI must expose it — recommended:
+  `--include-orphans` (store_true, default off) to show subnets/VPCs with no matching ENI,
+  passed straight through as `build_graph(collected, include_orphans=args.include_orphans)`.
+  Nothing else in the pipeline changes. Orphan EC2 instances / LBs are still not surfaced (only
+  subnets/VPCs, which is what the request covers); extend the same way if ever wanted.
 - **Real-account ELB verification:** capture and add fixtures for a Classic-ELB ENI and a GWLB ENI
   to promote §5's Classic/GWLB rules from "unit-tested against synthetic data" to "verified".
 - `flow_logs` / other roles: unaffected — new node/edge types plug into the same `Graph` model.
@@ -165,7 +188,7 @@ Only load-balancer attachment edges carry `match_rule` — Phase 3 can label tho
 
 ```bash
 pip install -e '.[dev]'          # or: pip install pytest ruff
-python -m pytest -q              # 58 tests, fully offline via tests/fixtures/
+python -m pytest -q              # 62 tests, fully offline via tests/fixtures/
 python -m pytest tests/test_builder.py tests/test_graph.py tests/test_resources.py -q  # Phase 2 only
 ruff check . && ruff format --check .
 ```

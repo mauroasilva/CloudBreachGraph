@@ -10,9 +10,10 @@ from conftest import load_fixture
 
 from cloudbreachgraph.aws import collectors
 from cloudbreachgraph.model.resources import (
+    ClassicLoadBalancer,
     Ec2Instance,
+    Elbv2LoadBalancer,
     Eni,
-    LoadBalancer,
     Subnet,
     Vpc,
 )
@@ -65,25 +66,26 @@ def test_ec2_instance_without_name_tag_has_none():
     assert inst.state == "stopped"
 
 
-def test_loadbalancer_from_collected_elbv2_token():
+def test_elbv2_loadbalancer_from_collected_token():
     lbs = _normalized(
         "elbv2_describe-load-balancers.json", "LoadBalancers", collectors._normalize_elbv2
     )
-    alb = LoadBalancer.from_collected(next(x for x in lbs if x["Type"] == "application"))
+    alb = Elbv2LoadBalancer.from_collected(next(x for x in lbs if x["Type"] == "application"))
     assert alb.node_id == alb.arn
     assert alb.lb_type == "application"
     assert alb.elb_token == "app/my-alb/50dc6c495c0c9188"
 
 
-def test_loadbalancer_from_classic_uses_odd_vpcid_key():
+def test_classic_loadbalancer_from_collected_uses_odd_vpcid_key():
     raw = collectors._normalize_classic_elb(
         load_fixture("elb_describe-load-balancers.json")["LoadBalancerDescriptions"][0]
     )
-    lb = LoadBalancer.from_classic(raw)
+    lb = ClassicLoadBalancer.from_collected(raw)
     assert lb.node_id == "legacy-classic-elb"
     assert lb.lb_type == "classic"
     assert lb.vpc_id == "vpc-0aaaaaaaaaaaaaaaa"  # sourced from Classic's "VPCId" spelling
-    assert lb.elb_token is None  # Classic ELBs are matched by name, not token
+    # Classic ELBs have no ARN token; they're matched by name instead.
+    assert not hasattr(lb, "elb_token")
 
 
 def test_subnet_and_vpc_from_collected():

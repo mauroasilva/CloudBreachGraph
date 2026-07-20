@@ -5,10 +5,12 @@ dicts** produced by Phase 1's collectors (see ``docs/learnings/learnings_phase1.
 The normalized dicts keep the original AWS key names, so these constructors read fields
 like ``d["Attachment"]["InstanceId"]`` exactly as documented in ``docs/02_architecture.md §4``.
 
-:class:`LoadBalancer` covers both the ELBv2 (ALB/NLB/GWLB) and Classic-ELB shapes, which
-differ enough that it exposes two constructors: :meth:`LoadBalancer.from_collected` for the
-``load_balancers_v2`` shape and :meth:`LoadBalancer.from_classic` for ``load_balancers_classic``
-(note Classic's odd ``VPCId`` spelling — see the Phase 1 learnings).
+ELBv2 (ALB/NLB/GWLB) and Classic ELB are **separate** AWS APIs with distinct response shapes,
+so they get **separate** dataclasses — :class:`Elbv2LoadBalancer` and
+:class:`ClassicLoadBalancer` — each with its own ``from_collected``. Keeping them apart means a
+future change to one (identity is ARN vs. name; ``VpcId`` vs. Classic's odd ``VPCId`` spelling;
+token vs. name description-matching) can't ripple into the other. Both still render to the single
+``load_balancer`` graph node — the mapping layer treats them through a small structural protocol.
 """
 
 from __future__ import annotations
@@ -91,59 +93,81 @@ class Ec2Instance:
 
 
 @dataclass
-class LoadBalancer:
-    """A load balancer an ENI may belong to (``docs/02_architecture.md §5.4``).
+class Elbv2LoadBalancer:
+    """An ELBv2 load balancer — ALB, NLB or GWLB (``docs/02_architecture.md §5.4.1``).
 
-    ``node_id`` is the graph node id: the ELBv2 ``LoadBalancerArn`` for ALB/NLB/GWLB, or the
-    ``LoadBalancerName`` for a Classic ELB (which has no ARN in the normalized shape).
+    Identity is the ``LoadBalancerArn``; ENIs are attributed by matching their ``Description``
+    token against the ARN suffix (see :attr:`elb_token`).
     """
 
-    node_id: str
+    arn: str | None
     name: str | None
-    lb_type: str | None  # "application" | "network" | "gateway" | "classic"
+    lb_type: str | None  # "application" | "network" | "gateway"
     scheme: str | None
     dns_name: str | None
     vpc_id: str | None
-    arn: str | None = None
 
     @classmethod
-    def from_collected(cls, d: dict[str, Any]) -> LoadBalancer:
-        """Build from a ``load_balancers_v2`` (ELBv2: ALB/NLB/GWLB) normalized dict."""
-        arn = d.get("LoadBalancerArn")
+    def from_collected(cls, d: dict[str, Any]) -> Elbv2LoadBalancer:
+        """Build from a ``load_balancers_v2`` normalized dict."""
         return cls(
-            node_id=arn,
+            arn=d.get("LoadBalancerArn"),
             name=d.get("LoadBalancerName"),
             lb_type=d.get("Type"),
             scheme=d.get("Scheme"),
             dns_name=d.get("DNSName"),
             vpc_id=d.get("VpcId"),
-            arn=arn,
         )
 
-    @classmethod
-    def from_classic(cls, d: dict[str, Any]) -> LoadBalancer:
-        """Build from a ``load_balancers_classic`` normalized dict (note the ``VPCId`` key)."""
-        name = d.get("LoadBalancerName")
-        return cls(
-            node_id=name,
-            name=name,
-            lb_type="classic",
-            scheme=d.get("Scheme"),
-            dns_name=d.get("DNSName"),
-            vpc_id=d.get("VPCId"),  # Classic ELB uses "VPCId" (capital P-C); see Phase 1 learnings.
-            arn=None,
-        )
+    @property
+    def node_id(self) -> str | None:
+        """Graph node id for an ELBv2 LB: its ARN."""
+        return self.arn
 
     @property
     def elb_token(self) -> str | None:
         """The ``app/<name>/<id>`` (or ``net/``/``gwy/``) token an ENI ``Description`` matches.
 
         Derived from the suffix of the ELBv2 ARN (``...:loadbalancer/app/<name>/<id>``).
-        ``None`` for Classic ELBs, which are matched by name instead.
         """
         if self.arn and ":loadbalancer/" in self.arn:
             return self.arn.rsplit(":loadbalancer/", 1)[-1]
         return None
+
+
+@dataclass
+class ClassicLoadBalancer:
+    """A Classic ELB (``docs/02_architecture.md §5.4.2``).
+
+    Identity is the ``LoadBalancerName`` (Classic ELBs have no ARN in the normalized shape);
+    ENIs are attributed by matching their ``Description`` (``"ELB <name>"``) against the name.
+    """
+
+    name: str | None
+    scheme: str | None
+    dns_name: str | None
+    vpc_id: str | None
+
+    @classmethod
+    def from_collected(cls, d: dict[str, Any]) -> ClassicLoadBalancer:
+        """Build from a ``load_balancers_classic`` normalized dict (note the ``VPCId`` key)."""
+        return cls(
+            name=d.get("LoadBalancerName"),
+            scheme=d.get("Scheme"),
+            dns_name=d.get("DNSName"),
+            # Classic ELB uses "VPCId" (capital P-C), unlike every other resource; see Phase 1.
+            vpc_id=d.get("VPCId"),
+        )
+
+    @property
+    def node_id(self) -> str | None:
+        """Graph node id for a Classic ELB: its name."""
+        return self.name
+
+    @property
+    def lb_type(self) -> str:
+        """Classic ELBs have a fixed type used for the graph node attribute."""
+        return "classic"
 
 
 @dataclass

@@ -15,14 +15,38 @@ Referenced-but-missing subnets, VPCs, instances and load balancers become ``synt
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Protocol
 
 from .. import __version__
 from ..model.graph import Edge, Graph, Node
-from ..model.resources import Ec2Instance, Eni, LoadBalancer, Subnet, Vpc
+from ..model.resources import (
+    ClassicLoadBalancer,
+    Ec2Instance,
+    Elbv2LoadBalancer,
+    Eni,
+    Subnet,
+    Vpc,
+)
 
 # Interface types that signal an LB-owned ENI even when the description didn't resolve (§5.4.3).
 _LB_INTERFACE_TYPES = {"network_load_balancer", "gateway_load_balancer"}
+
+
+class _LoadBalancerLike(Protocol):
+    """What the graph needs from any load balancer, ELBv2 or Classic.
+
+    :class:`~cloudbreachgraph.model.resources.Elbv2LoadBalancer` and
+    :class:`~cloudbreachgraph.model.resources.ClassicLoadBalancer` each satisfy this
+    structurally without sharing a base class, so the two resource types stay decoupled while
+    still rendering to the one ``load_balancer`` node.
+    """
+
+    node_id: str | None
+    name: str | None
+    lb_type: str | None
+    scheme: str | None
+    dns_name: str | None
+    vpc_id: str | None
 
 
 def _parse_elb_description(description: str) -> tuple[str | None, str | None]:
@@ -78,7 +102,7 @@ def _instance_node(inst: Ec2Instance) -> Node:
     )
 
 
-def _lb_node(lb: LoadBalancer) -> Node:
+def _lb_node(lb: _LoadBalancerLike) -> Node:
     return Node(
         id=lb.node_id,
         type="load_balancer",
@@ -117,8 +141,15 @@ def _vpc_node(vpc: Vpc) -> Node:
 # --------------------------------------------------------------------------- #
 # Builder
 # --------------------------------------------------------------------------- #
-def build_graph(collected: dict[str, Any]) -> Graph:
-    """Build the topology graph from a Phase 1 ``collect_all()`` bundle."""
+def build_graph(collected: dict[str, Any], *, include_orphans: bool = False) -> Graph:
+    """Build the topology graph from a Phase 1 ``collect_all()`` bundle.
+
+    The graph is ENI-anchored: by default only the subnets and VPCs that an ENI (transitively)
+    references appear. Set ``include_orphans=True`` to *also* emit every collected subnet and
+    VPC that no ENI references — an orphan subnet still gets its ``in_vpc`` edge, and an orphan
+    VPC is added as an isolated node. Phase 3's CLI exposes this as ``--include-orphans``
+    (default off, matching the ENI-anchored view).
+    """
     meta = dict(collected.get("meta", {}))
     meta.setdefault("tool_version", __version__)
     graph = Graph(meta=meta)
@@ -130,8 +161,10 @@ def build_graph(collected: dict[str, Any]) -> Graph:
     subnets = {s.id: s for s in map(Subnet.from_collected, collected.get("subnets", []))}
     vpcs = {v.id: v for v in map(Vpc.from_collected, collected.get("vpcs", []))}
 
-    elbv2 = list(map(LoadBalancer.from_collected, collected.get("load_balancers_v2", [])))
-    classic = list(map(LoadBalancer.from_classic, collected.get("load_balancers_classic", [])))
+    elbv2 = list(map(Elbv2LoadBalancer.from_collected, collected.get("load_balancers_v2", [])))
+    classic = list(
+        map(ClassicLoadBalancer.from_collected, collected.get("load_balancers_classic", []))
+    )
     elbv2_by_token = {lb.elb_token: lb for lb in elbv2 if lb.elb_token}
     classic_by_name = {lb.name: lb for lb in classic if lb.name}
 
@@ -153,14 +186,27 @@ def build_graph(collected: dict[str, Any]) -> Graph:
         subnet_vpc_hint.setdefault(subnet_id, eni.vpc_id)
         graph.add_edge(Edge(source=eni.id, target=subnet_id, relationship="in_subnet"))
 
+    # The subnets that get an in_vpc edge: those referenced by an ENI, plus (optionally) every
+    # collected subnet that no ENI references. dict.fromkeys keeps insertion order deterministic.
+    subnet_ids = dict.fromkeys(subnet_vpc_hint)
+    if include_orphans:
+        for subnet_id in subnets:
+            subnet_ids.setdefault(subnet_id)
+
     # 4. Subnet -> VPC (always), exactly one edge per subnet node.
-    for subnet_id in subnet_vpc_hint:
+    for subnet_id in subnet_ids:
         subnet = subnets.get(subnet_id)
-        vpc_id = subnet.vpc_id if subnet else subnet_vpc_hint[subnet_id]
+        vpc_id = subnet.vpc_id if subnet else subnet_vpc_hint.get(subnet_id)
         if not vpc_id:
             vpc_id = f"unknown-vpc:{subnet_id}"
+        _ensure_subnet_node(graph, subnet_id, subnets)  # covers orphan subnets too
         _ensure_vpc_node(graph, vpc_id, vpcs)
         graph.add_edge(Edge(source=subnet_id, target=vpc_id, relationship="in_vpc"))
+
+    # 5. Orphan VPCs (referenced by no subnet at all) — only when including orphans.
+    if include_orphans:
+        for vpc_id in vpcs:
+            _ensure_vpc_node(graph, vpc_id, vpcs)
 
     return graph
 
@@ -169,8 +215,8 @@ def _attribute_eni(
     graph: Graph,
     eni: Eni,
     instances: dict[str, Ec2Instance],
-    elbv2_by_token: dict[str, LoadBalancer],
-    classic_by_name: dict[str, LoadBalancer],
+    elbv2_by_token: dict[str, Elbv2LoadBalancer],
+    classic_by_name: dict[str, ClassicLoadBalancer],
 ) -> None:
     """Resolve at most one ``attached_to`` edge for an ENI (``docs/02_architecture.md §5``)."""
     # 5.3 — instance attachment wins outright; when present, never attribute to an LB.

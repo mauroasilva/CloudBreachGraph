@@ -312,6 +312,71 @@ def test_invariant_no_eni_attached_to_both_instance_and_lb(full_bundle):
 
 
 # --------------------------------------------------------------------------- #
+# include_orphans — show/hide subnets & VPCs that no ENI references
+# --------------------------------------------------------------------------- #
+def test_orphan_vpc_hidden_by_default(full_bundle):
+    # The fixtures include a default VPC (vpc-0defdefdefdefdefd) that no subnet/ENI references.
+    graph = build_graph(full_bundle)
+    assert graph.get_node("vpc-0defdefdefdefdefd") is None
+
+
+def test_include_orphans_adds_unreferenced_vpc(full_bundle):
+    graph = build_graph(full_bundle, include_orphans=True)
+    orphan = graph.get_node("vpc-0defdefdefdefdefd")
+    assert orphan is not None
+    assert orphan.type == "vpc"
+    assert orphan.attributes["is_default"] is True
+    # It is a real (not synthetic) node, just isolated (no in_vpc edge points at it).
+    assert "synthetic" not in orphan.attributes
+
+
+def test_include_orphans_adds_unreferenced_subnet_with_vpc_edge():
+    bundle = _bundle(
+        network_interfaces=[_eni("eni-a", subnet_id="subnet-used", vpc_id="vpc-1")],
+        subnets=[
+            {
+                "SubnetId": "subnet-used",
+                "VpcId": "vpc-1",
+                "CidrBlock": "10.0.1.0/24",
+                "AvailabilityZone": "us-east-1a",
+                "Tags": [],
+            },
+            {
+                "SubnetId": "subnet-orphan",
+                "VpcId": "vpc-1",
+                "CidrBlock": "10.0.9.0/24",
+                "AvailabilityZone": "us-east-1b",
+                "Tags": [],
+            },
+        ],
+        vpcs=[{"VpcId": "vpc-1", "CidrBlock": "10.0.0.0/16", "IsDefault": False, "Tags": []}],
+    )
+    # Hidden by default.
+    default_graph = build_graph(bundle)
+    assert default_graph.get_node("subnet-orphan") is None
+
+    # Shown, with its own in_vpc edge, when requested.
+    graph = build_graph(bundle, include_orphans=True)
+    assert graph.get_node("subnet-orphan") is not None
+    in_vpc = [e for e in graph.edges if e.source == "subnet-orphan" and e.relationship == "in_vpc"]
+    assert len(in_vpc) == 1
+    assert in_vpc[0].target == "vpc-1"
+    # The invariant still holds: every subnet node has exactly one in_vpc edge.
+    for subnet_id in [n.id for n in graph.nodes if n.type == "subnet"]:
+        edges = [e for e in graph.edges if e.source == subnet_id and e.relationship == "in_vpc"]
+        assert len(edges) == 1
+
+
+def test_include_orphans_does_not_change_eni_anchored_edges(full_bundle):
+    # Orphans only add isolated nodes/edges; the ENI-anchored core is unchanged.
+    base = build_graph(full_bundle).to_dict()
+    withorphans = build_graph(full_bundle, include_orphans=True).to_dict()
+    assert base["edges"] == [e for e in withorphans["edges"] if e in base["edges"]]
+    base_ids = {n["id"] for n in base["nodes"]}
+    assert base_ids.issubset({n["id"] for n in withorphans["nodes"]})
+
+
+# --------------------------------------------------------------------------- #
 # Determinism
 # --------------------------------------------------------------------------- #
 def test_build_is_deterministic(full_bundle):
