@@ -1,0 +1,132 @@
+# 03 — Phase Plan & Interface Contracts
+
+Three phases, three **separate** Claude Code sessions. Each phase is defined by its inputs
+(what earlier phases produced), its deliverables, its acceptance criteria, and the
+**interface contract** it exposes to the next phase. Contracts are what make segregated
+sessions safe: as long as a phase honors its contract, the next session can build against it
+without re-reading everything.
+
+If a phase must deviate from a contract, it records the deviation in `learnings_phaseX.md`.
+
+---
+
+## Phase 1 — Foundation & AWS CLI Collection
+
+**Goal:** Stand up the project and a reliable, testable data-collection layer.
+
+**Deliverables**
+- `pyproject.toml`, package skeleton under `src/cloudbreachgraph/`, `README.md` stub.
+- `aws/runner.py`: a subprocess wrapper that runs `aws <args> --output json --no-cli-pager`,
+  threads through `--region`/`--profile`, parses JSON, and raises a clear error on failure.
+- `aws/collectors.py`: functions returning normalized lists:
+  - `collect_network_interfaces(...) -> list[dict]`
+  - `collect_ec2_instances(...) -> list[dict]`  (flattened out of Reservations)
+  - `collect_load_balancers_v2(...) -> list[dict]`
+  - `collect_load_balancers_classic(...) -> list[dict]`
+  - `collect_subnets(...) -> list[dict]`
+  - `collect_vpcs(...) -> list[dict]`
+  - `collect_all(...) -> dict` bundling the above under fixed keys (see contract).
+- Optional `--cache-dir` raw-JSON dump.
+- `tests/fixtures/` with at least one recorded/representative JSON sample per command, plus
+  unit tests that mock `subprocess` and assert the collectors normalize correctly.
+
+**Acceptance criteria**
+- `pip install -e .` works; `python -c "import cloudbreachgraph"` works.
+- Collectors run against fixtures without touching the network in tests.
+- Runner surfaces AWS CLI stderr on non-zero exit.
+- `learnings_phase1.md` written (see `04_conventions.md` template).
+
+**Interface contract exposed to Phase 2** — `collect_all()` returns exactly:
+```python
+{
+    "meta": {"region": str, "profile": str | None, "account_id": str | None},
+    "network_interfaces": [ <normalized ENI dict>, ... ],
+    "ec2_instances":      [ <normalized instance dict>, ... ],
+    "load_balancers_v2":  [ <normalized elbv2 dict>, ... ],
+    "load_balancers_classic": [ <normalized classic elb dict>, ... ],
+    "subnets":            [ <normalized subnet dict>, ... ],
+    "vpcs":               [ <normalized vpc dict>, ... ],
+}
+```
+Each normalized dict **must** preserve the fields listed in `02_architecture.md §4`
+(at minimum the id + the fields used for mapping). Phase 1 documents the exact normalized
+shape it settled on in `learnings_phase1.md` — Phase 2 codes against that.
+
+---
+
+## Phase 2 — Domain Models, Graph Construction & Relationship Mapping
+
+**Goal:** Turn collected data into a graph by applying the relationship rules.
+
+**Inputs:** Phase 1 code + `docs/learnings/learnings_phase1.md` (the exact collector output shape).
+
+**Deliverables**
+- `model/resources.py`: dataclasses `Eni`, `Ec2Instance`, `LoadBalancer`, `Subnet`, `Vpc`,
+  each with a `from_collected(dict)` constructor.
+- `model/graph.py`: `Node`, `Edge`, `Graph` with `add_node` (merge-on-duplicate),
+  `add_edge`, deterministic ordering, and `to_dict()` (the Phase 3 contract).
+- `mapping/builder.py`: `build_graph(collected: dict) -> Graph` implementing, in order:
+  ENI enumeration → EC2/LB attribution (rules in `02_architecture.md §5`) → subnet → VPC,
+  including synthetic/unresolved nodes and `match_rule` edge metadata.
+- Tests covering each mapping rule: instance-attached ENI, ALB ENI, NLB ENI, Classic-ELB
+  ENI, unattached service ENI (NAT/endpoint), and missing-subnet/VPC synthetic cases.
+
+**Acceptance criteria**
+- `build_graph(collect_all_fixture)` produces the expected nodes/edges deterministically.
+- No ENI is ever attached to both an instance and a load balancer.
+- Every ENI has exactly one `in_subnet` edge; every subnet has exactly one `in_vpc` edge.
+- `learnings_phase2.md` written, including any real-account quirks in ELB description parsing.
+
+**Interface contract exposed to Phase 3** — `Graph.to_dict()` returns:
+```python
+{
+  "meta":  {...},
+  "nodes": [ {"id","type","label","attributes"}, ... ],   # sorted by (type, id)
+  "edges": [ {"source","target","relationship","attributes"}, ... ],  # sorted
+}
+```
+
+---
+
+## Phase 3 — Output, Visualization & End-to-End CLI
+
+**Goal:** Make the tool usable end to end and produce the map artifacts.
+
+**Inputs:** Phase 1 + Phase 2 code + `docs/learnings/learnings_phase1.md` + `docs/learnings/learnings_phase2.md`.
+
+**Deliverables**
+- `output/json_export.py`: `write_json(graph, path)`.
+- `output/dot_export.py`: `write_dot(graph, path)` — nodes colored by type, VPC clustering,
+  relationship-labeled edges; optional `render(dot_path, fmt)` shelling out to `dot`.
+- `cli.py`: argparse entrypoint wiring `collect_all` → `build_graph` → writers.
+  Flags: `--region`, `--profile`, `--cache-dir`, `--output-dir`, `--render {png,svg}`,
+  `--from-cache <dir>` (build from previously cached JSON with no live calls).
+- `pyproject.toml` console-script entry `cloudbreachgraph = cloudbreachgraph.cli:main`.
+- End-to-end test: fixtures → CLI (with `--from-cache`) → assert `graph.json` and
+  `graph.dot` are produced and well-formed.
+- Update the user-facing `README.md` with real usage examples.
+
+**Acceptance criteria**
+- `cloudbreachgraph --from-cache tests/fixtures/... --output-dir out/` produces
+  `graph.json` + `graph.dot` offline.
+- Graceful degradation when `dot` is not installed (still writes `.dot`, warns on render).
+- Read-only guarantee holds (no mutating calls anywhere).
+- `learnings_phase3.md` written, including final CLI surface and any follow-up ideas.
+
+---
+
+## Cross-phase dependency graph
+
+```
+Phase 1 (collection) ──► Phase 2 (graph/mapping) ──► Phase 3 (output/CLI)
+      │                        │                            │
+   docs/learnings/        docs/learnings/              docs/learnings/
+   learnings_phase1.md    learnings_phase2.md          learnings_phase3.md
+      └───────────────────────┴────────────────────────────┘
+                    all committed; each read by later phases
+```
+
+## Definition of done for the whole build
+- One command against a live account yields a correct `graph.json` + `graph.dot`.
+- All three `docs/learnings/learnings_phaseX.md` files exist and are accurate.
+- Tests pass offline via fixtures; the tool never mutates AWS.
