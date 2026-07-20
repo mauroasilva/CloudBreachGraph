@@ -175,6 +175,18 @@ def _dot_lines(graph: Graph) -> list[str]:
     for edge in graph.edges:
         out.append(f"  {_edge_stmt(edge)}")
 
+    # Any ENI with a public IP is reachable from the internet: draw a single generic
+    # "Internet" node at the top level and connect each such ENI to it. graph.nodes is
+    # already sorted, so the edges are deterministic.
+    public_enis = [n for n in graph.nodes if n.type == "eni" and n.attributes.get("public_ips")]
+    if public_enis:
+        out.append(
+            '  "Internet" [label="Internet", shape=doubleoctagon, '
+            'style="filled", fillcolor="#FFEBEE"];'
+        )
+        for node in public_enis:
+            out.append(f'  "{_esc(node.id)}" -> "Internet" [label="public_ip"];')
+
     out.append("}")
     return out
 

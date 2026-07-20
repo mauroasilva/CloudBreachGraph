@@ -90,6 +90,11 @@ def test_write_dot_wellformed(graph, tmp_path):
     # ENI labels carry Private IP / Public IP sections.
     assert "Private IP: 10.0.1.10" in text
     assert "Public IP: 54.10.20.30" in text
+    # ENIs with a public IP are connected to a generic "Internet" node.
+    assert '"Internet" [label="Internet"' in text
+    assert '"eni-00instance0000001" -> "Internet" [label="public_ip"];' in text
+    # ENIs without a public IP are not connected to it.
+    assert '"eni-00nlb00000000003" -> "Internet"' not in text
     # Nodes colored by type (a couple of representative fills).
     assert 'fillcolor="#E8F5E9"' in text  # eni
     assert 'fillcolor="#E3F2FD"' in text  # subnet
