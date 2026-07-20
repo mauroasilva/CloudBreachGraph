@@ -46,6 +46,8 @@ def _normalize_eni(raw: dict) -> dict:
             "Status": attachment.get("Status"),
         },
         "PrivateIpAddresses": raw.get("PrivateIpAddresses", []),
+        # Interface-level public IP (the primary private IP's Elastic/public IP), if any.
+        "Association": {"PublicIp": (raw.get("Association") or {}).get("PublicIp")},
         "Groups": raw.get("Groups", []),
     }
 
