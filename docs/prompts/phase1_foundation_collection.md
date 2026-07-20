@@ -42,11 +42,20 @@ Deliver the project scaffolding and the **AWS CLI data-collection layer**:
    **v1 only activates the `network` role**, but build the resolver/registry so `flow_logs` and
    other roles can be bound in config with **no** grammar change (see `docs/05_roadmap.md`).
    Do **not** build the CLI here (that's Phase 3) — just the loader/resolver API.
-4. `aws/collectors.py` — the collector functions and `collect_all(...)` returning the exact
-   dict shape defined in the Phase 1 **interface contract** in `docs/03_phase_plan.md`.
-   Normalize each resource to preserve the fields from `docs/02_architecture.md §4`
-   (flatten EC2 instances out of `Reservations`). Handle empty load-balancer results
-   gracefully (accounts may have none). Optionally support a `--cache-dir` raw-JSON dump.
+4. `aws/collectors.py` — the collector functions, the **explicit role registry**, and the
+   collection driver:
+   - Each collector `collect_x(profile, region) -> list[dict]` runs one `aws` command via
+     `runner.py` and normalizes it, preserving the fields from `docs/02_architecture.md §4`
+     (flatten EC2 instances out of `Reservations`). Collectors stay **role-agnostic** — they know
+     nothing about targets/accounts. Handle empty load-balancer results gracefully.
+   - `ROLE_COLLECTORS` / `ROLE_RESULT_KEYS` — the explicit registry from `docs/02_architecture.md
+     §11.6` binding role `network` to its six collectors and result keys. This is the seam future
+     roles extend; make adding a role a matter of adding a registry entry, not editing the loop.
+   - `collect_all(resolved, roles=["network"]) -> dict` — the driver loop from `§11.7`: for each
+     role, run its registry collectors with that role's resolved profile/region and bundle results
+     under the fixed keys, recording per-role account provenance in `meta`. Return the exact shape
+     in the Phase 1 **interface contract** in `docs/03_phase_plan.md`.
+   - Optionally support a `--cache-dir` raw-JSON dump.
 5. `tests/fixtures/` with a representative recorded JSON sample for **each** AWS command, and
    `pytest` tests that mock the subprocess boundary (the runner) and assert the collectors
    normalize correctly, **plus** tests for `config.py` (alias lookup, account-id lookup,
@@ -73,6 +82,8 @@ Before you finish, create **`docs/learnings/learnings_phase1.md`** using the tem
 `docs/04_conventions.md`. It must capture everything Phase 2 needs, especially:
 - The **exact normalized dict shape** each collector returns and the keys of `collect_all()`
   (this is the contract Phase 2 codes against).
+- The **role registry** (`ROLE_COLLECTORS`/`ROLE_RESULT_KEYS`) and the `collector(profile, region)`
+  signature — so the future `flow_logs` role knows exactly how to register itself.
 - The **exact `config.py` signatures** (`load_config`, `resolve_target`/`resolve_profile`, the
   verify helper), the `ResolvedTarget`/`ResolvedAccount` shapes, and the config schema
   (`accounts` + `targets.<name>.roles`) you settled on — the contract Phase 3's CLI wires into,

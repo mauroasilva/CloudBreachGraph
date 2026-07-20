@@ -11,10 +11,13 @@ forward-looking companion to it.
 ## The extension model in one paragraph
 
 Every collectable resource type belongs to a **role**. A role is fetched from exactly one
-account per run. Users bind roles to accounts inside a **target** (`02_architecture.md §11.2`).
-Adding a feature that reads a new resource type = (1) define a new role, (2) write that role's
-collectors, (3) map its nodes/edges into the existing graph model, (4) let users bind the role
-to an account in config. Steps 1 and 4 already work today; a new feature only writes 2 and 3.
+account per run. Users bind roles to accounts inside a **target** (`02_architecture.md §11.2`),
+and a role resolves to actual `aws` commands through the explicit `ROLE_COLLECTORS` registry
+(`02_architecture.md §11.6`). Adding a feature that reads a new resource type = (1) add a new
+entry to `ROLE_COLLECTORS`/`ROLE_RESULT_KEYS`, (2) write that role's `collect_x(profile, region)`
+collectors, (3) map its nodes/edges into the existing graph model, (4) let users bind the role to
+an account in config. Steps 1 and 4 are pure data; the config grammar, CLI, resolver, and driver
+loop (`§11.7`) don't change.
 
 ## First planned future feature: VPC Flow Logs (`flow_logs` role)
 

@@ -29,14 +29,19 @@ If a phase must deviate from a contract, it records the deviation in `learnings_
   expected account id. **v1 only activates the `network` role**, but build the resolver and the
   registry so `flow_logs` (and other roles) can be bound in config without grammar changes
   (`02_architecture.md §11`, `05_roadmap.md`).
-- `aws/collectors.py`: functions returning normalized lists:
+- `aws/collectors.py`: collector functions, each `collect_x(profile, region) -> list[dict]`:
   - `collect_network_interfaces(...) -> list[dict]`
   - `collect_ec2_instances(...) -> list[dict]`  (flattened out of Reservations)
   - `collect_load_balancers_v2(...) -> list[dict]`
   - `collect_load_balancers_classic(...) -> list[dict]`
   - `collect_subnets(...) -> list[dict]`
   - `collect_vpcs(...) -> list[dict]`
-  - `collect_all(...) -> dict` bundling the above under fixed keys (see contract).
+  - the **`ROLE_COLLECTORS` / `ROLE_RESULT_KEYS` registry** binding role `network` to the six
+    collectors above (`02_architecture.md §11.6`) — the explicit seam future roles extend.
+  - `collect_all(resolved, roles=["network"]) -> dict` — the driver loop of `§11.7` that, per
+    role, runs its registry collectors with that role's resolved profile/region and bundles the
+    results under fixed keys (see contract). Each collector stays role-agnostic; only the loop
+    knows about roles/accounts.
 - Optional `--cache-dir` raw-JSON dump.
 - `tests/fixtures/` with at least one recorded/representative JSON sample per command, plus
   unit tests that mock `subprocess` and assert the collectors normalize correctly.
@@ -55,7 +60,9 @@ If a phase must deviate from a contract, it records the deviation in `learnings_
 **Interface contract exposed to Phase 2** — `collect_all()` returns exactly:
 ```python
 {
-    "meta": {"region": str, "profile": str | None, "account_id": str | None},
+    # meta records per-role account provenance (§11.4/§11.7); v1 has only the network role
+    "meta": {"target": str | None, "region": str,
+             "accounts": {"network": str | None}},   # role -> account_id
     "network_interfaces": [ <normalized ENI dict>, ... ],
     "ec2_instances":      [ <normalized instance dict>, ... ],
     "load_balancers_v2":  [ <normalized elbv2 dict>, ... ],
@@ -64,6 +71,8 @@ If a phase must deviate from a contract, it records the deviation in `learnings_
     "vpcs":               [ <normalized vpc dict>, ... ],
 }
 ```
+The top-level resource keys are `ROLE_RESULT_KEYS["network"]` (§11.6). Future roles add their own
+keys alongside these without disturbing the network ones.
 Each normalized dict **must** preserve the fields listed in `02_architecture.md §4`
 (at minimum the id + the fields used for mapping). Phase 1 documents the exact normalized
 shape it settled on in `learnings_phase1.md` — Phase 2 codes against that.

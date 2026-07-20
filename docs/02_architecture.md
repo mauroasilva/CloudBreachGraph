@@ -367,16 +367,84 @@ raises a clear error if a requested `--target`/`--account`/role can't be resolve
 ### 11.4 Role-aware collection
 
 The collection layer runs **per role**: for each role needed by the current command, resolve
-its account's profile and run that role's collectors with it. In v1 only the `network` role is
-active, so behavior is identical to §3 today — but the loop is structured so adding `flow_logs`
-later is "register the role's collectors + let users bind it," with **no** change to the CLI
-grammar or the graph model. `collect_all` should therefore accept the resolved per-role profile
-map (or, for v1, at least be organized so the `network` role's profile is passed explicitly and
-a second role can be added alongside it). Record each role's resolved/verified account id in
-`Graph.meta` so the map documents which account each part came from.
+its account's profile and run that role's collectors with it. The role→collectors binding is the
+explicit registry in **§11.6**, and the exact driver loop is **§11.7**. In v1 only the `network`
+role is active, so behavior is identical to §3 today — but adding `flow_logs` later is one new
+registry entry ("register the role's collectors + let users bind it"), with **no** change to the
+CLI grammar or the graph model. Record each role's resolved/verified account id in `Graph.meta`
+so the map documents which account each part came from.
 
 ### 11.5 Verification with multiple accounts
 
 Run the §10.3 `sts get-caller-identity` check **once per distinct resolved account** in the
 target, comparing against each account's expected `account_id`. This catches a mis-bound role
 (e.g. a `log_archive` profile that actually points at the workload account).
+
+### 11.6 Role registry — how a role becomes actual `aws` commands
+
+A role name resolves to real AWS CLI calls through an explicit **registry** that binds each role
+to its set of collector functions. This is the single seam future roles plug into. Define it in
+`aws/collectors.py` (or a small `aws/roles.py`) as data, not scattered logic:
+
+```python
+# aws/collectors.py  (Phase 1)
+
+# Each collector is: collect_x(profile: str | None, region: str | None) -> list[dict]
+# and internally calls runner.run_aws([...], profile=profile, region=region), which shells out to
+#   aws <service> <describe-cmd> --region <r> --profile <p> --output json --no-cli-pager
+
+ROLE_COLLECTORS: dict[str, list[Collector]] = {
+    "network": [
+        collect_network_interfaces,   # aws ec2   describe-network-interfaces  -> .NetworkInterfaces[]
+        collect_ec2_instances,        # aws ec2   describe-instances           -> .Reservations[].Instances[]
+        collect_load_balancers_v2,    # aws elbv2 describe-load-balancers      -> .LoadBalancers[]
+        collect_load_balancers_classic,  # aws elb describe-load-balancers     -> .LoadBalancerDescriptions[]
+        collect_subnets,              # aws ec2   describe-subnets              -> .Subnets[]
+        collect_vpcs,                 # aws ec2   describe-vpcs                 -> .Vpcs[]
+    ],
+    # ── future (Phase 4; do NOT implement in v1, see 05_roadmap.md) ───────────────
+    # "flow_logs": [
+    #     collect_flow_logs,          # aws ec2  describe-flow-logs             -> .FlowLogs[]
+    #     collect_log_destinations,   # aws logs describe-log-groups / s3api ...
+    # ],
+}
+
+# The output key each role writes into the collected bundle (see §11.7).
+ROLE_RESULT_KEYS: dict[str, list[str]] = {
+    "network": ["network_interfaces", "ec2_instances", "load_balancers_v2",
+                "load_balancers_classic", "subnets", "vpcs"],
+    # "flow_logs": ["flow_logs", "log_destinations"],  # future
+}
+```
+
+Rules for the registry:
+
+- **Adding a role is data, not control flow.** A new feature adds one entry to `ROLE_COLLECTORS`
+  (+ its result keys) and writes the collectors — nothing in the CLI, config grammar, resolver,
+  or graph model changes.
+- Each collector takes only `(profile, region)` and returns normalized dicts; it must not know
+  about roles, targets, or which account it's running against. That knowledge lives one level up.
+- The registry is the authoritative list of what `network` (and later `flow_logs`) means —
+  §11.1's table is the human summary; this dict is the machine-readable source of truth.
+
+### 11.7 The collection loop (ties §11.3 + §11.6 together)
+
+`collect_all` is the driver. Pseudocode:
+
+```python
+def collect_all(resolved: ResolvedTarget, *, roles: list[str] = ["network"]) -> dict:
+    bundle = {"meta": {"target": ..., "region": ..., "accounts": {}}}
+    for role in roles:                                    # v1: just ["network"]
+        acct = resolved.roles[role]                       # {profile, account_id, region} (§11.3)
+        collectors = ROLE_COLLECTORS[role]                # role -> collectors            (§11.6)
+        keys       = ROLE_RESULT_KEYS[role]               # parallel result-bundle keys
+        for collector, key in zip(collectors, keys):
+            bundle[key] = collector(acct.profile, acct.region)   # -> aws ... via runner.py (§3)
+        bundle["meta"]["accounts"][role] = acct.account_id       # record provenance       (§11.4)
+    return bundle
+```
+
+So the path is always: **role → `resolved.roles[role]` (profile) + `ROLE_COLLECTORS[role]` (commands)
+→ `collector(profile, region)` → `runner.run_aws(...)` → one `aws` subprocess.** In v1 the loop
+runs a single iteration (`network`); binding `flow_logs` later just adds a second iteration that
+happens to use a different account's profile.
