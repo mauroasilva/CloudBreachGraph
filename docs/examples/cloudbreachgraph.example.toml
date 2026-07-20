@@ -1,0 +1,53 @@
+# CloudBreachGraph configuration: accounts, profiles, and targets
+#
+# Copy this to ./cloudbreachgraph.toml (next to where you run the tool) or to
+# ~/.config/cloudbreachgraph/config.toml, then edit for your environment.
+#
+# Two ideas (see docs/02_architecture.md §10 and §11):
+#   * accounts  -> the atom: an alias mapped to an AWS account id + CLI profile.
+#   * targets   -> what you point the tool at: a named environment that binds each
+#                  "resource role" to an account. This is how you say
+#                  "for THESE resources use account X, for THOSE use account Y".
+#
+# Selection precedence (first match wins):
+#   1. --profile <name>        explicit override, applies to every role, ignores this file
+#   2. --target <name>         a target below (may span multiple accounts by role)
+#   3. --account <alias|id>    shorthand: a target whose every role is this one account
+#   4. none of the above       uses default_target/default_account, else the AWS CLI default
+
+default_target = "prod"     # optional: used when neither --target nor --account is given
+
+# ---------------------------------------------------------------------------
+# Accounts: alias -> { account_id, profile, region? }
+# ---------------------------------------------------------------------------
+[accounts.workload_prod]
+account_id = "111111111111"
+profile    = "prod-audit"
+region     = "us-east-1"
+
+[accounts.workload_sandbox]
+account_id = "333333333333"
+profile    = "sandbox-ro"
+
+# A central logging / log-archive account. VPC flow logs are often published here,
+# separate from the account that owns the VPCs.
+[accounts.log_archive]
+account_id = "999999999999"
+profile    = "log-archive-ro"
+region     = "us-east-1"
+
+# ---------------------------------------------------------------------------
+# Targets: bind resource roles to accounts.
+#   role "network"   -> ENIs, EC2, load balancers, subnets, VPCs   (implemented in v1)
+#   role "flow_logs" -> VPC Flow Logs + their destinations         (future; see docs/05_roadmap.md)
+# Any role not listed under [targets.<name>.roles] uses default_account.
+# ---------------------------------------------------------------------------
+[targets.prod]
+default_account = "workload_prod"     # network resources come from the workload account
+[targets.prod.roles]
+flow_logs = "log_archive"             # ...but flow logs live in the central logging account
+                                      # (no effect until the flow_logs feature ships; safe to set now)
+
+# A simple, single-account target: everything comes from one account, no role overrides needed.
+[targets.sandbox]
+default_account = "workload_sandbox"

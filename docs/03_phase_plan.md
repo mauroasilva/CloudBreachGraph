@@ -18,28 +18,51 @@ If a phase must deviate from a contract, it records the deviation in `learnings_
 - `pyproject.toml`, package skeleton under `src/cloudbreachgraph/`, `README.md` stub.
 - `aws/runner.py`: a subprocess wrapper that runs `aws <args> --output json --no-cli-pager`,
   threads through `--region`/`--profile`, parses JSON, and raises a clear error on failure.
-- `aws/collectors.py`: functions returning normalized lists:
+- `config.py`: the account→profile + role/target loader/resolver described in
+  `02_architecture.md §10–§11` — `load_config(path)` (TOML via stdlib `tomllib`, with the
+  discovery order) supporting both `[accounts.*]` and `[targets.*]`. Resolution is **role-aware**:
+  `resolve_target(cfg, target=..., account=..., profile_override=...) -> ResolvedTarget` whose
+  `.roles` maps each role → `{profile, account_id, region}`, with `resolve_profile(...)` kept as a
+  thin single-account/`network`-role wrapper. Apply the precedence (`--profile` override →
+  `--target`/`--account` binding / `default` → CLI default). Include a helper that runs
+  `sts get-caller-identity` **once per distinct resolved account** and verifies it matches the
+  expected account id. **v1 only activates the `network` role**, but build the resolver and the
+  registry so `flow_logs` (and other roles) can be bound in config without grammar changes
+  (`02_architecture.md §11`, `05_roadmap.md`).
+- `aws/collectors.py`: collector functions, each `collect_x(profile, region) -> list[dict]`:
   - `collect_network_interfaces(...) -> list[dict]`
   - `collect_ec2_instances(...) -> list[dict]`  (flattened out of Reservations)
   - `collect_load_balancers_v2(...) -> list[dict]`
   - `collect_load_balancers_classic(...) -> list[dict]`
   - `collect_subnets(...) -> list[dict]`
   - `collect_vpcs(...) -> list[dict]`
-  - `collect_all(...) -> dict` bundling the above under fixed keys (see contract).
+  - the **`ROLE_COLLECTORS` / `ROLE_RESULT_KEYS` registry** binding role `network` to the six
+    collectors above (`02_architecture.md §11.6`) — the explicit seam future roles extend.
+  - `collect_all(resolved, roles=["network"]) -> dict` — the driver loop of `§11.7` that, per
+    role, runs its registry collectors with that role's resolved profile/region and bundles the
+    results under fixed keys (see contract). Each collector stays role-agnostic; only the loop
+    knows about roles/accounts.
 - Optional `--cache-dir` raw-JSON dump.
 - `tests/fixtures/` with at least one recorded/representative JSON sample per command, plus
   unit tests that mock `subprocess` and assert the collectors normalize correctly.
+- Tests for `config.py`: alias lookup, account-id lookup, `--profile` override precedence,
+  missing-config fallback, unresolvable `--account`/`--target` error, and a multi-account
+  target that resolves `network` and `flow_logs` roles to **different** accounts/profiles. Parse
+  the shipped `docs/examples/cloudbreachgraph.example.toml` in a test so the example stays valid.
 
 **Acceptance criteria**
 - `pip install -e .` works; `python -c "import cloudbreachgraph"` works.
 - Collectors run against fixtures without touching the network in tests.
 - Runner surfaces AWS CLI stderr on non-zero exit.
+- `resolve_profile` honors the precedence in `02_architecture.md §10`.
 - `learnings_phase1.md` written (see `04_conventions.md` template).
 
 **Interface contract exposed to Phase 2** — `collect_all()` returns exactly:
 ```python
 {
-    "meta": {"region": str, "profile": str | None, "account_id": str | None},
+    # meta records per-role account provenance (§11.4/§11.7); v1 has only the network role
+    "meta": {"target": str | None, "region": str,
+             "accounts": {"network": str | None}},   # role -> account_id
     "network_interfaces": [ <normalized ENI dict>, ... ],
     "ec2_instances":      [ <normalized instance dict>, ... ],
     "load_balancers_v2":  [ <normalized elbv2 dict>, ... ],
@@ -48,9 +71,17 @@ If a phase must deviate from a contract, it records the deviation in `learnings_
     "vpcs":               [ <normalized vpc dict>, ... ],
 }
 ```
+The top-level resource keys are `ROLE_RESULT_KEYS["network"]` (§11.6). Future roles add their own
+keys alongside these without disturbing the network ones.
 Each normalized dict **must** preserve the fields listed in `02_architecture.md §4`
 (at minimum the id + the fields used for mapping). Phase 1 documents the exact normalized
 shape it settled on in `learnings_phase1.md` — Phase 2 codes against that.
+
+**Interface contract exposed to Phase 3** — the `config.py` resolution API (`load_config`,
+`resolve_target`/`resolve_profile`, account-verification helper) from `02_architecture.md §10–§11`,
+plus the `collect_all(region=..., profile=...)` signature. Phase 3's CLI wires user flags
+(`--target`/`--account`/`--profile`) into these. Phase 1 records the exact function signatures
+and the `ResolvedTarget`/`ResolvedAccount` shapes it settled on in `learnings_phase1.md`.
 
 ---
 
@@ -98,9 +129,12 @@ shape it settled on in `learnings_phase1.md` — Phase 2 codes against that.
 - `output/json_export.py`: `write_json(graph, path)`.
 - `output/dot_export.py`: `write_dot(graph, path)` — nodes colored by type, VPC clustering,
   relationship-labeled edges; optional `render(dot_path, fmt)` shelling out to `dot`.
-- `cli.py`: argparse entrypoint wiring `collect_all` → `build_graph` → writers.
-  Flags: `--region`, `--profile`, `--cache-dir`, `--output-dir`, `--render {png,svg}`,
-  `--from-cache <dir>` (build from previously cached JSON with no live calls).
+- `cli.py`: argparse entrypoint wiring `config.resolve_profile` → `collect_all` → `build_graph`
+  → writers. Flags: `--account <alias|id>` and `--config <path>` (account→profile mapping, §10),
+  `--profile <name>` (direct override), `--verify-account/--no-verify-account`, `--region`,
+  `--cache-dir`, `--output-dir`, `--render {png,svg}`, `--from-cache <dir>` (build from
+  previously cached JSON with no live calls), and optional `--all-accounts` (loop over configured
+  accounts, one graph each — §10.4 stretch goal).
 - `pyproject.toml` console-script entry `cloudbreachgraph = cloudbreachgraph.cli:main`.
 - End-to-end test: fixtures → CLI (with `--from-cache`) → assert `graph.json` and
   `graph.dot` are produced and well-formed.
@@ -109,6 +143,8 @@ shape it settled on in `learnings_phase1.md` — Phase 2 codes against that.
 **Acceptance criteria**
 - `cloudbreachgraph --from-cache tests/fixtures/... --output-dir out/` produces
   `graph.json` + `graph.dot` offline.
+- `cloudbreachgraph --account <alias>` resolves and uses the mapped profile; `--profile`
+  overrides it; account verification catches a profile/account mismatch.
 - Graceful degradation when `dot` is not installed (still writes `.dot`, warns on render).
 - Read-only guarantee holds (no mutating calls anywhere).
 - `learnings_phase3.md` written, including final CLI surface and any follow-up ideas.
@@ -130,3 +166,18 @@ Phase 1 (collection) ──► Phase 2 (graph/mapping) ──► Phase 3 (output
 - One command against a live account yields a correct `graph.json` + `graph.dot`.
 - All three `docs/learnings/learnings_phaseX.md` files exist and are accurate.
 - Tests pass offline via fixtures; the tool never mutates AWS.
+
+---
+
+## Future phases (post-v1, not built now)
+
+These are designed for but out of scope for the v1 build above. Each is its own segregated
+session with its own `docs/learnings/learnings_phaseX.md`, following `05_roadmap.md`.
+
+- **Phase 4 — `flow_logs` role (cross-account VPC Flow Logs).** Add the `flow_logs` collectors
+  (workload account: `ec2:DescribeFlowLogs`; logging account: CloudWatch Logs / S3 destinations),
+  new `flow_log`/`log_group`/`log_bucket` node types and `logs_to`/`delivers_to` edges, and wire
+  the role into the existing role-aware collection loop. No config-grammar or CLI change needed —
+  users just bind `flow_logs` to their logging account in a target. See `02_architecture.md §11`
+  and `05_roadmap.md`.
+- **Later roles** (`dns`, `cloudtrail`, deeper networking) follow the same pattern.

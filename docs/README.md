@@ -15,8 +15,8 @@ Network Interface (ENI)
 ```
 
 > **Read order for every session:** `01_overview.md` → `02_architecture.md` →
-> `03_phase_plan.md` → `04_conventions.md` → the relevant prompt in `prompts/`,
-> plus the `learnings_phaseX.md` files produced by earlier phases (see below).
+> `03_phase_plan.md` → `04_conventions.md` → `05_roadmap.md` → the relevant prompt in
+> `prompts/`, plus the `learnings_phaseX.md` files produced by earlier phases (see below).
 
 ## The build is split into 3 segregated Claude Code sessions
 
@@ -62,7 +62,9 @@ note that as a risk in its own learnings file and reconstruct the contract from 
 | `02_architecture.md` | Technical design: layout, data model, AWS CLI commands, the relationship-mapping rules (the heart of the app). |
 | `03_phase_plan.md` | Phase breakdown, interface contracts between phases, deliverables, acceptance criteria. |
 | `04_conventions.md` | Coding standards, testing strategy, AWS access assumptions, and the `learnings_phaseX.md` template. |
+| `05_roadmap.md` | Extensibility model + future features (e.g. cross-account VPC flow logs) and how resource roles plug in. |
 | `learnings/` | Where each phase writes its `learnings_phaseX.md` handoff file. |
+| `examples/cloudbreachgraph.example.toml` | Sample account→profile mapping config ("for account X use profile Y"). |
 | `prompts/phase1_foundation_collection.md` | Copy-paste prompt for the Phase 1 session. |
 | `prompts/phase2_modeling_graph.md` | Copy-paste prompt for the Phase 2 session. |
 | `prompts/phase3_output_cli.md` | Copy-paste prompt for the Phase 3 session. |
