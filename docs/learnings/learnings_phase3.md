@@ -15,8 +15,10 @@
   reason — honored here rather than stamped at write time).
 - **`output/dot_export.py`** — Graphviz DOT emitter (plain text, zero deps):
   - `write_dot(graph, path) -> Path`. Nodes colored + shaped by type; `synthetic`/
-    `unresolved` nodes get a dashed outline; subnets/ENIs (and instances/LBs when their
-    `vpc_id` is known) grouped inside `subgraph cluster_<vpc>`; edges labeled by
+    `unresolved` nodes get a dashed outline; a VPC's *contents* (subnets/ENIs, plus
+    instances/LBs when their `vpc_id` is known) are grouped inside `subgraph cluster_<vpc>`,
+    while the **VPC itself is a standalone top-level node** the subnets connect up to via
+    `in_vpc` edges (it is *not* nested inside its own cluster — see §3); edges labeled by
     `relationship`, with `match_rule` appended on load-balancer attachment edges.
   - `dot_available() -> bool` and `render(dot_path, fmt) -> Path | None`. `render` shells
     out to `dot -T<fmt>` **only if** `dot` is on `PATH`; returns `None` when absent (caller
@@ -102,9 +104,18 @@ Output files (all in `--output-dir`): `graph.json`, `graph.dot`, and `graph.<fmt
   boundary swappable for `--from-cache` and tests. (Minor Phase-1 API gotcha — see §5.)
 - **DOT clustering keys off the graph's own edges, not just attributes.** `_node_vpc`
   derives each node's VPC from `in_vpc`/`in_subnet` edges first (ENI → subnet → VPC),
-  falling back to `attributes["vpc_id"]`. This means even synthetic subnets/VPCs cluster
+  falling back to `attributes["vpc_id"]`. This means even synthetic subnets cluster
   correctly, and it needs no new data from Phase 2. Nodes with no resolvable VPC render at
   the top level rather than being dropped.
+- **A VPC is its own top-level node, not swallowed by its cluster.** `_node_vpc` returns
+  `None` for `vpc` nodes, so a VPC is drawn as a standalone node and each subnet's `in_vpc`
+  edge visibly connects the subnet (inside the VPC's `cluster_*`) *up to* that VPC node.
+  The cluster groups only the VPC's **contents** and is labeled `VPC <name>` for context —
+  distinct from the VPC node's own `[vpc] / <name> / <cidr>` label, so the name isn't
+  confusingly duplicated. (Initial cut nested the VPC node inside its own cluster, which
+  read as a container box rather than a node subnets connect to; corrected after review.)
+  The graph *model* was already correct all along — VPCs have always been real nodes with
+  `in_vpc` edges (`docs/02_architecture.md §5.2`); this was purely a DOT-layout fix.
 - **DOT determinism.** Clusters are emitted in `sorted` VPC-id order and members follow the
   graph's already-sorted node order, so `graph.dot` is byte-stable across runs like the JSON.
 - **`--all-accounts` loops `resolve_target(account=alias)` per `[accounts.*]`.** It stays

@@ -72,8 +72,14 @@ def test_write_dot_wellformed(graph, tmp_path):
     text = path.read_text()
     assert text.startswith("digraph cloudbreachgraph {")
     assert text.rstrip().endswith("}")
-    # VPC clustering groups subnets/ENIs.
+    # VPC clustering groups subnets/ENIs (the VPC's *contents*).
     assert "subgraph cluster_vpc_0aaaaaaaaaaaaaaaa {" in text
+    assert 'label="VPC primary-vpc";' in text
+    # The VPC is its own top-level node (2-space indent), NOT nested in its own cluster
+    # (which would be 4-space indent), and subnets connect up to it via in_vpc edges.
+    assert '\n  "vpc-0aaaaaaaaaaaaaaaa" [' in text
+    assert '\n    "vpc-0aaaaaaaaaaaaaaaa" [' not in text
+    assert '"subnet-011111111111111" -> "vpc-0aaaaaaaaaaaaaaaa" [label="in_vpc"' in text
     # Nodes colored by type (a couple of representative fills).
     assert 'fillcolor="#E8F5E9"' in text  # eni
     assert 'fillcolor="#E3F2FD"' in text  # subnet

@@ -58,9 +58,15 @@ def _node_vpc(
     subnet_of_eni: dict[str, str],
     vpc_of_subnet: dict[str, str],
 ) -> str | None:
-    """Which VPC a node belongs to, for clustering (``None`` -> draw at top level)."""
+    """Which VPC a node's *cluster* is, for grouping (``None`` -> draw at top level).
+
+    A ``vpc`` node is **not** placed inside its own cluster — it is its own top-level node
+    that the subnets in the cluster connect up to via ``in_vpc`` edges. The cluster groups
+    the VPC's *contents* (subnets, ENIs, and — when known — instances/LBs), not the VPC
+    node itself.
+    """
     if node.type == "vpc":
-        return node.id
+        return None
     if node.type == "subnet":
         return vpc_of_subnet.get(node.id) or node.attributes.get("vpc_id")
     if node.type == "eni":
@@ -114,13 +120,15 @@ def _dot_lines(graph: Graph) -> list[str]:
     subnet_of_eni = {e.source: e.target for e in graph.edges if e.relationship == "in_subnet"}
     vpc_of_subnet = {e.source: e.target for e in graph.edges if e.relationship == "in_vpc"}
 
-    # Group nodes by their owning VPC (None -> top level). Insertion order follows the
-    # already-sorted node list, so the emitted DOT is deterministic.
+    # Group each VPC's *contents* (subnets/ENIs/instances/LBs) into a cluster; VPC nodes
+    # themselves fall into the ``None`` bucket and render at the top level as their own
+    # nodes. Insertion order follows the already-sorted node list, so the DOT is
+    # deterministic.
     by_vpc: dict[str | None, list[Node]] = {}
-    vpc_labels: dict[str, list[str]] = {}
+    vpc_names: dict[str, str] = {}
     for node in graph.nodes:
         if node.type == "vpc":
-            vpc_labels[node.id] = _node_lines(node)
+            vpc_names[node.id] = node.label
         vpc = _node_vpc(node, subnet_of_eni, vpc_of_subnet)
         by_vpc.setdefault(vpc, []).append(node)
 
@@ -132,10 +140,12 @@ def _dot_lines(graph: Graph) -> list[str]:
         '  edge [fontname="Helvetica", fontsize=9, color="#607D8B"];',
     ]
 
-    # One cluster per VPC (deterministic order by VPC id).
+    # One cluster per VPC, grouping that VPC's contents (deterministic order by VPC id).
+    # The cluster is labeled "VPC <name>" for context; the VPC itself is a separate
+    # top-level node (below) that these subnets connect to via in_vpc edges.
     for vpc_id in sorted(k for k in by_vpc if k is not None):
         members = by_vpc[vpc_id]
-        label = _label(vpc_labels.get(vpc_id, ["[vpc]", vpc_id]))
+        label = _esc(f"VPC {vpc_names.get(vpc_id, vpc_id)}")
         out.append(f"  subgraph {_cluster_id(vpc_id)} {{")
         out.append(f'    label="{label}";')
         out.append('    style="rounded";')
