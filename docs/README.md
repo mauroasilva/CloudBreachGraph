@@ -68,3 +68,4 @@ note that as a risk in its own learnings file and reconstruct the contract from 
 | `prompts/phase1_foundation_collection.md` | Copy-paste prompt for the Phase 1 session. |
 | `prompts/phase2_modeling_graph.md` | Copy-paste prompt for the Phase 2 session. |
 | `prompts/phase3_output_cli.md` | Copy-paste prompt for the Phase 3 session. |
+| `prompts/new_change.md` | **Reusable** prompt for making a new change to the (already-built) code — fill in the CHANGE REQUEST block and run it in a fresh session. |
