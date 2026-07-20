@@ -48,8 +48,8 @@ are Phases 2 and 3. Leave the layout ready for them.
 - `pytest` passes offline using the fixtures.
 - Code committed to the branch specified for this repo.
 
-## REQUIRED final step — write `learnings_phase1.md`
-Before you finish, create **`learnings_phase1.md` at the repo root** using the template in
+## REQUIRED final step — write `docs/learnings/learnings_phase1.md`
+Before you finish, create **`docs/learnings/learnings_phase1.md`** using the template in
 `docs/04_conventions.md`. It must capture everything Phase 2 needs, especially:
 - The **exact normalized dict shape** each collector returns and the keys of `collect_all()`
   (this is the contract Phase 2 codes against).
@@ -57,5 +57,5 @@ Before you finish, create **`learnings_phase1.md` at the repo root** using the t
 - Any deviation from `docs/02_architecture.md §2` layout.
 - Exact commands to run the tests.
 
-Commit `learnings_phase1.md` together with the Phase 1 code, then push. Do not open a pull
-request unless asked.
+Commit `docs/learnings/learnings_phase1.md` together with the Phase 1 code, then push. Do not
+open a pull request unless asked.

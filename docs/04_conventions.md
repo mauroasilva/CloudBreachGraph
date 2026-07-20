@@ -35,10 +35,10 @@ compatible without constant re-reading.
 
 ## The `learnings_phaseX.md` file — REQUIRED output of every phase
 
-Every phase ends by writing `learnings_phaseX.md`. Put it at the **repo root**
-(`learnings_phase1.md`, `learnings_phase2.md`, `learnings_phase3.md`) so it's easy to find,
-and commit it with the phase's code. Its job: tell the *next* agent everything it needs that
-isn't obvious from the code alone.
+Every phase ends by writing `learnings_phaseX.md`. Put it in **`docs/learnings/`**
+(`docs/learnings/learnings_phase1.md`, `docs/learnings/learnings_phase2.md`,
+`docs/learnings/learnings_phase3.md`) and commit it with the phase's code. Its job: tell the
+*next* agent everything it needs that isn't obvious from the code alone.
 
 Use this template:
 

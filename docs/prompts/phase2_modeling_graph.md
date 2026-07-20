@@ -15,9 +15,9 @@ AWS CLI collection layer) is already committed.
 - `docs/02_architecture.md`  (**§5 relationship-mapping rules are the core of your work**, plus §6 graph model)
 - `docs/03_phase_plan.md`    (your scope is the **Phase 2** section and its interface contract)
 - `docs/04_conventions.md`   (coding rules + the mandatory learnings-file template)
-- **`learnings_phase1.md`** at the repo root — the actual collector output shape you must
-  code against. If it's missing or thin, reconstruct the contract from Phase 1's committed
-  code in `src/cloudbreachgraph/aws/` and note the gap at the top of your own learnings file.
+- **`docs/learnings/learnings_phase1.md`** — the actual collector output shape you must code
+  against. If it's missing or thin, reconstruct the contract from Phase 1's committed code in
+  `src/cloudbreachgraph/aws/` and note the gap at the top of your own learnings file.
 
 ## Your scope (Phase 2 only — do not build CLI or output writers)
 
@@ -52,8 +52,8 @@ Do **not** implement `output/` writers or `cli.py` — that's Phase 3.
 - Python 3.11+, full type hints, `dataclasses`, standard library only for runtime.
 - Read-only tool; you're only transforming already-collected data here.
 
-## REQUIRED final step — write `learnings_phase2.md`
-Before finishing, create **`learnings_phase2.md` at the repo root** using the
+## REQUIRED final step — write `docs/learnings/learnings_phase2.md`
+Before finishing, create **`docs/learnings/learnings_phase2.md`** using the
 `docs/04_conventions.md` template. Capture especially:
 - The exact `Graph.to_dict()` structure and the node/edge `attributes` keys you emit (Phase 3
   renders these).
@@ -62,4 +62,5 @@ Before finishing, create **`learnings_phase2.md` at the repo root** using the
 - Any deviation from the docs and why.
 - Exact commands to run the tests.
 
-Commit `learnings_phase2.md` with the Phase 2 code, then push. No pull request unless asked.
+Commit `docs/learnings/learnings_phase2.md` with the Phase 2 code, then push. No pull request
+unless asked.

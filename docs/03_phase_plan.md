@@ -58,7 +58,7 @@ shape it settled on in `learnings_phase1.md` — Phase 2 codes against that.
 
 **Goal:** Turn collected data into a graph by applying the relationship rules.
 
-**Inputs:** Phase 1 code + `learnings_phase1.md` (the exact collector output shape).
+**Inputs:** Phase 1 code + `docs/learnings/learnings_phase1.md` (the exact collector output shape).
 
 **Deliverables**
 - `model/resources.py`: dataclasses `Eni`, `Ec2Instance`, `LoadBalancer`, `Subnet`, `Vpc`,
@@ -92,7 +92,7 @@ shape it settled on in `learnings_phase1.md` — Phase 2 codes against that.
 
 **Goal:** Make the tool usable end to end and produce the map artifacts.
 
-**Inputs:** Phase 1 + Phase 2 code + `learnings_phase1.md` + `learnings_phase2.md`.
+**Inputs:** Phase 1 + Phase 2 code + `docs/learnings/learnings_phase1.md` + `docs/learnings/learnings_phase2.md`.
 
 **Deliverables**
 - `output/json_export.py`: `write_json(graph, path)`.
@@ -120,6 +120,7 @@ shape it settled on in `learnings_phase1.md` — Phase 2 codes against that.
 ```
 Phase 1 (collection) ──► Phase 2 (graph/mapping) ──► Phase 3 (output/CLI)
       │                        │                            │
+   docs/learnings/        docs/learnings/              docs/learnings/
    learnings_phase1.md    learnings_phase2.md          learnings_phase3.md
       └───────────────────────┴────────────────────────────┘
                     all committed; each read by later phases
@@ -127,5 +128,5 @@ Phase 1 (collection) ──► Phase 2 (graph/mapping) ──► Phase 3 (output
 
 ## Definition of done for the whole build
 - One command against a live account yields a correct `graph.json` + `graph.dot`.
-- All three `learnings_phaseX.md` files exist and are accurate.
+- All three `docs/learnings/learnings_phaseX.md` files exist and are accurate.
 - Tests pass offline via fixtures; the tool never mutates AWS.

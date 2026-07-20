@@ -15,10 +15,10 @@ that uses the **AWS CLI** (not boto3) to map an AWS account's network topology. 
 - `docs/02_architecture.md`  (**§7 output formats**, §6 graph model)
 - `docs/03_phase_plan.md`    (your scope is the **Phase 3** section)
 - `docs/04_conventions.md`   (coding rules + the mandatory learnings-file template)
-- **`learnings_phase1.md`** and **`learnings_phase2.md`** at the repo root — the collector
-  contract and the `Graph.to_dict()` structure/attribute keys you render against. If either
-  is missing or thin, reconstruct from the committed code in `src/cloudbreachgraph/` and note
-  the gap at the top of your own learnings file.
+- **`docs/learnings/learnings_phase1.md`** and **`docs/learnings/learnings_phase2.md`** — the
+  collector contract and the `Graph.to_dict()` structure/attribute keys you render against. If
+  either is missing or thin, reconstruct from the committed code in `src/cloudbreachgraph/` and
+  note the gap at the top of your own learnings file.
 
 ## Your scope (Phase 3 — make it usable end to end)
 
@@ -51,8 +51,8 @@ that uses the **AWS CLI** (not boto3) to map an AWS account's network topology. 
 - Python 3.11+, full type hints, standard library only for runtime (DOT is emitted as text;
   any `graphviz` package must remain an optional extra).
 
-## REQUIRED final step — write `learnings_phase3.md`
-Before finishing, create **`learnings_phase3.md` at the repo root** using the
+## REQUIRED final step — write `docs/learnings/learnings_phase3.md`
+Before finishing, create **`docs/learnings/learnings_phase3.md`** using the
 `docs/04_conventions.md` template. Capture especially:
 - The final CLI surface (all flags) and example invocations.
 - The output file formats/locations and any rendering caveats.
@@ -60,4 +60,5 @@ Before finishing, create **`learnings_phase3.md` at the repo root** using the
 - Follow-up ideas (e.g. `--all-regions`, extra resource types, HTML output).
 - Exact commands to run the tests and to produce a sample map.
 
-Commit `learnings_phase3.md` with the Phase 3 code, then push. No pull request unless asked.
+Commit `docs/learnings/learnings_phase3.md` with the Phase 3 code, then push. No pull request
+unless asked.
