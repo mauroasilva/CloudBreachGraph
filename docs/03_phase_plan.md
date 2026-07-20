@@ -18,11 +18,17 @@ If a phase must deviate from a contract, it records the deviation in `learnings_
 - `pyproject.toml`, package skeleton under `src/cloudbreachgraph/`, `README.md` stub.
 - `aws/runner.py`: a subprocess wrapper that runs `aws <args> --output json --no-cli-pager`,
   threads through `--region`/`--profile`, parses JSON, and raises a clear error on failure.
-- `config.py`: the account→profile mapping loader/resolver described in `02_architecture.md §10`
-  — `load_config(path)` (TOML via stdlib `tomllib`, with the discovery order) and
-  `resolve_profile(cfg, account=..., profile_override=...)` applying the precedence
-  (`--profile` override → `--account` lookup → CLI default). Also a helper to run
-  `sts get-caller-identity` and verify the resolved profile matches the expected account id.
+- `config.py`: the account→profile + role/target loader/resolver described in
+  `02_architecture.md §10–§11` — `load_config(path)` (TOML via stdlib `tomllib`, with the
+  discovery order) supporting both `[accounts.*]` and `[targets.*]`. Resolution is **role-aware**:
+  `resolve_target(cfg, target=..., account=..., profile_override=...) -> ResolvedTarget` whose
+  `.roles` maps each role → `{profile, account_id, region}`, with `resolve_profile(...)` kept as a
+  thin single-account/`network`-role wrapper. Apply the precedence (`--profile` override →
+  `--target`/`--account` binding / `default` → CLI default). Include a helper that runs
+  `sts get-caller-identity` **once per distinct resolved account** and verifies it matches the
+  expected account id. **v1 only activates the `network` role**, but build the resolver and the
+  registry so `flow_logs` (and other roles) can be bound in config without grammar changes
+  (`02_architecture.md §11`, `05_roadmap.md`).
 - `aws/collectors.py`: functions returning normalized lists:
   - `collect_network_interfaces(...) -> list[dict]`
   - `collect_ec2_instances(...) -> list[dict]`  (flattened out of Reservations)
@@ -35,8 +41,9 @@ If a phase must deviate from a contract, it records the deviation in `learnings_
 - `tests/fixtures/` with at least one recorded/representative JSON sample per command, plus
   unit tests that mock `subprocess` and assert the collectors normalize correctly.
 - Tests for `config.py`: alias lookup, account-id lookup, `--profile` override precedence,
-  missing-config fallback, and unresolvable `--account` error. Parse the shipped
-  `docs/examples/cloudbreachgraph.example.toml` in a test so the example stays valid.
+  missing-config fallback, unresolvable `--account`/`--target` error, and a multi-account
+  target that resolves `network` and `flow_logs` roles to **different** accounts/profiles. Parse
+  the shipped `docs/examples/cloudbreachgraph.example.toml` in a test so the example stays valid.
 
 **Acceptance criteria**
 - `pip install -e .` works; `python -c "import cloudbreachgraph"` works.
@@ -62,9 +69,10 @@ Each normalized dict **must** preserve the fields listed in `02_architecture.md 
 shape it settled on in `learnings_phase1.md` — Phase 2 codes against that.
 
 **Interface contract exposed to Phase 3** — the `config.py` resolution API (`load_config`,
-`resolve_profile`, account-verification helper) from `02_architecture.md §10`, plus the
-`collect_all(region=..., profile=...)` signature. Phase 3's CLI wires user flags into these.
-Phase 1 records the exact function signatures it settled on in `learnings_phase1.md`.
+`resolve_target`/`resolve_profile`, account-verification helper) from `02_architecture.md §10–§11`,
+plus the `collect_all(region=..., profile=...)` signature. Phase 3's CLI wires user flags
+(`--target`/`--account`/`--profile`) into these. Phase 1 records the exact function signatures
+and the `ResolvedTarget`/`ResolvedAccount` shapes it settled on in `learnings_phase1.md`.
 
 ---
 
@@ -149,3 +157,18 @@ Phase 1 (collection) ──► Phase 2 (graph/mapping) ──► Phase 3 (output
 - One command against a live account yields a correct `graph.json` + `graph.dot`.
 - All three `docs/learnings/learnings_phaseX.md` files exist and are accurate.
 - Tests pass offline via fixtures; the tool never mutates AWS.
+
+---
+
+## Future phases (post-v1, not built now)
+
+These are designed for but out of scope for the v1 build above. Each is its own segregated
+session with its own `docs/learnings/learnings_phaseX.md`, following `05_roadmap.md`.
+
+- **Phase 4 — `flow_logs` role (cross-account VPC Flow Logs).** Add the `flow_logs` collectors
+  (workload account: `ec2:DescribeFlowLogs`; logging account: CloudWatch Logs / S3 destinations),
+  new `flow_log`/`log_group`/`log_bucket` node types and `logs_to`/`delivers_to` edges, and wire
+  the role into the existing role-aware collection loop. No config-grammar or CLI change needed —
+  users just bind `flow_logs` to their logging account in a target. See `02_architecture.md §11`
+  and `05_roadmap.md`.
+- **Later roles** (`dns`, `cloudtrail`, deeper networking) follow the same pattern.

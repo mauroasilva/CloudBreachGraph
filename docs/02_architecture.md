@@ -215,6 +215,11 @@ Requirements:
 
 ## 10. Account → profile mapping (how to target an account)
 
+> **The `account` is the atom** (alias → account id + profile + region). This section covers the
+> simple, common case: everything in one account. When resources for a single run live in
+> **different** accounts — e.g. VPC flow logs in a central logging account, separate from the
+> VPCs — see **§11 (resource roles & multi-account targets)**, which builds directly on this.
+
 The operator keeps **one named AWS CLI profile per account**. CloudBreachGraph must let them
 say "for account X, use profile Y" so they select an account without memorizing which profile
 maps to it. There are two inputs, resolved in this precedence order (first match wins):
@@ -287,3 +292,91 @@ account in the config, running the full collect→build→write pipeline per acc
 per-account outputs (e.g. `graph.<alias>.json` / `graph.<alias>.dot`). This stays within the
 single-account-per-graph model (no merged cross-account graph); it just loops. Treat it as a
 Phase 3 stretch goal — if not built in v1, note it as future work in learnings.
+
+## 11. Resource roles & multi-account targets (the flow-logs nuance)
+
+Some data for a single logical environment lives in **different accounts**. The motivating
+example: **VPC Flow Logs** are commonly published to a central **log-archive / logging
+account** (CloudWatch Logs or an S3 bucket), separate from the workload account that owns the
+VPCs, subnets, ENIs, and instances. To collect the full picture the tool must use **profile A**
+for the networking resources and **profile B** for the flow logs — in the same run.
+
+To express this the app introduces two concepts on top of §10's accounts:
+
+### 11.1 Resource roles
+
+A **role** is a named group of resources that are always fetched from the same account. Roles
+form an extensible registry; new features add new roles without changing the config grammar.
+
+| Role | Resources | Status |
+|------|-----------|--------|
+| `network` | ENIs, EC2 instances, load balancers, subnets, VPCs (everything in §3 today) | **v1** |
+| `flow_logs` | VPC Flow Logs (CloudWatch Logs log groups / S3), the flow-log configs on VPCs/subnets/ENIs | **future** (design for it now, don't build in v1) |
+
+Additional future roles (e.g. `dns`, `cloudtrail`) plug in the same way. See `05_roadmap.md`.
+
+### 11.2 Targets — bind roles to accounts
+
+A **target** is the thing you point the tool at: a named environment composed of one or more
+accounts, one per role. It maps each role to an account alias from §10.
+
+```toml
+# accounts are still the atom (see §10)
+[accounts.workload_prod]
+account_id = "111111111111"
+profile    = "prod-audit"
+region     = "us-east-1"
+
+[accounts.log_archive]
+account_id = "999999999999"
+profile    = "log-archive-ro"
+
+# a target binds resource roles to accounts
+[targets.prod]
+default_account = "workload_prod"   # every role uses this unless overridden below
+[targets.prod.roles]
+flow_logs = "log_archive"           # ...but flow logs come from the central logging account
+
+# a simple target that is entirely one account needs no role overrides
+[targets.sandbox]
+default_account = "workload_sandbox"
+```
+
+- `default_account` covers the ordinary "one account for everything" case; the `[targets.X.roles]`
+  table overrides only the roles that live elsewhere. This keeps simple configs simple.
+- A bare `--account <alias|id>` (from §10) is exactly a target whose every role resolves to that
+  one account — backward compatible. `--target <name>` selects a multi-account target instead.
+- `--profile <name>` still overrides **all** roles to that single profile (escape hatch).
+
+### 11.3 Role-aware resolution API (generalizes §10.2)
+
+`config.py` resolves to a **profile per role**, not a single profile:
+
+```python
+def resolve_target(cfg, *, target: str | None, account: str | None,
+                   profile_override: str | None) -> ResolvedTarget
+#   ResolvedTarget.roles: dict[str, ResolvedAccount]   # role -> {profile, account_id, region}
+#   ResolvedAccount.profile may be None -> use the CLI default
+```
+
+The single-account `resolve_profile` from §10.2 becomes a thin wrapper: it resolves the
+`network` role of a target built from `--account`/`--profile`. Precedence within each role:
+`--profile` override → target's role binding / `default_account` → CLI default. The resolver
+raises a clear error if a requested `--target`/`--account`/role can't be resolved.
+
+### 11.4 Role-aware collection
+
+The collection layer runs **per role**: for each role needed by the current command, resolve
+its account's profile and run that role's collectors with it. In v1 only the `network` role is
+active, so behavior is identical to §3 today — but the loop is structured so adding `flow_logs`
+later is "register the role's collectors + let users bind it," with **no** change to the CLI
+grammar or the graph model. `collect_all` should therefore accept the resolved per-role profile
+map (or, for v1, at least be organized so the `network` role's profile is passed explicitly and
+a second role can be added alongside it). Record each role's resolved/verified account id in
+`Graph.meta` so the map documents which account each part came from.
+
+### 11.5 Verification with multiple accounts
+
+Run the §10.3 `sts get-caller-identity` check **once per distinct resolved account** in the
+target, comparing against each account's expected `account_id`. This catches a mis-bound role
+(e.g. a `log_archive` profile that actually points at the workload account).

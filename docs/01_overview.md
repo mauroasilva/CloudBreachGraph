@@ -57,11 +57,15 @@ resolution rules, which are the trickiest part of the whole app.
 
 - No boto3 / AWS SDK. The user specifically wants the **AWS CLI** as the data source.
 - No write operations, no remediation, no "breach simulation" — mapping only.
-- No *merged* cross-account graph / AWS Organizations traversal. Each run maps a single account
-  (selected via the account→profile mapping); an optional `--all-accounts` may loop over the
-  configured accounts to produce one graph **per** account, but never a single combined graph.
-- No other resource types (security groups, route tables, IGWs, NAT, RDS, etc.) in v1.
-  The architecture should leave room to add them later, but they are out of scope now.
+- No AWS Organizations auto-discovery. Accounts are declared by the operator in config.
+- v1 collects only the **`network`** role (ENIs, EC2, LB, subnets, VPCs) and from a single
+  account. **However**, the config and architecture are built multi-account-ready from day one:
+  a "target" binds resource roles to accounts so a later feature (e.g. VPC flow logs living in a
+  separate logging account) can pull different resource types from different accounts/profiles in
+  one run — see `02_architecture.md §11` and `05_roadmap.md`. That cross-account collection is
+  designed now but not implemented in v1.
+- No other resource types (security groups, route tables, IGWs, NAT, RDS, flow logs, etc.) in v1.
+  The architecture explicitly leaves room to add them as new roles later (see `05_roadmap.md`).
 - No web server / live UI. Output is files (JSON + DOT, optional rendered image).
 
 ## Assumptions about the target account
@@ -69,7 +73,8 @@ resolution rules, which are the trickiest part of the whole app.
 - The operator uses **one named AWS CLI profile per account** and wants to select an account
   without remembering which profile it maps to. CloudBreachGraph accepts an account→profile
   mapping (config file) plus CLI flags so you can say "for account X, use profile Y" — see
-  `02_architecture.md §10`.
+  `02_architecture.md §10`. When a single environment's resources span accounts (e.g. flow logs
+  in a logging account), a **target** binds each resource role to an account — see §11.
 - Each profile has **read-only** permissions:
   `ec2:DescribeNetworkInterfaces`, `ec2:DescribeInstances`, `ec2:DescribeSubnets`,
   `ec2:DescribeVpcs`, `elasticloadbalancing:DescribeLoadBalancers`, and

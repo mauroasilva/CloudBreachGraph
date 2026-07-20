@@ -12,9 +12,10 @@ that uses the **AWS CLI** (not boto3) to map an AWS account's network topology. 
 **Before writing any code, read these — they are the source of truth:**
 - `docs/README.md`
 - `docs/01_overview.md`
-- `docs/02_architecture.md`  (**§7 output formats**, §6 graph model)
+- `docs/02_architecture.md`  (**§7 output formats**, §6 graph model, **§10–§11** accounts/roles/targets)
 - `docs/03_phase_plan.md`    (your scope is the **Phase 3** section)
 - `docs/04_conventions.md`   (coding rules + the mandatory learnings-file template)
+- `docs/05_roadmap.md`       (so `--target`/role wiring stays future-proof for `flow_logs`)
 - **`docs/learnings/learnings_phase1.md`** and **`docs/learnings/learnings_phase2.md`** — the
   collector contract and the `Graph.to_dict()` structure/attribute keys you render against. If
   either is missing or thin, reconstruct from the committed code in `src/cloudbreachgraph/` and
@@ -34,23 +35,27 @@ that uses the **AWS CLI** (not boto3) to map an AWS account's network topology. 
 3. `cli.py` — an `argparse` entrypoint wiring the Phase 1 `config.resolve_profile` →
    `collect_all` → `build_graph` → writers. This is where the operator's **"for account X use
    profile Y"** requirement is surfaced. Flags:
-   - `--account <alias|id>` + `--config <path>` — select an account from the account→profile
-     mapping (`docs/02_architecture.md §10`); the resolved profile is passed to every AWS call.
-   - `--profile <name>` — direct override that bypasses the mapping.
+   - `--target <name>` + `--config <path>` — select a target that binds resource roles to
+     accounts (`docs/02_architecture.md §11`); each role's collectors use that role's resolved
+     profile. In v1 only the `network` role runs, but wire the CLI through `resolve_target` so
+     binding `flow_logs` to another account later needs no CLI change.
+   - `--account <alias|id>` — shorthand: a target whose every role is that one account (§10).
+   - `--profile <name>` — direct override that bypasses the mapping (applies to all roles).
    - `--verify-account / --no-verify-account` — toggle the `sts get-caller-identity` check
      (default on when the account id is known).
    - `--region`, `--cache-dir`, `--output-dir`, `--render {png,svg}`, `--from-cache <dir>`
      (build from previously cached JSON with **no** live AWS calls).
    - optional `--all-accounts` — loop over every configured account, writing one graph each
      (`graph.<alias>.json` / `.dot`); §10.4 stretch goal, skip if time-boxed and note in learnings.
-   Use the config `load_config`/`resolve_profile` API exactly as Phase 1 documented it in
-   `docs/learnings/learnings_phase1.md`. Register the console script
+   Use the config `load_config`/`resolve_target`/`resolve_profile` API exactly as Phase 1
+   documented it in `docs/learnings/learnings_phase1.md`. Register the console script
    `cloudbreachgraph = cloudbreachgraph.cli:main` in `pyproject.toml`.
 4. End-to-end test: fixtures/cached JSON → CLI with `--from-cache` → assert `graph.json` and
    `graph.dot` are produced and well-formed. Add a test that `--account <alias>` resolves the
    mapped profile (mock the AWS boundary) and that `--profile` overrides it. Tests run offline.
-5. Update the user-facing `README.md` with real usage examples: the account→profile config
-   file, `--account <alias>`, `--profile` override, a live run, and `--from-cache`.
+5. Update the user-facing `README.md` with real usage examples: the config file (accounts +
+   a multi-account target), `--target <name>`, `--account <alias>`, `--profile` override, a live
+   run, and `--from-cache`. Note that `flow_logs` is a future role (link `docs/05_roadmap.md`).
 
 ## Definition of done
 - `cloudbreachgraph --from-cache <fixtures> --output-dir out/` produces `graph.json` +
