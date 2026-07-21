@@ -223,10 +223,12 @@ def test_ringed_view_data_groups_by_vpc_and_ring(graph):
     assert len(data["clusters"]) == 1
     cluster = data["clusters"][0]
     assert cluster["label"] == vpc.label
-    assert 0 < cluster["r1"] < cluster["r2"]  # inner (subnets) inside outer (everything else)
+    rings = cluster["rings"]
+    assert len(rings) == 3  # subnets, then ENIs, then everything else
+    assert 0 < rings[0] < rings[1] < rings[2]  # each successive ring is further out
 
     pos = {n["id"]: n for n in data["nodes"]}
-    # The VPC sits at the cluster center; subnets on the inner ring; ENIs on the outer ring.
+    # VPC at the center; subnets on ring 1; ENIs on their own ring 2; everything else on ring 3.
     assert (pos[vpc.id]["x"], pos[vpc.id]["y"]) == (cluster["cx"], cluster["cy"])
     for n in graph.nodes:
         d = round(
@@ -236,9 +238,11 @@ def test_ringed_view_data_groups_by_vpc_and_ring(graph):
         if n.type == "vpc":
             assert d == 0.0
         elif n.type == "subnet":
-            assert d == round(cluster["r1"], 1)
+            assert d == round(rings[0], 1)
+        elif n.type == "eni":
+            assert d == round(rings[1], 1)
         else:
-            assert d == round(cluster["r2"], 1)
+            assert d == round(rings[2], 1)
 
 
 def test_ringed_unassigned_nodes_form_their_own_cluster():

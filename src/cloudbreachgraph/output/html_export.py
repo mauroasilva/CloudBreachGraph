@@ -17,7 +17,8 @@ This is an **opt-in** output (the CLI ``--html`` flag) — it is never produced 
 
 An alternative **ringed** layout (:func:`write_ringed_html` / :func:`build_ringed_html`,
 exposed by the ``cloudbreachgraph-to-html --ringed`` auxiliary flag) draws each VPC at the
-center of its own cluster, its subnets on an inner ring and everything else on an outer ring.
+center of its own cluster and successive concentric rings around it — subnets, then ENIs,
+then everything else (EC2 instances, load balancers).
 Unlike the force layout its positions are computed deterministically in Python, so the page
 needs no in-browser relaxation. It shares the same :data:`MAX_NODES` / :data:`MAX_HTML_BYTES`
 size guard and the same ``None``-means-fall-back-to-``.dot`` contract.
@@ -150,8 +151,9 @@ def write_html(
 # Ringed layout — concentric rings centered on each VPC.
 #
 # An alternative, deterministic layout (no force simulation): every VPC is the *center* of
-# its own cluster, its subnets sit on the **inner ring**, and everything else that lives
-# under that VPC (ENIs, EC2 instances, load balancers) sits on the **outer ring**. Multiple
+# its own cluster, its subnets sit on the **first ring**, its **ENIs** on their own dedicated
+# **second ring**, and everything else that lives under that VPC (EC2 instances, load
+# balancers) sits on the **outer ring**. Multiple
 # VPC clusters are tiled in a grid so they don't overlap; resources that resolve to no VPC
 # (orphans) collect into one final ring-cluster with an empty center. Positions are computed
 # here in Python from the already-sorted nodes/edges, so the page is byte-stable and needs no
@@ -162,30 +164,48 @@ _UNASSIGNED = "__unassigned__"  # pseudo-group key for resources that resolve to
 # Ring geometry (pixels). Arc is the minimum spacing between adjacent nodes on a ring, so a
 # ring's radius grows with how many nodes sit on it (keeping them from colliding).
 _RING_ARC = 92.0
-_RING1_MIN = 150.0  # inner (subnet) ring never smaller than this
-_RING_GAP = 150.0  # radial gap between the inner and outer ring
+_RING1_MIN = 150.0  # the first (innermost) ring never smaller than this
+_RING_GAP = 150.0  # radial gap between one ring and the next
 _CLUSTER_MARGIN = 80.0  # empty room around a cluster's outermost ring
 _CLUSTER_PAD = 130.0  # extra gap between adjacent clusters in the grid
 
+# Concentric rings, from the center out: VPC (center), then subnets, then ENIs, then
+# everything else (EC2 instances, load balancers, …). ENIs get their own dedicated ring so
+# the interfaces read as a distinct layer between their subnets and the compute/LBs they front.
+_RING_COUNT = 4  # ring 0 is the center; rings 1..3 are the concentric outer rings
+
 
 def _ring_of(node_type: str) -> int:
-    """Ring index for a node type: VPC center (0), subnet inner ring (1), else outer ring (2)."""
+    """Ring index for a node type: VPC center (0), subnet (1), ENI (2), everything else (3)."""
     if node_type == "vpc":
         return 0
     if node_type == "subnet":
         return 1
-    return 2
+    if node_type == "eni":
+        return 2
+    return 3
 
 
-def _ring_radii(n_inner: int, n_outer: int) -> tuple[float, float]:
-    """Inner/outer ring radii sized so ``n_inner``/``n_outer`` nodes fit without colliding."""
-    r1 = max(_RING1_MIN, n_inner * _RING_ARC / (2 * math.pi)) if n_inner else 0.0
-    if n_outer:
-        base = (r1 + _RING_GAP) if r1 else _RING1_MIN
-        r2 = max(base, n_outer * _RING_ARC / (2 * math.pi))
-    else:
-        r2 = 0.0
-    return r1, r2
+def _ring_radii(counts: list[int]) -> list[float]:
+    """Radius of each successive ring, sized so its nodes fit without colliding.
+
+    ``counts[i]`` is how many nodes sit on ring ``i + 1`` (ring 0 is the center, radius 0). A
+    ring's radius is the larger of a fixed step out from the previous non-empty ring and the
+    radius its own node count needs. An **empty** ring collapses to radius 0 and consumes no
+    radial space, so later rings still nest tightly (e.g. a cluster with no subnets puts its
+    ENIs on the innermost ring).
+    """
+    radii: list[float] = []
+    prev = 0.0
+    for c in counts:
+        if not c:
+            radii.append(0.0)
+            continue
+        base = (prev + _RING_GAP) if prev else _RING1_MIN
+        r = max(base, c * _RING_ARC / (2 * math.pi))
+        radii.append(r)
+        prev = r
+    return radii
 
 
 def _place_on_ring(members: list, cx: float, cy: float, radius: float) -> None:
@@ -246,7 +266,8 @@ def _ringed_view_data(graph: Graph) -> dict:
     labels: dict[str, str] = {}
     for n in graph.nodes:
         g = group_of[n.id]
-        groups.setdefault(g, {0: [], 1: [], 2: []})[_ring_of(n.type)].append(by_id[n.id])
+        bucket = groups.setdefault(g, {r: [] for r in range(_RING_COUNT)})
+        bucket[_ring_of(n.type)].append(by_id[n.id])
         if n.type == "vpc":
             labels[g] = n.label
 
@@ -255,8 +276,9 @@ def _ringed_view_data(graph: Graph) -> dict:
     if _UNASSIGNED in groups:
         order.append(_UNASSIGNED)
 
-    radii = {g: _ring_radii(len(groups[g][1]), len(groups[g][2])) for g in order}
-    cluster_r = {g: max(radii[g][0], radii[g][1], 60.0) + _CLUSTER_MARGIN for g in order}
+    # radii[g] holds the radius of each outer ring (rings 1..3); ring 0 is the center at 0.
+    radii = {g: _ring_radii([len(groups[g][r]) for r in range(1, _RING_COUNT)]) for g in order}
+    cluster_r = {g: max([*radii[g], 60.0]) + _CLUSTER_MARGIN for g in order}
     cell = 2 * (max(cluster_r.values(), default=0.0)) + _CLUSTER_PAD
     cols = max(1, math.ceil(math.sqrt(len(order))))
 
@@ -264,16 +286,15 @@ def _ringed_view_data(graph: Graph) -> dict:
     for i, g in enumerate(order):
         cx = (i % cols) * cell
         cy = (i // cols) * cell
-        r1, r2 = radii[g]
+        rs = radii[g]
         _place_on_ring(groups[g][0], cx, cy, 0.0)  # VPC center (0..1 nodes)
-        _place_on_ring(groups[g][1], cx, cy, r1)  # subnet inner ring
-        _place_on_ring(groups[g][2], cx, cy, r2)  # everything-else outer ring
+        for r in range(1, _RING_COUNT):  # ring 1 subnets, ring 2 ENIs, ring 3 everything else
+            _place_on_ring(groups[g][r], cx, cy, rs[r - 1])
         clusters.append(
             {
                 "cx": round(cx, 2),
                 "cy": round(cy, 2),
-                "r1": round(r1, 2),
-                "r2": round(r2, 2),
+                "rings": [round(r, 2) for r in rs],
                 "label": labels.get(g, "unassigned"),
             }
         )
@@ -774,8 +795,8 @@ _RINGED_TEMPLATE = """<!DOCTYPE html>
     <label title="When on, the mouse wheel no longer zooms — use the + / − buttons instead.">
       <input type="checkbox" id="noscroll"> lock scroll-zoom</label>
   </div>
-  <div id="hint">VPC at each center · subnets on the inner ring · everything else on the
-    outer ring · drag a node · scroll to zoom (or lock it and use + / −) · drag to pan</div>
+  <div id="hint">rings from each center: VPC · subnets · ENIs · everything else ·
+    drag a node · scroll to zoom (or lock it and use + / −) · drag to pan</div>
 </div>
 <script>
 "use strict";
@@ -819,7 +840,7 @@ function autoCenter() {
   if (centered || nodes.length === 0) return;
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
   for (const c of clusters) {
-    const r = Math.max(c.r2, c.r1, 40) + 30;
+    const r = Math.max(0, ...c.rings, 40) + 30;
     minX = Math.min(minX, c.cx - r); minY = Math.min(minY, c.cy - r);
     maxX = Math.max(maxX, c.cx + r); maxY = Math.max(maxY, c.cy + r);
   }
@@ -847,11 +868,11 @@ function draw() {
   ctx.font = "12px Helvetica, Arial, sans-serif";
   for (const c of clusters) {
     const p = toScreen({ x: c.cx, y: c.cy });
-    for (const rr of [c.r1, c.r2]) {
+    for (const rr of c.rings) {
       if (rr <= 0) continue;
       ctx.beginPath(); ctx.arc(p.x, p.y, rr * scale, 0, Math.PI * 2); ctx.stroke();
     }
-    const top = Math.max(c.r1, c.r2, 40) * scale;
+    const top = Math.max(0, ...c.rings, 40) * scale;
     if (scale > 0.4) ctx.fillText(c.label, p.x, p.y - top - 6);
   }
 

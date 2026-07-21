@@ -202,9 +202,9 @@ cloudbreachgraph-to-html out/graph.json --ringed        # concentric-ringed layo
 ### Ringed layout (`--ringed`)
 
 Pass `--ringed` to render a **concentric-ringed** view instead of the force-directed one:
-each **VPC** sits at the center of its own cluster, its **subnets** form the **inner ring**,
-and **everything else** under that VPC (ENIs, EC2 instances, load balancers) forms the
-**outer ring**. Multiple VPCs are tiled in a grid so their rings don't overlap; any resource
+each **VPC** sits at the center of its own cluster, ringed by its **subnets**, then its
+**ENIs** on their own dedicated ring, then **everything else** under that VPC (EC2 instances,
+load balancers) on the outer ring. Multiple VPCs are tiled in a grid so their rings don't overlap; any resource
 that resolves to no VPC (an orphan) collects into a final ring-cluster with an empty center.
 Faint guide circles and a per-cluster VPC label make the ring structure legible. Unlike the
 force view, positions are computed deterministically (no in-browser relaxation, no Recompute

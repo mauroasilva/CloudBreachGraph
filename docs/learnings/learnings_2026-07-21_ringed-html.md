@@ -26,6 +26,15 @@
   returns so only the buttons zoom. In the ringed page `zoomAround` also calls `draw()` since
   it renders on demand (no animation loop); the force page relies on its existing frame loop.
   Covered by `test_write_html_has_zoom_controls_and_scroll_lock` and its ringed twin.
+- **Follow-up — ENIs get their own ring:** the outer ring was split so the ringed layout now
+  has four concentric layers: VPC (center) · subnets · **ENIs** · everything else (EC2/LBs).
+  `_ring_of` returns 0/1/2/3; `_RING_COUNT = 4`; `_ring_radii` was generalized from a fixed
+  `(inner, outer)` pair to a **list of ring counts → list of radii** (empty rings collapse to
+  radius 0 and consume no space, so a subnet-less cluster still nests tightly). Each cluster
+  in the payload now carries a **`rings: [r1, r2, r3]` list** instead of the old `r1`/`r2`
+  keys — the ringed template's guide-circle drawing and `autoCenter` were updated to iterate
+  `c.rings` (`Math.max(0, ...c.rings, 40)`). Tests that asserted on `cluster["r1"]/["r2"]`
+  now assert on `cluster["rings"]` and check ENIs sit on a strictly-inner ring vs EC2/LBs.
 
 ## 2. Interface contract for the next session
 - `html_export.write_ringed_html` has the **same signature and return contract** as

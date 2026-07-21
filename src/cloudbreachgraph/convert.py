@@ -7,8 +7,8 @@ view (``output/html_export.py``). Handy when you ran without ``--html`` (or from
 ``--from-cache``) and now want the interactive page without re-collecting from AWS.
 
 By default it renders the force-directed layout; with ``--ringed`` it instead renders the
-concentric-**ringed** layout (each VPC at a cluster center, its subnets on the inner ring,
-everything else on the outer ring — ``output/html_export.write_ringed_html``).
+concentric-**ringed** layout (each VPC at a cluster center, then rings of subnets, ENIs, and
+everything else — ``output/html_export.write_ringed_html``).
 
 It reuses the exact same writer and size guard as the main pipeline: if the graph is too
 large to render responsibly in a browser, it warns and **falls back to writing a ``.dot``**
@@ -51,8 +51,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--ringed",
         action="store_true",
         help="render the ringed layout instead of the force-directed one: each VPC is the "
-        "center of a cluster, its subnets form the inner ring, and everything else forms the "
-        "outer ring (same size guard / .dot fallback)",
+        "center of a cluster, ringed by its subnets, then its ENIs, then everything else "
+        "(same size guard / .dot fallback)",
     )
     return p
 
