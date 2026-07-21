@@ -110,6 +110,30 @@
   cross-linked graph (instances spanning several subnets) and asserts `build(120) == build(600)`
   — this fails without cooling.
 
+## 6d. Follow-up — greedy crossing-reduction local search
+- Even after cooling+min-gap, the real capture kept 28 crossings, and a breakdown showed **25 of
+  28 were `attached_to`×`attached_to`** — outer-ring nodes (LB/EC2) whose spokes to their ENIs
+  cross each other. Barycenter optimises proximity, not crossings, so it leaves these.
+- Added **`_reduce_crossings`** (runs after the cooling loop, per cluster): a greedy local search
+  that relocates each ring node to the gap-midpoint slot with the fewest **incident** edge
+  crossings. Key property — moving one node only changes crossings on *its own* edges (they all
+  share it as an endpoint, so never cross each other), so `Δtotal == Δincident`: accepting strict
+  incident improvements is a **monotone total-crossing minimiser**. Deterministic (nodes visited
+  in id order, first strict-best wins). `_orient` helper added; `_nudge_overlaps` still runs after
+  to clean any tight insertion (min gap stayed 26px in practice).
+- Bounded by `_RELOC_SWEEPS` (8, early-exits ~2) and gated by `_RELOC_MAX_NODES` (260 per
+  cluster) so the O(ring²·edges) sweep can't blow up on a huge cluster — beyond that the
+  barycenter result stands.
+- Real-graph result: crossings **28 → 24** (79 → 24 vs the plain ringed layout, −70%). **30
+  random-restart + greedy runs could not beat 24**, so 24 is at/near the floor for this rigid
+  concentric-ring topology; the residual are structural (multi-AZ NLBs with ENIs in 3 subnets).
+- Test `test_ringed_crossing_reduction_beats_barycenter_only` monkeypatches `_RELOC_MAX_NODES=0`
+  to get the barycenter-only baseline on an interleaved-LB graph (13 crossings) and asserts the
+  full pipeline does strictly better (8). `_count_crossings` helper added to the tests.
+- **Follow-up idea (not done):** to go below the structural floor you must relax the rigid rings
+  — e.g. give outer LB nodes small radial freedom, collapse a multi-AZ LB's per-AZ ENIs into one
+  node, or fall back to the force layout for the outer ring.
+
 ## 7. Git note (this session)
 - PR #13 was merged into `main`. This work is on branch
   `claude/cloudbreachgraph-no-ring-circles` (which also carried the "stop drawing ring circles"
@@ -118,7 +142,7 @@
 ## 8. How to verify
 ```bash
 pip install -e '.[dev]'
-pytest                       # 134 tests, all offline
+pytest                       # 135 tests, all offline
 ruff check . && ruff format --check .
 cloudbreachgraph --from-cache tests/fixtures --output-dir /tmp/cbg-out
 cloudbreachgraph-to-html /tmp/cbg-out/graph.json --ringed --optimize-passes 20 -o /tmp/opt.html

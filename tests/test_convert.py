@@ -549,6 +549,55 @@ def test_ringed_optimize_freezes_on_tangled_graph():
     assert html_export.build_ringed_html(g, 120) == html_export.build_ringed_html(g, 600)
 
 
+def _count_crossings(data):
+    pos = {n["id"]: (n["x"], n["y"]) for n in data["nodes"]}
+    e = [(pos[x["source"]], pos[x["target"]]) for x in data["edges"]]
+
+    def orient(a, b, c):
+        v = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+        return (v > 1e-9) - (v < -1e-9)
+
+    def crosses(p, q, r, s):
+        if p in (r, s) or q in (r, s):  # shared endpoint
+            return False
+        return orient(p, q, r) != orient(p, q, s) and orient(r, s, p) != orient(r, s, q)
+
+    return sum(1 for i in range(len(e)) for j in range(i + 1, len(e)) if crosses(*e[i], *e[j]))
+
+
+def test_ringed_crossing_reduction_beats_barycenter_only(monkeypatch):
+    # Load balancers whose ENIs are interleaved across subnets leave whole spokes crossing after
+    # the barycenter passes; the greedy relocation local search removes several of them.
+    def eni(name, subnet, instance):
+        return {
+            "NetworkInterfaceId": name,
+            "SubnetId": subnet,
+            "VpcId": "vpc-1",
+            "InterfaceType": "interface",
+            "Description": "",
+            "Attachment": {"InstanceId": instance},
+            "PrivateIpAddresses": [],
+            "Groups": [],
+        }
+
+    spans = {
+        "i-a": ["s0", "s4"],
+        "i-b": ["s1", "s5"],
+        "i-c": ["s2", "s6"],
+        "i-d": ["s3", "s7"],
+        "i-e": ["s0", "s2", "s4", "s6"],
+        "i-f": ["s1", "s3", "s5", "s7"],
+    }
+    nis = [eni(f"eni-{i}-{s}", s, i) for i, subs in spans.items() for s in subs]
+    g = build_graph({"meta": {}, "network_interfaces": nis})
+
+    monkeypatch.setattr(html_export, "_RELOC_MAX_NODES", 0)  # disable the local search
+    barycenter_only = _count_crossings(html_export._ringed_view_data(g, 80))
+    monkeypatch.undo()  # re-enable it
+    with_relocation = _count_crossings(html_export._ringed_view_data(g, 80))
+    assert with_relocation < barycenter_only
+
+
 def test_convert_ringed_optimize_passes(graph, tmp_path):
     jp = json_export.write_json(graph, tmp_path / "graph.json")
     out = tmp_path / "opt.html"
