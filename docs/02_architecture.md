@@ -232,7 +232,10 @@ Requirements:
   EC2/LB at the mean angle of the ENIs attached to it, so both stay radially next to their
   interfaces; orphan resources collect into a final ring-cluster (empty center). Ring positions are
   computed deterministically in Python (no in-browser force sim), and the same `MAX_NODES`/
-  `MAX_HTML_BYTES` guard and `.dot` fallback apply.
+  `MAX_HTML_BYTES` guard and `.dot` fallback apply. The `--optimize-passes N` flag runs up to
+  N barycenter passes (`html_export._optimize_cluster`) that reorder nodes *within* their rings
+  to pull connected nodes together (fewer crossing edges) and then nudge apart any overlaps —
+  rings preserved, output still deterministic; `N=0` (default) is the exact ENI-aligned layout.
 
 ## 8. Regions
 

@@ -54,6 +54,15 @@ def build_parser() -> argparse.ArgumentParser:
         "center of a cluster, ringed by its subnets, then its ENIs, then everything else "
         "(same size guard / .dot fallback)",
     )
+    p.add_argument(
+        "--optimize-passes",
+        type=int,
+        default=0,
+        metavar="N",
+        help="ringed layout only: run up to N passes that reorder nodes within their rings to "
+        "pull connected nodes together (fewer crossing edges) and nudge apart any overlaps. "
+        "0 (default) keeps the deterministic ENI-aligned placement.",
+    )
     return p
 
 
@@ -62,14 +71,26 @@ def main(argv: list[str] | None = None) -> int:
     in_path = Path(args.input)
     out_path = Path(args.output) if args.output else in_path.with_suffix(".html")
 
+    if args.optimize_passes < 0:
+        print("cloudbreachgraph-to-html: --optimize-passes must be >= 0", file=sys.stderr)
+        return 2
+
     try:
         graph = load_graph(in_path, fmt=args.format)
     except GraphLoadError as exc:
         print(f"cloudbreachgraph-to-html: {exc}", file=sys.stderr)
         return 2
 
-    writer = html_export.write_ringed_html if args.ringed else html_export.write_html
-    result = writer(graph, out_path)
+    if args.ringed:
+        result = html_export.write_ringed_html(graph, out_path, passes=args.optimize_passes)
+    else:
+        if args.optimize_passes:
+            print(
+                "cloudbreachgraph-to-html: warning: --optimize-passes only affects --ringed; "
+                "ignoring it for the force-directed layout.",
+                file=sys.stderr,
+            )
+        result = html_export.write_html(graph, out_path)
     if result is not None:
         print(f"wrote {result}")
         return 0
