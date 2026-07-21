@@ -162,7 +162,9 @@ cloudbreachgraph --from-cache tests/fixtures --output-dir out/
   HTML5 canvas with a small vanilla-JavaScript **force layout**: nodes self-distribute
   (repulsion + edge springs + collision separation) so they don't sit on top of each other,
   and disconnected clusters (e.g. separate VPCs) repel each other so they settle apart rather
-  than mingling. Drag a node to pin it, scroll to zoom, drag the background to pan. A
+  than mingling. Drag a node to pin it, scroll to zoom, drag the background to pan. **Zoom
+  In / Zoom Out** buttons zoom about the center, and a **lock scroll-zoom** toggle disables
+  wheel zoom so only those buttons change the zoom. A
   **Recompute layout** button *gently tidies the layout from wherever the nodes are now* — it
   anchors each node to its current position and only relieves local crowding (resolving
   overlaps, easing clusters apart), so a layout you arranged by hand is preserved rather than
@@ -186,6 +188,7 @@ tool renders the same interactive HTML view from it — **no AWS calls, purely l
 cloudbreachgraph-to-html out/graph.json                 # writes out/graph.html
 cloudbreachgraph-to-html out/graph.dot -o topology.html # explicit output path
 cloudbreachgraph-to-html capture.data --format json     # force the input format
+cloudbreachgraph-to-html out/graph.json --ringed        # concentric-ringed layout
 ```
 
 - **From JSON** the conversion is **lossless** — it reproduces exactly the page `--html`
@@ -195,6 +198,20 @@ cloudbreachgraph-to-html capture.data --format json     # force the input format
   per-type detail (interface/LB type, CIDR, instance state), and every edge are recovered.
 - The same size guard applies: if the graph is too large for a browser force layout, it warns
   and writes a `.dot` fallback instead (skipping it if the input already is that `.dot`).
+
+### Ringed layout (`--ringed`)
+
+Pass `--ringed` to render a **concentric-ringed** view instead of the force-directed one:
+each **VPC** sits at the center of its own cluster, ringed by its **subnets**, then its
+**ENIs** on their own dedicated ring, then **everything else** under that VPC (EC2 instances,
+load balancers) on the outer ring. Multiple VPCs are tiled in a grid so their rings don't overlap; any resource
+that resolves to no VPC (an orphan) collects into a final ring-cluster with an empty center.
+Faint guide circles and a per-cluster VPC label make the ring structure legible. Unlike the
+force view, positions are computed deterministically (no in-browser relaxation, no Recompute
+button); you can still drag a node, scroll to zoom, and drag the background to pan, plus the
+same **Zoom In / Zoom Out** buttons and **lock scroll-zoom** toggle as the default view. It obeys
+the **same size guard** — if the graph is too large it warns and writes the `.dot` fallback,
+exactly like the default HTML mode.
 
 ## Future roles (flow logs, etc.)
 
