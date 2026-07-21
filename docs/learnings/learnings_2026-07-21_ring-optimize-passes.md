@@ -67,6 +67,28 @@
 - Barycenter is a heuristic (global crossing minimisation is NP-hard); it cuts crossings
   sharply but doesn't guarantee the optimum.
 
+## 6b. Follow-up — min-gap placement (real improvement after user feedback)
+- The first cut placed each ring **evenly** after reordering and converged on **order** change.
+  That barely improved real layouts: on a ring with few nodes, "adjacent" is still a huge
+  angular gap, so two subnets sharing an LB became neighbours but stayed ~180° apart; and
+  order-based convergence meant 2000 passes ≈ 5 passes.
+- Replaced even placement with **`_place_min_gap`**: place each node at (near) its true
+  barycenter angle subject only to a minimum angular gap (sized so disks don't touch). Done as
+  an **L2 isotonic (pool-adjacent-violators) projection**: sort by target, cut the circle at
+  its widest gap, unwrap to a monotonic sequence, subtract `i·gap`, project to non-decreasing
+  (`_isotonic_l2`), add `i·gap` back. This lets connected nodes actually sit close.
+  - New helpers: `_isotonic_l2`, `_place_min_gap`, `_ang_diff`. Removed `_place_even_anchored`.
+  - Convergence is now **position-based** (max angular move < 1e-4 per pass), so a large `N`
+    still stops once stable but the optimiser can keep improving while it's actually moving.
+  - Result on the crafted 4-subnet/2-instance case: two subnets sharing an instance go from
+    **180° → ~11.5°** apart; total edge length **3363 → 1806** (was 2475 with even placement);
+    min node gap 30px (no overlaps); deterministic; `build(20) == build(2000)`.
+  - **Gotcha:** the widest-gap cut guarantees the wrap slack ≥ min-gap because the largest
+    circular gap ≥ average gap `2π/n` ≥ the chosen `gap` (which is capped at `2π/n`). The
+    `_nudge_overlaps` pass remains as a safety net for any residual overlap.
+- New test `test_ringed_optimize_places_lb_sharing_subnets_adjacent` locks the ~180°→<45°
+  behaviour in.
+
 ## 7. Git note (this session)
 - PR #13 was merged into `main`. This work is on branch
   `claude/cloudbreachgraph-no-ring-circles` (which also carried the "stop drawing ring circles"
@@ -75,7 +97,7 @@
 ## 8. How to verify
 ```bash
 pip install -e '.[dev]'
-pytest                       # 132 tests, all offline
+pytest                       # 133 tests, all offline
 ruff check . && ruff format --check .
 cloudbreachgraph --from-cache tests/fixtures --output-dir /tmp/cbg-out
 cloudbreachgraph-to-html /tmp/cbg-out/graph.json --ringed --optimize-passes 20 -o /tmp/opt.html

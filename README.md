@@ -223,13 +223,14 @@ exactly like the default HTML mode.
 
 By default a subnet/EC2/LB sits at the *mean* angle of its ENIs, which can push a resource
 into an awkward spot when its ENIs span subnets on opposite sides of the ring (long, crossing
-edges). Add `--optimize-passes N` (ringed layout only) to run up to **N passes** that
-**reorder the nodes within each ring** to pull connected nodes together — subnets that share a
-load balancer migrate next to each other, so its edges stop crossing the circle — and then
-**nudge apart** any overlapping nodes. The rings are preserved (nodes keep their VPC/subnet/
-ENI/outer ring); only their angular order and tiny overlap offsets change. Passes stop early
-once the ordering converges, and `--optimize-passes 0` (the default) keeps the exact
-ENI-aligned placement. Output stays deterministic.
+edges). Add `--optimize-passes N` (ringed layout only) to run up to **N passes** that move each
+node toward the mean angle of its neighbours — placing it there **as close as an overlap-free
+minimum gap allows**, so two subnets that share a load balancer are pulled right next to each
+other (not just reordered into distant even slots) and its edges stop crossing the circle — and
+then **nudge apart** any residual overlaps. The rings are preserved (nodes keep their VPC/
+subnet/ENI/outer ring); only their angle within the ring changes. Passes stop early once the
+layout stops moving (so a big `N` never over-churns), and `--optimize-passes 0` (the default)
+keeps the exact ENI-aligned placement. Output stays deterministic.
 
 ```bash
 cloudbreachgraph-to-html out/graph.json --ringed --optimize-passes 20

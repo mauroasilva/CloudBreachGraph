@@ -471,6 +471,27 @@ def test_ringed_optimize_reduces_edge_length():
     assert opt < base
 
 
+def test_ringed_optimize_places_lb_sharing_subnets_adjacent():
+    # The reported case: two subnets that share an instance/LB (subnet-1 & subnet-3 both host an
+    # ENI of i-1) start on opposite sides of the ring and must be pulled angularly close — not
+    # merely reordered into distant even slots.
+    import math
+
+    g = _crossing_graph()
+
+    def separation_deg(data):
+        pos = {n["id"]: n for n in data["nodes"]}
+        c = data["clusters"][0]
+        a1, a3 = (
+            math.atan2(pos[s]["y"] - c["cy"], pos[s]["x"] - c["cx"])
+            for s in ("subnet-1", "subnet-3")
+        )
+        return abs(math.degrees(math.atan2(math.sin(a1 - a3), math.cos(a1 - a3))))
+
+    assert separation_deg(html_export._ringed_view_data(g, 0)) > 150  # baseline: opposite sides
+    assert separation_deg(html_export._ringed_view_data(g, 20)) < 45  # optimized: adjacent
+
+
 def test_ringed_optimize_leaves_no_overlaps():
     import math
 

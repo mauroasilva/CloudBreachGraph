@@ -280,21 +280,71 @@ def _place_aligned_to_enis(
         _place_at_angle(m, cx, cy, radius, -math.pi / 2 + (2 * math.pi * i / count if count else 0))
 
 
-def _place_even_anchored(members: list, cx: float, cy: float, radius: float, target: dict) -> None:
-    """Place ``members`` (already sorted by their target angle) evenly, rotated to fit targets.
+def _ang_diff(a: float, b: float) -> float:
+    """Signed smallest angular difference ``a - b`` in ``(-π, π]``."""
+    d = (a - b) % (2 * math.pi)
+    return d - 2 * math.pi if d > math.pi else d
 
-    Even spacing guarantees no two nodes on the ring collide; the whole ring is then rotated by
-    the single offset that best matches each node's ``target`` angle (the circular mean of the
-    per-node offset between an even slot and its target), so connected nodes stay as close to
-    their neighbours as an even, overlap-free ring allows.
+
+def _isotonic_l2(y: list[float]) -> list[float]:
+    """Least-squares non-decreasing fit of ``y`` (pool-adjacent-violators). Deterministic, O(n)."""
+    blocks: list[list[float]] = []  # each: [mean, count, total]
+    for yi in y:
+        blocks.append([yi, 1.0, yi])
+        while len(blocks) >= 2 and blocks[-2][0] > blocks[-1][0]:
+            _, c2, t2 = blocks.pop()
+            _, c1, t1 = blocks.pop()
+            total, count = t1 + t2, c1 + c2
+            blocks.append([total / count, count, total])
+    out: list[float] = []
+    for mean, count, _ in blocks:
+        out.extend([mean] * int(count))
+    return out
+
+
+def _place_min_gap(members: list, cx: float, cy: float, radius: float, target: dict) -> None:
+    """Place ``members`` near their ``target`` angle, spread just enough to not overlap.
+
+    Unlike even spacing, this lets connected nodes actually sit *close* together (only a
+    minimum angular gap apart, sized so their disks don't touch), so e.g. two subnets that share
+    a load balancer end up adjacent rather than parked at distant even slots. Implemented as an
+    L2 isotonic projection: sort by target, cut the circle at its widest gap (so the unavoidable
+    wrap-around slack lands where it's least binding), then find the ordered positions closest to
+    the targets subject to the min-gap — a min-gap-shifted isotonic regression. Reorders
+    ``members`` in place to match the placement.
     """
     n = len(members)
     if n == 0:
         return
-    slots = [2 * math.pi * i / n for i in range(n)]
-    phi = _circular_mean([target[m["id"]] - slots[i] for i, m in enumerate(members)])
-    for i, m in enumerate(members):
-        _place_at_angle(m, cx, cy, radius, slots[i] + phi)
+    members.sort(key=lambda m: (target[m["id"]], m["id"]))
+    if n == 1:
+        _place_at_angle(members[0], cx, cy, radius, target[members[0]["id"]])
+        return
+
+    ts = [target[m["id"]] for m in members]  # ascending in (-π, π]
+    max_r = max(_node_radius(m) for m in members)
+    gap = min((2 * max_r + 8.0) / radius, 2 * math.pi / n)  # never exceed even spacing
+
+    # Cut after the widest gap between consecutive (circular) targets.
+    gaps = [(ts[(i + 1) % n] - ts[i]) % (2 * math.pi) for i in range(n)]
+    cut = max(range(n), key=lambda i: gaps[i])
+    order = [(cut + 1 + k) % n for k in range(n)]
+
+    # Unwrap the targets into a monotonically increasing sequence in this order.
+    unwrapped: list[float] = []
+    for idx in order:
+        a = ts[idx]
+        while unwrapped and a < unwrapped[-1] - 1e-12:
+            a += 2 * math.pi
+        unwrapped.append(a)
+
+    # Positions minimizing Σ(p_i - t_i)² s.t. p_{i+1} - p_i ≥ gap: subtract i·gap, project to
+    # non-decreasing, add it back.
+    shifted = _isotonic_l2([a - i * gap for i, a in enumerate(unwrapped)])
+    reordered = [members[i] for i in order]
+    for k, m in enumerate(reordered):
+        _place_at_angle(m, cx, cy, radius, shifted[k] + k * gap)
+    members[:] = reordered
 
 
 def _node_radius(node: dict) -> float:
@@ -337,22 +387,23 @@ def _nudge_overlaps(nodes: list, iterations: int = 12, pad: float = 6.0) -> None
 
 
 def _optimize_cluster(bucket: dict, cx: float, cy: float, rs: list, adj: dict, passes: int) -> None:
-    """Reorder nodes within each ring to pull connected nodes together, then nudge out overlaps.
+    """Move nodes within each ring toward their neighbours to cut crossings, then de-overlap.
 
-    A barycenter (mean-of-neighbours) heuristic: on each ring, every node is aimed at the mean
-    angle of its neighbours on the *other* rings, the ring is re-sorted by that angle and placed
-    evenly (overlap-free), and the sweep repeats up to ``passes`` times — outward then back in
-    each pass so the ordering propagates across all four rings. This is what unclumps an LB whose
-    ENIs sit in far-apart subnets: the shared subnets migrate next to each other and the LB's
-    edges stop crossing the circle. The centre VPC (ring 0) has no angle and is skipped as a
-    neighbour. Converges early when a full pass changes no ring's order.
+    A barycenter (mean-of-neighbours) heuristic: on each ring every node is aimed at the mean
+    angle of its neighbours on the *other* rings and placed there — as close as a minimum,
+    overlap-free gap allows (:func:`_place_min_gap`), so connected nodes genuinely cluster rather
+    than snapping to distant even slots. The sweep repeats up to ``passes`` times, outward then
+    back inward each pass so positions propagate across all four rings. This is what pulls two
+    subnets that share a load balancer next to each other, so its edges stop crossing the circle.
+    The centre VPC (ring 0) has no angle and is skipped as a neighbour. Stops early once a full
+    pass moves every node less than a small epsilon (so extra passes never churn the layout).
     """
     ring_of = {m["id"]: r for r in range(_RING_COUNT) for m in bucket[r]}
     angle = {m["id"]: math.atan2(m["y"] - cy, m["x"] - cx) for r in (1, 2, 3) for m in bucket[r]}
 
     for _ in range(passes):
-        changed = False
-        for r in (1, 2, 3, 2):  # outward then back inward, so orderings propagate both ways
+        max_move = 0.0
+        for r in (1, 2, 3, 2):  # outward then back inward, so positions propagate both ways
             members = bucket[r]
             if not members:
                 continue
@@ -364,14 +415,12 @@ def _optimize_cluster(bucket: dict, cx: float, cy: float, rs: list, adj: dict, p
                     if ring_of.get(nid, 0) != 0 and nid in angle
                 ]
                 target[m["id"]] = _circular_mean(neigh) if neigh else angle[m["id"]]
-            before = [m["id"] for m in members]
-            members.sort(key=lambda m: (target[m["id"]], m["id"]))
-            if [m["id"] for m in members] != before:
-                changed = True
-            _place_even_anchored(members, cx, cy, rs[r - 1], target)
+            _place_min_gap(members, cx, cy, rs[r - 1], target)
             for m in members:
-                angle[m["id"]] = math.atan2(m["y"] - cy, m["x"] - cx)
-        if not changed:
+                a = math.atan2(m["y"] - cy, m["x"] - cx)
+                max_move = max(max_move, abs(_ang_diff(a, angle[m["id"]])))
+                angle[m["id"]] = a
+        if max_move < 1e-4:
             break
 
     _nudge_overlaps([m for r in (1, 2, 3) for m in bucket[r]])
