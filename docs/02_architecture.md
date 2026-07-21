@@ -202,7 +202,10 @@ Requirements:
   a single **self-contained** page (`output/html_export.py`) — the graph is inlined as JSON
   and drawn on an HTML5 canvas by a small vanilla-JS force simulation that self-distributes
   the nodes (pairwise repulsion + edge springs + collision separation) so they don't
-  overlap; supports drag/zoom/pan. **No** third-party runtime dependency and **no** network
+  overlap; supports drag/zoom/pan. Disconnected components (separate VPCs, orphans) repel
+  each other (`CROSS_COMPONENT`) so segregated clusters settle apart, and a **Recompute
+  layout** button releases manual pins and re-runs the simulation to re-separate them after
+  the user has dragged things around. **No** third-party runtime dependency and **no** network
   access (stays consistent with §1). The emitted HTML is byte-stable (nodes/edges pre-sorted,
   a seeded PRNG for the layout, no timestamps). Because an in-browser O(n²) force layout only
   stays responsive up to a point, `write_html` enforces a size guard (`MAX_NODES`,

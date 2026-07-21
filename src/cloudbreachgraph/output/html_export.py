@@ -164,11 +164,20 @@ _TEMPLATE = """<!DOCTYPE html>
   #legend { margin-top: 8px; display: grid; grid-template-columns: auto 1fr; gap: 3px 6px; }
   #legend .swatch { width: 12px; height: 12px; border-radius: 3px; align-self: center; }
   #legend .exposed { border: 2px solid #e53935; }
+  #controls { margin-top: 10px; }
+  #controls button {
+    font: inherit; font-size: 12px; cursor: pointer; padding: 5px 10px;
+    border: 1px solid #b0bec5; border-radius: 6px; background: #eceff1; color: #263238;
+  }
+  #controls button:hover { background: #cfd8dc; }
+  #controls button:active { transform: translateY(1px); }
   #hint { margin-top: 8px; color: #607d8b; }
   @media (prefers-color-scheme: dark) {
     body { background: #202124; color: #e8eaed; }
     #hud { background: rgba(40,42,45,0.92); border-color: #3c4043; }
     #hud .muted, #hint { color: #9aa0a6; }
+    #controls button { background: #3c4043; border-color: #5f6368; color: #e8eaed; }
+    #controls button:hover { background: #4a4d51; }
   }
 </style>
 </head>
@@ -179,7 +188,12 @@ _TEMPLATE = """<!DOCTYPE html>
   <div class="muted"><span id="ncount">__NODE_COUNT__</span> nodes ·
     <span id="ecount">__EDGE_COUNT__</span> edges</div>
   <div id="legend"></div>
-  <div id="hint">drag a node to pin · scroll to zoom · drag background to pan</div>
+  <div id="controls">
+    <button id="recompute" title="Release pinned nodes and re-run the layout, pushing
+separate clusters apart">↻ Recompute layout</button>
+  </div>
+  <div id="hint">drag a node to pin · scroll to zoom · drag background to pan ·
+    Recompute to re-separate clusters</div>
 </div>
 <script>
 "use strict";
@@ -240,6 +254,7 @@ const SPRING = 0.03;         // edge spring stiffness
 const GRAVITY = 0.012;       // pull toward the layout center (keeps it on screen)
 const DAMPING = 0.86;        // velocity damping per tick
 const ANGULAR = 22;          // hub spoke-spreading strength (angular resolution)
+const CROSS_COMPONENT = 4;   // extra repulsion between disconnected clusters (keep them apart)
 let alpha = 1.0;             // cooling factor (1 -> 0)
 
 // Degree-weighted charge + adjacency: high-degree hubs repel harder, so their neighbors
@@ -254,6 +269,24 @@ for (const n of nodes) n.charge = REPULSION * (1 + 0.7 * Math.sqrt(n.deg));
 // the room they need to spread rather than being pulled back into a tangle.
 for (const e of edges) e.len = 70 + 9 * Math.sqrt(Math.max(e.s.deg, e.t.deg));
 
+// Connected components: each maximal set of nodes joined by edges is one "cluster" (e.g. a
+// VPC and everything under it; a stand-alone orphan). Nodes in *different* components repel
+// CROSS_COMPONENT× harder (see step()), so segregated clusters drift apart instead of
+// mingling — which is what the Recompute button leans on. Computed once via BFS over adj.
+let componentCount = 0;
+for (const n of nodes) n.comp = -1;
+for (const start of nodes) {
+  if (start.comp !== -1) continue;
+  start.comp = componentCount;
+  const queue = [start];
+  for (let qi = 0; qi < queue.length; qi++) {
+    for (const nb of queue[qi].adj) {
+      if (nb.comp === -1) { nb.comp = componentCount; queue.push(nb); }
+    }
+  }
+  componentCount++;
+}
+
 function step() {
   if (alpha > 0.005) alpha *= 0.992;
   // Pairwise repulsion + collision separation (self-distribution).
@@ -265,7 +298,9 @@ function step() {
       let d2 = dx * dx + dy * dy;
       if (d2 < 0.01) { dx = (rand() - 0.5); dy = (rand() - 0.5); d2 = dx * dx + dy * dy; }
       const dist = Math.sqrt(d2);
-      const f = (Math.sqrt(a.charge * b.charge) / d2) * alpha;
+      let rep = Math.sqrt(a.charge * b.charge);
+      if (a.comp !== b.comp) rep *= CROSS_COMPONENT;   // shove disconnected clusters apart
+      const f = (rep / d2) * alpha;
       const fx = (dx / dist) * f, fy = (dy / dist) * f;
       a.vx += fx; a.vy += fy; b.vx -= fx; b.vy -= fy;
       // Hard collision: never let two node disks overlap.
@@ -412,6 +447,17 @@ canvas.addEventListener("wheel", (ev) => {
   scale = Math.max(0.1, Math.min(6, scale * factor));
   panX = ev.clientX - w.x * scale; panY = ev.clientY - w.y * scale; centered = true;
 }, { passive: false });
+
+// --- recompute layout ------------------------------------------------------
+// Release every manual pin, reheat the simulation, and let it re-settle from the current
+// positions. The cross-component repulsion (above) then pushes segregated clusters apart,
+// and autoCenter re-fits the view once it cools. Wired to the HUD button.
+function recompute() {
+  for (const n of nodes) { n.fixed = false; n.vx = 0; n.vy = 0; }
+  alpha = 1.0;        // reheat: the running frame() loop animates the re-layout
+  centered = false;   // re-fit the viewport after it settles
+}
+document.getElementById("recompute").addEventListener("click", recompute);
 
 // --- legend ----------------------------------------------------------------
 (function legend() {
