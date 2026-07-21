@@ -155,8 +155,17 @@ def test_write_html_has_recompute_button_and_cluster_separation(graph, tmp_path)
     assert "Recompute layout" in text
     assert "function recompute()" in text
     assert 'getElementById("recompute").addEventListener("click", recompute)' in text
-    # recompute releases manual pins and reheats the simulation.
+    # recompute refines from CURRENT positions, not a full re-solve: it releases pins, anchors
+    # each node to where it is, drops the centering gravity, and applies only a gentle reheat.
     assert "n.fixed = false" in text
+    assert "n.ax = n.x" in text and "n.ay = n.y" in text  # per-node position anchors
+    assert "anchored = true" in text
+    assert "gravityScale = 0" in text
+    assert "alpha = RECOMPUTE_ALPHA" in text
+    # It must NOT do a full high-energy reheat (that was the re-tangling bug).
+    assert "alpha = 1.0;        // reheat" not in text
+    # The anchor tether is applied during integration and follows a dragged node.
+    assert "(n.ax - n.x) * ANCHOR" in text
     # Connected components are computed and disconnected clusters repel harder, so
     # segregated clusters sit away from each other.
     assert "CROSS_COMPONENT" in text

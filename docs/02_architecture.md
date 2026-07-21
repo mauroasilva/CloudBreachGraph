@@ -203,9 +203,13 @@ Requirements:
   and drawn on an HTML5 canvas by a small vanilla-JS force simulation that self-distributes
   the nodes (pairwise repulsion + edge springs + collision separation) so they don't
   overlap; supports drag/zoom/pan. Disconnected components (separate VPCs, orphans) repel
-  each other (`CROSS_COMPONENT`) so segregated clusters settle apart, and a **Recompute
-  layout** button releases manual pins and re-runs the simulation to re-separate them after
-  the user has dragged things around. **No** third-party runtime dependency and **no** network
+  each other (`CROSS_COMPONENT`) so segregated clusters settle apart. A **Recompute layout**
+  button *refines the layout from its current positions* rather than re-solving it: it anchors
+  each node to where it is (`n.ax`/`n.ay` + `ANCHOR`), re-anchors spring rest lengths to the
+  current edge lengths, drops the centering gravity (`gravityScale = 0`) and applies only a
+  gentle reheat (`RECOMPUTE_ALPHA`), so a hand-arranged layout is preserved while overlaps are
+  resolved and clusters eased apart (a full reheat re-tangled it — that was a bug).
+  **No** third-party runtime dependency and **no** network
   access (stays consistent with §1). The emitted HTML is byte-stable (nodes/edges pre-sorted,
   a seeded PRNG for the layout, no timestamps). Because an in-browser O(n²) force layout only
   stays responsive up to a point, `write_html` enforces a size guard (`MAX_NODES`,
