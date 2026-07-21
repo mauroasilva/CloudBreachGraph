@@ -189,11 +189,12 @@ _TEMPLATE = """<!DOCTYPE html>
     <span id="ecount">__EDGE_COUNT__</span> edges</div>
   <div id="legend"></div>
   <div id="controls">
-    <button id="recompute" title="Release pinned nodes and re-run the layout, pushing
-separate clusters apart">↻ Recompute layout</button>
+    <button id="recompute" title="Tidy the layout from its current positions: release pins
+and gently settle, resolving overlaps and easing clusters apart — your arrangement is kept,
+not re-solved. Click again to refine further.">↻ Recompute layout</button>
   </div>
   <div id="hint">drag a node to pin · scroll to zoom · drag background to pan ·
-    Recompute to re-separate clusters</div>
+    Recompute gently tidies from where nodes are now</div>
 </div>
 <script>
 "use strict";
@@ -255,7 +256,14 @@ const GRAVITY = 0.012;       // pull toward the layout center (keeps it on scree
 const DAMPING = 0.86;        // velocity damping per tick
 const ANGULAR = 22;          // hub spoke-spreading strength (angular resolution)
 const CROSS_COMPONENT = 4;   // extra repulsion between disconnected clusters (keep them apart)
+const RECOMPUTE_ALPHA = 0.1; // gentle reheat for the Recompute button: refine from current
+                             // positions (nearest minimum), never a full high-energy re-solve
+const ANCHOR = 0.08;         // Recompute tethers each node to its current spot with this
+                             // stiffness, so it moves only as far as decluttering requires
 let alpha = 1.0;             // cooling factor (1 -> 0)
+let gravityScale = 1;        // 1 during the initial layout; the Recompute button drops it to 0
+                             // so a hand-made arrangement isn't dragged back toward center
+let anchored = false;        // true after Recompute: nodes are pulled toward n.ax/n.ay anchors
 
 // Degree-weighted charge + adjacency: high-degree hubs repel harder, so their neighbors
 // fan out evenly instead of bunching on one side — this unfolds star clusters (a subnet
@@ -343,10 +351,13 @@ function step() {
       }
     }
   }
-  // Gravity + integrate.
+  // Gravity + anchors + integrate. After a Recompute, gravityScale is 0 (no re-centering) and
+  // each node is pulled back toward its anchor (n.ax/n.ay) — this tether is NOT alpha-scaled,
+  // so as the sim cools nodes return to where they were except where decluttering moved them.
   for (const n of nodes) {
     if (n.fixed) { n.vx = 0; n.vy = 0; continue; }
-    n.vx -= n.x * GRAVITY * alpha; n.vy -= n.y * GRAVITY * alpha;
+    n.vx -= n.x * GRAVITY * gravityScale * alpha; n.vy -= n.y * GRAVITY * gravityScale * alpha;
+    if (anchored) { n.vx += (n.ax - n.x) * ANCHOR; n.vy += (n.ay - n.y) * ANCHOR; }
     n.vx *= DAMPING; n.vy *= DAMPING;
     n.x += n.vx; n.y += n.vy;
   }
@@ -434,6 +445,8 @@ window.addEventListener("mousemove", (ev) => {
   if (dragNode) {
     const w = fromScreen(ev.clientX, ev.clientY);
     dragNode.x = w.x; dragNode.y = w.y; dragNode.vx = 0; dragNode.vy = 0;
+    dragNode.ax = w.x; dragNode.ay = w.y;   // if anchored (post-Recompute), the anchor follows
+                                            // the drag so the node stays where you drop it
   } else if (dragging) {
     panX += ev.clientX - lastX; panY += ev.clientY - lastY;
     lastX = ev.clientX; lastY = ev.clientY; centered = true;
@@ -449,13 +462,26 @@ canvas.addEventListener("wheel", (ev) => {
 }, { passive: false });
 
 // --- recompute layout ------------------------------------------------------
-// Release every manual pin, reheat the simulation, and let it re-settle from the current
-// positions. The cross-component repulsion (above) then pushes segregated clusters apart,
-// and autoCenter re-fits the view once it cools. Wired to the HUD button.
+// Tidy the layout *from wherever the nodes are now* — NOT a global re-solve. The old full
+// reheat (alpha = 1) gave nodes large velocities that overshot into a far-away, chaotic
+// minimum, throwing away the arrangement you'd made by hand and re-tangling it. Instead we
+// make the *current* arrangement the equilibrium and only relieve local crowding:
+//   * anchor every node to its current position (n.ax/n.ay) so it's tethered where it is;
+//   * re-anchor every spring's rest length to its current length, so edges are NOT contracted
+//     back toward the default layout (your shape and edge lengths are preserved);
+//   * switch off the centering gravity (gravityScale = 0), so nodes aren't dragged to center;
+//   * apply a small amount of energy (RECOMPUTE_ALPHA) so only repulsion, collision, angular
+//     spread and cross-component separation act — resolving overlaps and easing clusters apart.
+// The viewport is left untouched so the picture doesn't jump. Click again to tidy further.
 function recompute() {
-  for (const n of nodes) { n.fixed = false; n.vx = 0; n.vy = 0; }
-  alpha = 1.0;        // reheat: the running frame() loop animates the re-layout
-  centered = false;   // re-fit the viewport after it settles
+  for (const e of edges) {
+    const dx = e.t.x - e.s.x, dy = e.t.y - e.s.y;
+    e.len = Math.sqrt(dx * dx + dy * dy) || e.len;   // current geometry becomes the rest state
+  }
+  for (const n of nodes) { n.fixed = false; n.ax = n.x; n.ay = n.y; n.vx = 0; n.vy = 0; }
+  anchored = true;           // tether each node to where it is now
+  gravityScale = 0;          // keep the arrangement in place; don't re-center it
+  alpha = RECOMPUTE_ALPHA;   // gentle nudge from current positions, not a full reheat
 }
 document.getElementById("recompute").addEventListener("click", recompute);
 
