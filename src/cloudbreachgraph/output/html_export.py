@@ -303,11 +303,12 @@ def _vpc_group_of(graph: Graph) -> dict[str, str]:
 
 
 def _ringed_view_data(graph: Graph) -> dict:
-    """Build the ringed page payload: nodes with fixed x/y, edges, and per-cluster ring guides.
+    """Build the ringed page payload: nodes with fixed x/y, edges, and per-cluster metadata.
 
     Reuses :func:`_view_data`'s per-node fields (colors, exposure flag, detail line) and adds
     computed ``x``/``y``. ``clusters`` carries each VPC cluster's center, ring radii and label
-    so the page can draw the guide circles that make the rings legible.
+    — used to place the cluster label and fit the view; the rings themselves are conveyed by
+    node position alone (no guide circles are drawn).
     """
     base = _view_data(graph)
     by_id = {n["id"]: n for n in base["nodes"]}
@@ -812,8 +813,8 @@ document.getElementById("recompute").addEventListener("click", recompute);
 
 # --------------------------------------------------------------------------- #
 # Ringed page template. Positions are precomputed in Python (GRAPH.nodes have x/y and
-# GRAPH.clusters carry the ring guides), so there is no force simulation — the JS only draws
-# and handles pan/zoom/drag. Self-contained: inline CSS + JS, no external assets.
+# GRAPH.clusters carry each cluster's center/label), so there is no force simulation — the JS
+# only draws and handles pan/zoom/drag. Self-contained: inline CSS + JS, no external assets.
 # --------------------------------------------------------------------------- #
 _RINGED_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
@@ -936,19 +937,17 @@ function draw() {
   ctx.clearRect(0, 0, W, H);
   const dark = getComputedStyle(document.body).color === "rgb(232, 234, 237)";
 
-  // Ring guide circles + cluster labels first, so nodes/edges sit on top.
-  ctx.strokeStyle = dark ? "rgba(160,170,180,0.30)" : "rgba(96,125,139,0.28)";
+  // Cluster labels (the VPC name above each cluster), drawn first so nodes/edges sit on top.
+  // The rings themselves are conveyed purely by node position — no guide circles are drawn.
   ctx.fillStyle = dark ? "#9aa0a6" : "#607d8b";
   ctx.textAlign = "center";
   ctx.font = "12px Helvetica, Arial, sans-serif";
-  for (const c of clusters) {
-    const p = toScreen({ x: c.cx, y: c.cy });
-    for (const rr of c.rings) {
-      if (rr <= 0) continue;
-      ctx.beginPath(); ctx.arc(p.x, p.y, rr * scale, 0, Math.PI * 2); ctx.stroke();
+  if (scale > 0.4) {
+    for (const c of clusters) {
+      const p = toScreen({ x: c.cx, y: c.cy });
+      const top = Math.max(0, ...c.rings, 40) * scale;
+      ctx.fillText(c.label, p.x, p.y - top - 6);
     }
-    const top = Math.max(0, ...c.rings, 40) * scale;
-    if (scale > 0.4) ctx.fillText(c.label, p.x, p.y - top - 6);
   }
 
   ctx.lineWidth = 1;

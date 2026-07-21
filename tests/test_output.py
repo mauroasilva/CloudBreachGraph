@@ -233,9 +233,11 @@ def test_write_ringed_html_is_self_contained(graph, tmp_path):
     assert "http://" not in text and "https://" not in text
     assert "<script src" not in text and 'link rel="stylesheet"' not in text
     assert "__GRAPH_DATA__" not in text and "const GRAPH =" in text
-    # Ringed page: precomputed positions + cluster ring guides, NOT a force simulation.
+    # Ringed page: precomputed positions + per-cluster metadata, NOT a force simulation.
     assert "GRAPH.clusters" in text
     assert "REPULSION" not in text and "requestAnimationFrame" not in text
+    # Rings are conveyed by node position only — no guide circles are stroked.
+    assert "ctx.arc(p.x, p.y, rr" not in text
     assert "eni-00instance0000001" in text
 
 

@@ -211,7 +211,8 @@ keeps its interfaces clustered right next to it, and an EC2 instance or load bal
 radially with its interface(s) (a single ENI puts it on exactly that spoke; several average
 out). Multiple VPCs are tiled in a grid so their rings don't overlap; any resource
 that resolves to no VPC (an orphan) collects into a final ring-cluster with an empty center.
-Faint guide circles and a per-cluster VPC label make the ring structure legible. Unlike the
+The ring structure is conveyed by node position alone (no guide circles are drawn); a
+per-cluster VPC label sits above each cluster. Unlike the
 force view, positions are computed deterministically (no in-browser relaxation, no Recompute
 button); you can still drag a node, scroll to zoom, and drag the background to pan, plus the
 same **Zoom In / Zoom Out** buttons and **lock scroll-zoom** toggle as the default view. It obeys
