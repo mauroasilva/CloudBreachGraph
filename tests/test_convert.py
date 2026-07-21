@@ -312,6 +312,62 @@ def test_ringed_outer_node_uses_average_angle_of_multiple_enis():
     assert not _angles_close(got, a) and not _angles_close(got, b)
 
 
+def test_ringed_subnet_aligns_with_mean_angle_of_its_enis(graph):
+    # In the fixture each subnet sits at the circular mean of the ENIs it contains.
+    import math
+
+    data = html_export._ringed_view_data(graph)
+    pos = {n["id"]: n for n in data["nodes"]}
+    cx, cy = data["clusters"][0]["cx"], data["clusters"][0]["cy"]
+    enis_of_subnet = {}
+    for e in graph.edges:
+        if e.relationship == "in_subnet":
+            enis_of_subnet.setdefault(e.target, []).append(e.source)
+    assert enis_of_subnet  # sanity: the fixture has subnets with ENIs
+    for subnet, enis in enis_of_subnet.items():
+        angs = [_angle_of(pos[e], cx, cy) for e in enis]
+        expected = math.atan2(sum(map(math.sin, angs)), sum(map(math.cos, angs)))
+        assert _angles_close(_angle_of(pos[subnet], cx, cy), expected)
+
+
+def test_ringed_enis_stay_grouped_near_their_subnet():
+    # Two subnets with several ENIs each: every ENI must be angularly closest to its own
+    # subnet, i.e. a subnet's interfaces cluster near it rather than scattering around the ring.
+    import math
+
+    def eni(name, subnet):
+        return {
+            "NetworkInterfaceId": name,
+            "SubnetId": subnet,
+            "VpcId": "vpc-1",
+            "InterfaceType": "interface",
+            "Description": "",
+            "Attachment": {"InstanceId": None},
+            "PrivateIpAddresses": [],
+            "Groups": [],
+        }
+
+    enis_of_subnet = {"subnet-1": ["eni-a", "eni-b"], "subnet-2": ["eni-c", "eni-d", "eni-e"]}
+    collected = {
+        "meta": {},
+        "network_interfaces": [eni(n, s) for s, names in enis_of_subnet.items() for n in names],
+    }
+    g = build_graph(collected)
+    data = html_export._ringed_view_data(g)
+    pos = {n["id"]: n for n in data["nodes"]}
+    cx, cy = data["clusters"][0]["cx"], data["clusters"][0]["cy"]
+
+    def circ_dist(a, b):
+        return math.acos(max(-1.0, min(1.0, math.cos(a - b))))
+
+    subnets = list(enis_of_subnet)
+    for subnet, enis in enis_of_subnet.items():
+        for e in enis:
+            ea = _angle_of(pos[e], cx, cy)
+            nearest = min(subnets, key=lambda s: circ_dist(ea, _angle_of(pos[s], cx, cy)))
+            assert nearest == subnet
+
+
 def test_ringed_unassigned_nodes_form_their_own_cluster():
     # An ENI in no subnet (thus no VPC) collects into the trailing "unassigned" cluster.
     collected = {

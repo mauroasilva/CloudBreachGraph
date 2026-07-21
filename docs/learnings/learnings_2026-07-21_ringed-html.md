@@ -46,6 +46,27 @@
   that sum to the zero vector (e.g. 3 evenly-spaced or 2 antipodal spokes) is degenerate —
   `atan2(0, 0)` returns 0; the multi-ENI test deliberately uses a non-antipodal pair to avoid
   testing that degenerate path.
+- **Follow-up — subnets align to their ENIs too (ENIs grouped near their subnet):** the
+  ENI ring is now the angular anchor for *both* neighbours. `_place_outer_ring` was
+  generalized/renamed to **`_place_aligned_to_enis(members, cx, cy, radius, eni_angle,
+  enis_by_member)`** and is used for the subnet ring (map = `enis_of_subnet`) and the outer
+  ring (map = `enis_of_lb`). On ring 2 the ENIs are now **ordered by `(subnet_id, eni_id)`**
+  so each subnet's ENIs form one contiguous arc; the subnet then sits at the circular mean of
+  that arc, keeping its interfaces angularly adjacent. `_ringed_view_data` builds
+  `enis_of_subnet` and `subnet_of_eni` from the sorted `in_subnet` edges alongside the
+  existing `enis_of_lb`. Tests: subnet = mean-angle-of-its-ENIs, and a "every ENI's nearest
+  subnet is its own" grouping check.
+  - **Known minor gap:** subnets are no longer evenly spaced on ring 1 (they follow their ENI
+    blocks), so in pathological cases two subnets with adjacent small ENI blocks could sit
+    close on the (smaller-radius) subnet ring. Not observed on real topologies; revisit with a
+    subnet-node de-collision pass if it ever bites.
+
+## GIT NOTE (this session)
+- PR #12 (first three commits: ringed HTML, zoom controls, ENI ring split) was **merged** as a
+  real merge commit into `main`. The angular-alignment commit and this subnet-alignment commit
+  are **new, unmerged work**: the branch was rebased onto the post-merge `main` so it carries
+  only the unmerged commits (no duplicate already-merged history), then force-with-lease pushed.
+  Any PR opened for this branch now is a **new** PR, not #12.
 
 ## 2. Interface contract for the next session
 - `html_export.write_ringed_html` has the **same signature and return contract** as

@@ -227,9 +227,10 @@ Requirements:
   Its `--ringed` flag selects an alternative **concentric-ringed** layout
   (`html_export.write_ringed_html`/`build_ringed_html`): each VPC is a cluster center, ringed
   by its subnets, then its ENIs on a dedicated ring, then everything else under that VPC (EC2
-  instances, load balancers) — each outer-ring node placed at the mean angle of the ENIs
-  attached to it so it lines up radially with its interface(s), with
-  orphan resources collected into a final ring-cluster (empty center). Ring positions are
+  instances, load balancers). The ENI ring is the angular anchor: each subnet is placed at the
+  mean angle of the ENIs it contains (ENIs are grouped by subnet on their ring) and each
+  EC2/LB at the mean angle of the ENIs attached to it, so both stay radially next to their
+  interfaces; orphan resources collect into a final ring-cluster (empty center). Ring positions are
   computed deterministically in Python (no in-browser force sim), and the same `MAX_NODES`/
   `MAX_HTML_BYTES` guard and `.dot` fallback apply.
 
