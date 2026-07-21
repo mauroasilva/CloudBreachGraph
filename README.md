@@ -191,6 +191,14 @@ cloudbreachgraph-to-html capture.data --format json     # force the input format
 cloudbreachgraph-to-html out/graph.json --ringed        # concentric-ringed layout
 ```
 
+No capture of your own? A shipped, fully **anonymised** example graph (a real-shaped
+multi-VPC topology — 4 VPCs, 28 subnets, 60 ENIs, 19 load balancers; all names, IDs and IPs
+randomised) lets you try the tool with no AWS account at all:
+
+```bash
+cloudbreachgraph-to-html docs/examples/example-graph.json --ringed -o example.html
+```
+
 - **From JSON** the conversion is **lossless** — it reproduces exactly the page `--html`
   would have written.
 - **From DOT** it's **best-effort** (DOT is a lossy rendering, and only *this tool's own*
