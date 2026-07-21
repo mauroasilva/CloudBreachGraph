@@ -14,7 +14,8 @@ from conftest import load_fixture
 from cloudbreachgraph.aws import collectors, runner
 from cloudbreachgraph.config import ResolvedAccount, ResolvedTarget
 from cloudbreachgraph.mapping.builder import build_graph
-from cloudbreachgraph.output import dot_export, json_export
+from cloudbreachgraph.model.graph import Edge, Graph, Node
+from cloudbreachgraph.output import dot_export, html_export, json_export
 
 _COMMAND_FIXTURES = {
     ("ec2", "describe-network-interfaces"): "ec2_describe-network-interfaces.json",
@@ -124,6 +125,61 @@ def test_write_dot_marks_synthetic_dashed(tmp_path):
     g = build_graph(collected)
     text = dot_export.write_dot(g, tmp_path / "g.dot").read_text()
     assert 'style="filled,dashed"' in text  # synthetic subnet / vpc rendered dashed
+
+
+# --------------------------------------------------------------------------- #
+# HTML
+# --------------------------------------------------------------------------- #
+def test_write_html_is_self_contained(graph, tmp_path):
+    path = html_export.write_html(graph, tmp_path / "graph.html")
+    assert path is not None and path.is_file()
+    text = path.read_text()
+    assert text.startswith("<!DOCTYPE html>")
+    assert text.rstrip().endswith("</html>")
+    # Fully self-contained: no external assets / network references at all.
+    assert "http://" not in text and "https://" not in text
+    assert "<script src" not in text and 'link rel="stylesheet"' not in text
+    # The graph data is inlined and the placeholder was substituted.
+    assert "__GRAPH_DATA__" not in text
+    assert "const GRAPH =" in text
+    # The force layout that self-distributes nodes is present.
+    assert "REPULSION" in text and "requestAnimationFrame" in text
+    # A representative node id is embedded in the inlined data.
+    assert "eni-00instance0000001" in text
+
+
+def test_write_html_embeds_public_exposure(graph, tmp_path):
+    text = html_export.write_html(graph, tmp_path / "graph.html").read_text()
+    # An ENI with a public IP is flagged so the page can highlight internet exposure.
+    assert '"public": true' in text
+
+
+def test_write_html_is_deterministic(graph, tmp_path):
+    a = html_export.write_html(graph, tmp_path / "a.html").read_text()
+    b = html_export.write_html(graph, tmp_path / "b.html").read_text()
+    assert a == b  # stable ordering, seeded layout, no timestamps
+
+
+def test_write_html_falls_back_when_too_many_nodes(graph, tmp_path):
+    # With a node cap of 0 the graph is "too big": nothing is written, None returned.
+    result = html_export.write_html(graph, tmp_path / "graph.html", max_nodes=0)
+    assert result is None
+    assert not (tmp_path / "graph.html").exists()
+
+
+def test_write_html_falls_back_when_too_many_bytes(graph, tmp_path):
+    result = html_export.write_html(graph, tmp_path / "graph.html", max_bytes=10)
+    assert result is None
+    assert not (tmp_path / "graph.html").exists()
+
+
+def test_write_html_size_guard_defaults_allow_small_graph(tmp_path):
+    g = Graph(meta={})
+    g.add_node(Node(id="vpc-1", type="vpc", label="vpc-1"))
+    g.add_node(Node(id="subnet-1", type="subnet", label="subnet-1"))
+    g.add_edge(Edge(source="subnet-1", target="vpc-1", relationship="in_vpc"))
+    path = html_export.write_html(g, tmp_path / "graph.html")
+    assert path is not None and path.is_file()
 
 
 def test_render_without_dot_returns_none(graph, tmp_path, monkeypatch):

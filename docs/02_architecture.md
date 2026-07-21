@@ -198,6 +198,17 @@ Requirements:
   per VPC so the layout groups subnets/ENIs inside their VPC visually.
 - **Optional render:** if the `dot` binary is on PATH, offer `--render png|svg` that shells
   out to `dot -T<fmt>`. Absence of `dot` must degrade gracefully (still write the `.dot`).
+- **Interactive HTML** (`graph.html`, opt-in via `--html`, *not* produced by default):
+  a single **self-contained** page (`output/html_export.py`) — the graph is inlined as JSON
+  and drawn on an HTML5 canvas by a small vanilla-JS force simulation that self-distributes
+  the nodes (pairwise repulsion + edge springs + collision separation) so they don't
+  overlap; supports drag/zoom/pan. **No** third-party runtime dependency and **no** network
+  access (stays consistent with §1). The emitted HTML is byte-stable (nodes/edges pre-sorted,
+  a seeded PRNG for the layout, no timestamps). Because an in-browser O(n²) force layout only
+  stays responsive up to a point, `write_html` enforces a size guard (`MAX_NODES`,
+  `MAX_HTML_BYTES`): over budget it writes nothing and returns `None`, and the CLI **warns
+  and falls back to the always-written `.dot`** (which Graphviz lays out offline at any
+  scale).
 
 ## 8. Regions
 

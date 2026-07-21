@@ -127,6 +127,8 @@ cloudbreachgraph --from-cache tests/fixtures --output-dir out/
 --include-orphans          also emit collected resources no ENI references
 --output-dir DIR           where to write outputs (default: .)
 --render {png,svg}         also rasterize the .dot with Graphviz (needs `dot`)
+--html                     also write an interactive, self-contained HTML view
+                             (falls back to .dot when the graph is too large)
 ```
 
 ## Outputs
@@ -140,8 +142,19 @@ cloudbreachgraph --from-cache tests/fixtures --output-dir out/
   a public IP is also linked to a generic `Internet` node to highlight internet exposure.
 - `graph.<fmt>` — only with `--render`; requires `dot`. If `dot` is absent the tool warns
   and still writes the `.dot`.
+- `graph.html` — **only with `--html`** (never produced by default). A single,
+  **self-contained** HTML page (no CDN, no external assets) that draws the graph on an
+  HTML5 canvas with a small vanilla-JavaScript **force layout**: nodes self-distribute
+  (repulsion + edge springs + collision separation) so they don't sit on top of each other.
+  Drag a node to pin it, scroll to zoom, drag the background to pan; nodes are colored by
+  type and ENIs with a public IP get a red "exposed" outline. For very large graphs an
+  in-browser force layout stops being responsive, so if the graph exceeds the render budget
+  the tool **warns and skips the HTML**, pointing you at the always-written `.dot` (which
+  Graphviz can lay out offline at any scale). Just open the file in any browser — it works
+  fully offline.
 
-With `--all-accounts` the files are named per account: `graph.<alias>.json` / `.dot`.
+With `--all-accounts` the files are named per account: `graph.<alias>.json` / `.dot`
+(and `.html` with `--html`).
 
 ## Future roles (flow logs, etc.)
 

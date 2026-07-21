@@ -40,7 +40,7 @@ from .config import (
     verify_target,
 )
 from .mapping.builder import build_graph
-from .output import dot_export, json_export
+from .output import dot_export, html_export, json_export
 
 # The roles a run activates. v1 = network only; binding another role in config later means
 # extending this default (or a future --roles flag) — the rest of the pipeline is role-aware.
@@ -103,6 +103,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--render",
         choices=("png", "svg"),
         help="also rasterize the .dot with Graphviz (requires the `dot` binary on PATH)",
+    )
+    out.add_argument(
+        "--html",
+        action="store_true",
+        help="also write an interactive, self-contained HTML view (graph.html) whose nodes "
+        "self-distribute via a force layout; falls back to the .dot when the graph is too "
+        "large to render responsibly in a browser",
     )
     return p
 
@@ -181,6 +188,20 @@ def _write_outputs(collected: dict, out_dir: Path, stem: str, args: argparse.Nam
     dot_path = dot_export.write_dot(graph, out_dir / f"{stem}.dot")
     print(f"wrote {json_path}")
     print(f"wrote {dot_path}")
+
+    if args.html:
+        html_path = html_export.write_html(graph, out_dir / f"{stem}.html")
+        if html_path is None:
+            # Too large to render responsibly in a browser: fall back to the .dot, which
+            # Graphviz can lay out offline at any scale (docs/02_architecture.md §7).
+            print(
+                f"cloudbreachgraph: warning: graph too large for an interactive HTML view "
+                f"(> {html_export.MAX_NODES} nodes); skipped {stem}.html — use {dot_path} "
+                f"with Graphviz instead.",
+                file=sys.stderr,
+            )
+        else:
+            print(f"wrote {html_path}")
 
     if args.render:
         rendered = dot_export.render(dot_path, args.render)
