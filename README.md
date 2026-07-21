@@ -19,6 +19,21 @@ CLI v2 must be installed and on `PATH`, with a read-only profile per account. To
 the graph to PNG/SVG you also need [Graphviz](https://graphviz.org/) (`dot`) on `PATH` —
 this is optional; without it the tool still writes the `.dot` file.
 
+### Updating to the latest version
+
+After pulling new commits, reinstall so any new or changed console scripts (e.g.
+`cloudbreachgraph-to-html`) and metadata are picked up:
+
+```bash
+git pull
+pip install -e .          # or: pip install -e '.[dev]' to also refresh dev tools
+```
+
+Because the package is installed in editable mode (`-e`), day-to-day code changes take
+effect without reinstalling — but a reinstall is required whenever `pyproject.toml` changes
+(new entry points, dependencies, or version), which a `git pull` may include. When in doubt,
+just rerun the command above; it's cheap and idempotent.
+
 ## Quick start
 
 Build a map of an account and write `graph.json` + `graph.dot` into `out/`:
