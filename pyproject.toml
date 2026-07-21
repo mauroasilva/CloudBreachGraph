@@ -28,6 +28,8 @@ graphviz = ["graphviz>=0.20"]
 [project.scripts]
 # Wired up in Phase 3 (cli.py); declared now so the console entry point is stable.
 cloudbreachgraph = "cloudbreachgraph.cli:main"
+# Auxiliary tool: convert an existing graph.json/graph.dot into the interactive HTML view.
+cloudbreachgraph-to-html = "cloudbreachgraph.convert:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

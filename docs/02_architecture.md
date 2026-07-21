@@ -209,6 +209,14 @@ Requirements:
   `MAX_HTML_BYTES`): over budget it writes nothing and returns `None`, and the CLI **warns
   and falls back to the always-written `.dot`** (which Graphviz lays out offline at any
   scale).
+- **Converting existing output → HTML** (`cloudbreachgraph-to-html`, `convert.py`): an
+  auxiliary console entry point that re-loads a previously written `graph.json`/`graph.dot`
+  and renders the HTML view without re-collecting from AWS. Loading is the inverse of the
+  writers and lives in `graph_io.py`: `load_json`/`graph_from_dict` is a **lossless** inverse
+  of `Graph.to_dict()`; `load_dot` is a **best-effort** parser for *this tool's own* DOT
+  (recovers node id/type/name, public/synthetic flags, the one display attribute per type,
+  and every edge + `match_rule`; folds the DOT-only `Internet` decoration back into
+  `public_ips`). The converter reuses the same `write_html` size guard and `.dot` fallback.
 
 ## 8. Regions
 

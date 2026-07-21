@@ -55,6 +55,38 @@ crossings** (the initial version left visible crossings on the fixture graph):
 - New tunables live as JS consts in the template: `REPULSION`, `SPRING`, `ANGULAR`,
   `GRAVITY`, `DAMPING`, `WARMUP`. Adjust `ANGULAR` (spoke spreading) / `REPULSION` first.
 
+## 1b. Follow-up in the same session: graph.json / graph.dot → HTML converter
+Added an auxiliary tool to render the HTML view from an *already-written* graph file (no
+AWS collection), for people who ran without `--html` or only have a `--from-cache`/colleague
+capture.
+- **`src/cloudbreachgraph/graph_io.py`** — the inverse of the output writers:
+  - `graph_from_dict(dict) -> Graph` and `load_json(path) -> Graph`: **lossless** inverse of
+    `Graph.to_dict()` (rebuilds every node/edge attribute). Round-trip is byte-identical.
+  - `load_dot(path) -> Graph`: **best-effort** parser for *this tool's own* DOT only (not
+    general Graphviz). Regex-matches node/edge statements, splits the label on `\n`, and
+    recovers id, type (from the `[type]` first label line), name (`<id> [<name>]`),
+    `synthetic` (from `style="...dashed"` or the `(unresolved)` line), `private_ips`/
+    `public_ips` (from the `Private IP:`/`Public IP:` lines), and the single per-type bare
+    attribute (`interface_type`/`lb_type`/`cidr`/`state`). The DOT-only `Internet` node +
+    its `public_ip` edges are folded back into `public_ips` on the source ENI (inverse of
+    what `dot_export` adds), so the reconstructed graph matches the *model*, not the drawing.
+  - `load_graph(path, fmt="auto")` dispatches by extension (`.json` / `.dot`|`.gv`) or an
+    explicit `fmt`. Errors raise `GraphLoadError`.
+- **`src/cloudbreachgraph/convert.py`** — new console entry point
+  `cloudbreachgraph-to-html = "cloudbreachgraph.convert:main"` (added to `pyproject.toml`).
+  Loads the file, calls the same `html_export.write_html`, and on the too-big path writes a
+  `.dot` fallback via `dot_export` (skipping the write when the input already *is* that
+  `.dot`, so the source is never clobbered). `main(argv)` returns `2` on load errors, `0`
+  otherwise — mirrors `cli.py` conventions.
+- **Verified:** JSON→HTML is **byte-identical** to `--html`'s direct output; DOT→HTML
+  recovers all 10 fixture nodes, 9 edges, the public flag, and every per-type detail line
+  (incl. colon-heavy ELB ARNs). Both render error-free in headless Chromium. Tests in
+  `tests/test_convert.py` (17). Separate entry point (not a subcommand) keeps the main CLI's
+  parser untouched.
+- **Known gap:** `load_dot` is coupled to `dot_export`'s exact label format — if that emitter
+  changes (label line order, new attribute lines), update the parser + its tests together.
+  JSON is the safe, lossless path; prefer it when both files exist.
+
 ## 2. Interface contract for the next change
 - Output writers live in `src/cloudbreachgraph/output/`. The HTML writer signature is
   `write_html(graph, path, *, max_nodes=None, max_bytes=None) -> Path | None`. **`None` means
@@ -113,13 +145,17 @@ crossings** (the initial version left visible crossings on the fixture graph):
 ## 7. How to verify this change
 ```bash
 pip install -e '.[dev]'
-pytest                     # 90 tests pass, incl. new HTML output + CLI tests
+pytest                     # 107 tests pass (HTML output, CLI, converter round-trips)
 ruff check . && ruff format --check .
 
 # End-to-end, offline, against the checked-in fixtures:
 cloudbreachgraph --from-cache tests/fixtures --output-dir /tmp/cbg-out --html
 #   -> writes graph.json, graph.dot, graph.html
 open /tmp/cbg-out/graph.html      # (or any browser) — self-contained, works offline
+
+# Convert existing files to HTML (no AWS calls):
+cloudbreachgraph-to-html /tmp/cbg-out/graph.json   # lossless -> /tmp/cbg-out/graph.html
+cloudbreachgraph-to-html /tmp/cbg-out/graph.dot -o /tmp/cbg-out/from_dot.html  # best-effort
 
 # Exercise the size-guard fallback (skips HTML, keeps .dot, warns on stderr):
 python - <<'PY'

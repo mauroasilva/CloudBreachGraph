@@ -156,6 +156,26 @@ cloudbreachgraph --from-cache tests/fixtures --output-dir out/
 With `--all-accounts` the files are named per account: `graph.<alias>.json` / `.dot`
 (and `.html` with `--html`).
 
+## Converting an existing graph to HTML
+
+Already have a `graph.json` or `graph.dot` from an earlier run (e.g. from `--from-cache`, a
+colleague's capture, or a run without `--html`)? The auxiliary `cloudbreachgraph-to-html`
+tool renders the same interactive HTML view from it — **no AWS calls, purely local**:
+
+```bash
+cloudbreachgraph-to-html out/graph.json                 # writes out/graph.html
+cloudbreachgraph-to-html out/graph.dot -o topology.html # explicit output path
+cloudbreachgraph-to-html capture.data --format json     # force the input format
+```
+
+- **From JSON** the conversion is **lossless** — it reproduces exactly the page `--html`
+  would have written.
+- **From DOT** it's **best-effort** (DOT is a lossy rendering, and only *this tool's own*
+  `.dot` is understood): node ids/types/names, the public-exposure and unresolved flags, the
+  per-type detail (interface/LB type, CIDR, instance state), and every edge are recovered.
+- The same size guard applies: if the graph is too large for a browser force layout, it warns
+  and writes a `.dot` fallback instead (skipping it if the input already is that `.dot`).
+
 ## Future roles (flow logs, etc.)
 
 v1 maps the **`network`** role. VPC Flow Logs (`flow_logs`) — often published to a separate
