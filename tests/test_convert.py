@@ -522,6 +522,33 @@ def test_ringed_optimize_converges_early():
     assert html_export.build_ringed_html(g, 20) == html_export.build_ringed_html(g, 200)
 
 
+def test_ringed_optimize_freezes_on_tangled_graph():
+    # A densely cross-linked graph (instances spanning several subnets) makes the barycenter
+    # iteration limit-cycle rather than settle; the cooling schedule must freeze it so a large
+    # pass count is byte-stable. Without cooling build(120) != build(600) here.
+    def eni(name, subnet, instance):
+        return {
+            "NetworkInterfaceId": name,
+            "SubnetId": subnet,
+            "VpcId": "vpc-1",
+            "InterfaceType": "interface",
+            "Description": "",
+            "Attachment": {"InstanceId": instance},
+            "PrivateIpAddresses": [],
+            "Groups": [],
+        }
+
+    spans = {  # instance -> the subnets it spans (cross-links that tangle the rings)
+        "i-a": ["subnet-0", "subnet-3"],
+        "i-b": ["subnet-1", "subnet-4"],
+        "i-c": ["subnet-2", "subnet-5"],
+        "i-d": ["subnet-0", "subnet-2", "subnet-4"],
+    }
+    nis = [eni(f"eni-{inst}-{s}", s, inst) for inst, subs in spans.items() for s in subs]
+    g = build_graph({"meta": {}, "network_interfaces": nis})
+    assert html_export.build_ringed_html(g, 120) == html_export.build_ringed_html(g, 600)
+
+
 def test_convert_ringed_optimize_passes(graph, tmp_path):
     jp = json_export.write_json(graph, tmp_path / "graph.json")
     out = tmp_path / "opt.html"

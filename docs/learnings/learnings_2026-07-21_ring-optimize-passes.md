@@ -89,6 +89,27 @@
 - New test `test_ringed_optimize_places_lb_sharing_subnets_adjacent` locks the ~180°→<45°
   behaviour in.
 
+## 6c. Follow-up — cooling schedule (fixes non-convergence on real graphs)
+- Testing on a real 124-node/4-VPC capture exposed that the position-based convergence check
+  **never triggered**: the barycenter+min-gap iteration doesn't settle on a dense graph — it
+  wanders a **limit cycle** of equal-crossing layouts (pairwise distances shifted up to ~140px
+  between pass 150 and 300), so the coordinates — and the emitted bytes — depended on the exact
+  pass count. `build(150) != build(300)`. The earlier "stable for large N" claim held only for
+  simple graphs that happen to reach a true fixed point.
+- Fix: a **geometric cooling schedule** in `_optimize_cluster`. Each pass moves a node only
+  `alpha` of the way to its barycenter (`cur + alpha·angdiff(bary, cur)` fed into
+  `_place_min_gap`), and `alpha *= _OPT_COOLING` (0.9) per pass. Movement decays to zero, the
+  `max_move < 1e-4` break fires (~pass 90 for the real graph), and the layout **freezes** — so
+  `build(100) == build(300) == build(2000)`, independent of N. `_OPT_COOLING` is a module const.
+- Real-graph result (`--optimize-passes 100`): crossings **79 → 28**, total edge length
+  **32185 → 23729 (−26%)**, min node gap **0 → 26px** (the baseline ringed layout actually had
+  *overlapping* nodes — cooling+min-gap fixes that too). Crossings reach 28 by ~pass 10.
+- Cost: the frozen state has 1 more crossing than the un-cooled limit-cycle minimum (28 vs 27)
+  — a negligible price for byte-stable, converging output.
+- New regression test `test_ringed_optimize_freezes_on_tangled_graph` builds a densely
+  cross-linked graph (instances spanning several subnets) and asserts `build(120) == build(600)`
+  — this fails without cooling.
+
 ## 7. Git note (this session)
 - PR #13 was merged into `main`. This work is on branch
   `claude/cloudbreachgraph-no-ring-circles` (which also carried the "stop drawing ring circles"
@@ -97,7 +118,7 @@
 ## 8. How to verify
 ```bash
 pip install -e '.[dev]'
-pytest                       # 133 tests, all offline
+pytest                       # 134 tests, all offline
 ruff check . && ruff format --check .
 cloudbreachgraph --from-cache tests/fixtures --output-dir /tmp/cbg-out
 cloudbreachgraph-to-html /tmp/cbg-out/graph.json --ringed --optimize-passes 20 -o /tmp/opt.html

@@ -189,6 +189,11 @@ _CLUSTER_PAD = 130.0  # extra gap between adjacent clusters in the grid
 # the interfaces read as a distinct layer between their subnets and the compute/LBs they front.
 _RING_COUNT = 4  # ring 0 is the center; rings 1..3 are the concentric outer rings
 
+# Per-pass cooling factor for the --optimize-passes refinement (see _optimize_cluster): each
+# pass moves nodes only `alpha` of the way to their barycenter, and alpha *= this each pass, so
+# movement decays to zero and the layout freezes to a stable state regardless of the pass count.
+_OPT_COOLING = 0.9
+
 
 def _ring_of(node_type: str) -> int:
     """Ring index for a node type: VPC center (0), subnet (1), ENI (2), everything else (3)."""
@@ -401,6 +406,12 @@ def _optimize_cluster(bucket: dict, cx: float, cy: float, rs: list, adj: dict, p
     ring_of = {m["id"]: r for r in range(_RING_COUNT) for m in bucket[r]}
     angle = {m["id"]: math.atan2(m["y"] - cy, m["x"] - cx) for r in (1, 2, 3) for m in bucket[r]}
 
+    # Cooling: each node is moved only a fraction `alpha` of the way to its barycenter, and
+    # `alpha` decays every pass. Without it the barycenter iteration on a real graph never
+    # settles — it drifts around a limit cycle of equal-crossing layouts, so the coordinates
+    # (and the emitted bytes) would depend on the exact pass count. Geometric cooling forces the
+    # movement to zero, so the layout *freezes* and any large pass count yields the same result.
+    alpha = 1.0
     for _ in range(passes):
         max_move = 0.0
         for r in (1, 2, 3, 2):  # outward then back inward, so positions propagate both ways
@@ -414,13 +425,16 @@ def _optimize_cluster(bucket: dict, cx: float, cy: float, rs: list, adj: dict, p
                     for nid in adj.get(m["id"], ())
                     if ring_of.get(nid, 0) != 0 and nid in angle
                 ]
-                target[m["id"]] = _circular_mean(neigh) if neigh else angle[m["id"]]
+                cur = angle[m["id"]]
+                bary = _circular_mean(neigh) if neigh else cur
+                target[m["id"]] = cur + alpha * _ang_diff(bary, cur)  # damped step toward it
             _place_min_gap(members, cx, cy, rs[r - 1], target)
             for m in members:
                 a = math.atan2(m["y"] - cy, m["x"] - cx)
                 max_move = max(max_move, abs(_ang_diff(a, angle[m["id"]])))
                 angle[m["id"]] = a
-        if max_move < 1e-4:
+        alpha *= _OPT_COOLING
+        if max_move < 1e-4:  # frozen — further passes would not change anything
             break
 
     _nudge_overlaps([m for r in (1, 2, 3) for m in bucket[r]])

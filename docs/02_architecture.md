@@ -236,8 +236,10 @@ Requirements:
   N barycenter passes (`html_export._optimize_cluster`) that move each node toward the mean
   angle of its neighbours, placed via an L2 isotonic min-gap projection (`_place_min_gap`) so
   connected nodes cluster as close as an overlap-free gap allows (not merely reordered), then
-  nudge apart any residual overlaps — rings preserved, output still deterministic; `N=0`
-  (default) is the exact ENI-aligned layout.
+  nudge apart any residual overlaps. A geometric cooling schedule shrinks each pass's movement
+  so the iteration freezes to a stable layout (otherwise it limit-cycles on dense graphs and the
+  bytes would depend on the pass count). Rings preserved, output deterministic; `N=0` (default)
+  is the exact ENI-aligned layout.
 - **Anonymising existing output** (`cloudbreachgraph-anonymize`, `anonymize.py`): an auxiliary
   console entry point that rewrites a previously written `graph.json` into a scrubbed copy safe
   to share as a debugging/example graph. It **keeps every node and edge** but replaces all
