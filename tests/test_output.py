@@ -148,6 +148,22 @@ def test_write_html_is_self_contained(graph, tmp_path):
     assert "eni-00instance0000001" in text
 
 
+def test_write_html_has_recompute_button_and_cluster_separation(graph, tmp_path):
+    text = html_export.write_html(graph, tmp_path / "graph.html").read_text()
+    # A HUD button re-runs the layout on demand, wired to a recompute() handler.
+    assert 'id="recompute"' in text
+    assert "Recompute layout" in text
+    assert "function recompute()" in text
+    assert 'getElementById("recompute").addEventListener("click", recompute)' in text
+    # recompute releases manual pins and reheats the simulation.
+    assert "n.fixed = false" in text
+    # Connected components are computed and disconnected clusters repel harder, so
+    # segregated clusters sit away from each other.
+    assert "CROSS_COMPONENT" in text
+    assert "a.comp !== b.comp" in text
+    assert "componentCount" in text
+
+
 def test_write_html_embeds_public_exposure(graph, tmp_path):
     text = html_export.write_html(graph, tmp_path / "graph.html").read_text()
     # An ENI with a public IP is flagged so the page can highlight internet exposure.
