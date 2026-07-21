@@ -471,6 +471,27 @@ def test_ringed_optimize_reduces_edge_length():
     assert opt < base
 
 
+def test_ringed_optimize_places_lb_sharing_subnets_adjacent():
+    # The reported case: two subnets that share an instance/LB (subnet-1 & subnet-3 both host an
+    # ENI of i-1) start on opposite sides of the ring and must be pulled angularly close — not
+    # merely reordered into distant even slots.
+    import math
+
+    g = _crossing_graph()
+
+    def separation_deg(data):
+        pos = {n["id"]: n for n in data["nodes"]}
+        c = data["clusters"][0]
+        a1, a3 = (
+            math.atan2(pos[s]["y"] - c["cy"], pos[s]["x"] - c["cx"])
+            for s in ("subnet-1", "subnet-3")
+        )
+        return abs(math.degrees(math.atan2(math.sin(a1 - a3), math.cos(a1 - a3))))
+
+    assert separation_deg(html_export._ringed_view_data(g, 0)) > 150  # baseline: opposite sides
+    assert separation_deg(html_export._ringed_view_data(g, 20)) < 45  # optimized: adjacent
+
+
 def test_ringed_optimize_leaves_no_overlaps():
     import math
 
@@ -499,6 +520,82 @@ def test_ringed_optimize_converges_early():
     # Asking for many passes must not change the result once it has converged (no drift).
     g = _crossing_graph()
     assert html_export.build_ringed_html(g, 20) == html_export.build_ringed_html(g, 200)
+
+
+def test_ringed_optimize_freezes_on_tangled_graph():
+    # A densely cross-linked graph (instances spanning several subnets) makes the barycenter
+    # iteration limit-cycle rather than settle; the cooling schedule must freeze it so a large
+    # pass count is byte-stable. Without cooling build(120) != build(600) here.
+    def eni(name, subnet, instance):
+        return {
+            "NetworkInterfaceId": name,
+            "SubnetId": subnet,
+            "VpcId": "vpc-1",
+            "InterfaceType": "interface",
+            "Description": "",
+            "Attachment": {"InstanceId": instance},
+            "PrivateIpAddresses": [],
+            "Groups": [],
+        }
+
+    spans = {  # instance -> the subnets it spans (cross-links that tangle the rings)
+        "i-a": ["subnet-0", "subnet-3"],
+        "i-b": ["subnet-1", "subnet-4"],
+        "i-c": ["subnet-2", "subnet-5"],
+        "i-d": ["subnet-0", "subnet-2", "subnet-4"],
+    }
+    nis = [eni(f"eni-{inst}-{s}", s, inst) for inst, subs in spans.items() for s in subs]
+    g = build_graph({"meta": {}, "network_interfaces": nis})
+    assert html_export.build_ringed_html(g, 120) == html_export.build_ringed_html(g, 600)
+
+
+def _count_crossings(data):
+    pos = {n["id"]: (n["x"], n["y"]) for n in data["nodes"]}
+    e = [(pos[x["source"]], pos[x["target"]]) for x in data["edges"]]
+
+    def orient(a, b, c):
+        v = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+        return (v > 1e-9) - (v < -1e-9)
+
+    def crosses(p, q, r, s):
+        if p in (r, s) or q in (r, s):  # shared endpoint
+            return False
+        return orient(p, q, r) != orient(p, q, s) and orient(r, s, p) != orient(r, s, q)
+
+    return sum(1 for i in range(len(e)) for j in range(i + 1, len(e)) if crosses(*e[i], *e[j]))
+
+
+def test_ringed_crossing_reduction_beats_barycenter_only(monkeypatch):
+    # Load balancers whose ENIs are interleaved across subnets leave whole spokes crossing after
+    # the barycenter passes; the greedy relocation local search removes several of them.
+    def eni(name, subnet, instance):
+        return {
+            "NetworkInterfaceId": name,
+            "SubnetId": subnet,
+            "VpcId": "vpc-1",
+            "InterfaceType": "interface",
+            "Description": "",
+            "Attachment": {"InstanceId": instance},
+            "PrivateIpAddresses": [],
+            "Groups": [],
+        }
+
+    spans = {
+        "i-a": ["s0", "s4"],
+        "i-b": ["s1", "s5"],
+        "i-c": ["s2", "s6"],
+        "i-d": ["s3", "s7"],
+        "i-e": ["s0", "s2", "s4", "s6"],
+        "i-f": ["s1", "s3", "s5", "s7"],
+    }
+    nis = [eni(f"eni-{i}-{s}", s, i) for i, subs in spans.items() for s in subs]
+    g = build_graph({"meta": {}, "network_interfaces": nis})
+
+    monkeypatch.setattr(html_export, "_RELOC_MAX_NODES", 0)  # disable the local search
+    barycenter_only = _count_crossings(html_export._ringed_view_data(g, 80))
+    monkeypatch.undo()  # re-enable it
+    with_relocation = _count_crossings(html_export._ringed_view_data(g, 80))
+    assert with_relocation < barycenter_only
 
 
 def test_convert_ringed_optimize_passes(graph, tmp_path):

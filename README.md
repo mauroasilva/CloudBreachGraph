@@ -223,13 +223,23 @@ exactly like the default HTML mode.
 
 By default a subnet/EC2/LB sits at the *mean* angle of its ENIs, which can push a resource
 into an awkward spot when its ENIs span subnets on opposite sides of the ring (long, crossing
-edges). Add `--optimize-passes N` (ringed layout only) to run up to **N passes** that
-**reorder the nodes within each ring** to pull connected nodes together — subnets that share a
-load balancer migrate next to each other, so its edges stop crossing the circle — and then
-**nudge apart** any overlapping nodes. The rings are preserved (nodes keep their VPC/subnet/
-ENI/outer ring); only their angular order and tiny overlap offsets change. Passes stop early
-once the ordering converges, and `--optimize-passes 0` (the default) keeps the exact
-ENI-aligned placement. Output stays deterministic.
+edges). Add `--optimize-passes N` (ringed layout only) to run up to **N passes** that move each
+node toward the mean angle of its neighbours — placing it there **as close as an overlap-free
+minimum gap allows**, so two subnets that share a load balancer are pulled right next to each
+other (not just reordered into distant even slots) and its edges stop crossing the circle — and
+then **nudge apart** any residual overlaps. Finally a **greedy crossing-reduction local search**
+relocates each node to the same-ring slot with the fewest edge crossings — this clears whole
+spokes that the proximity passes leave crossing (typically a load balancer fanning edges to ENIs
+in several subnets). The rings are preserved (nodes keep their VPC/subnet/ENI/outer ring); only
+their angle within the ring changes. A **cooling schedule** shrinks the per-pass movement so the
+layout **freezes** to a stable state (a big `N` converges to the same result rather than
+drifting), and `--optimize-passes 0` (the default) keeps the exact ENI-aligned placement. Output
+stays deterministic.
+
+On a real 124-node/4-VPC capture, `--optimize-passes 100` cut edge crossings from **79 to 24**,
+shortened total edge length ~22%, and removed the overlapping nodes the plain ringed layout had.
+The residual crossings are structural — e.g. a multi-AZ network load balancer whose interfaces
+genuinely sit in three different subnets must fan its spokes across the ring.
 
 ```bash
 cloudbreachgraph-to-html out/graph.json --ringed --optimize-passes 20

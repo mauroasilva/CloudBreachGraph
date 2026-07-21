@@ -189,6 +189,18 @@ _CLUSTER_PAD = 130.0  # extra gap between adjacent clusters in the grid
 # the interfaces read as a distinct layer between their subnets and the compute/LBs they front.
 _RING_COUNT = 4  # ring 0 is the center; rings 1..3 are the concentric outer rings
 
+# Per-pass cooling factor for the --optimize-passes refinement (see _optimize_cluster): each
+# pass moves nodes only `alpha` of the way to their barycenter, and alpha *= this each pass, so
+# movement decays to zero and the layout freezes to a stable state regardless of the pass count.
+_OPT_COOLING = 0.9
+
+# After the barycenter passes, a greedy crossing-reduction local search (`_reduce_crossings`)
+# relocates each node to the same-ring slot with the fewest incident edge crossings. Bounded so
+# the O(ring² · edges) sweep stays cheap; skipped for clusters larger than the node cap (the
+# barycenter result stands there).
+_RELOC_SWEEPS = 8
+_RELOC_MAX_NODES = 260
+
 
 def _ring_of(node_type: str) -> int:
     """Ring index for a node type: VPC center (0), subnet (1), ENI (2), everything else (3)."""
@@ -280,21 +292,71 @@ def _place_aligned_to_enis(
         _place_at_angle(m, cx, cy, radius, -math.pi / 2 + (2 * math.pi * i / count if count else 0))
 
 
-def _place_even_anchored(members: list, cx: float, cy: float, radius: float, target: dict) -> None:
-    """Place ``members`` (already sorted by their target angle) evenly, rotated to fit targets.
+def _ang_diff(a: float, b: float) -> float:
+    """Signed smallest angular difference ``a - b`` in ``(-π, π]``."""
+    d = (a - b) % (2 * math.pi)
+    return d - 2 * math.pi if d > math.pi else d
 
-    Even spacing guarantees no two nodes on the ring collide; the whole ring is then rotated by
-    the single offset that best matches each node's ``target`` angle (the circular mean of the
-    per-node offset between an even slot and its target), so connected nodes stay as close to
-    their neighbours as an even, overlap-free ring allows.
+
+def _isotonic_l2(y: list[float]) -> list[float]:
+    """Least-squares non-decreasing fit of ``y`` (pool-adjacent-violators). Deterministic, O(n)."""
+    blocks: list[list[float]] = []  # each: [mean, count, total]
+    for yi in y:
+        blocks.append([yi, 1.0, yi])
+        while len(blocks) >= 2 and blocks[-2][0] > blocks[-1][0]:
+            _, c2, t2 = blocks.pop()
+            _, c1, t1 = blocks.pop()
+            total, count = t1 + t2, c1 + c2
+            blocks.append([total / count, count, total])
+    out: list[float] = []
+    for mean, count, _ in blocks:
+        out.extend([mean] * int(count))
+    return out
+
+
+def _place_min_gap(members: list, cx: float, cy: float, radius: float, target: dict) -> None:
+    """Place ``members`` near their ``target`` angle, spread just enough to not overlap.
+
+    Unlike even spacing, this lets connected nodes actually sit *close* together (only a
+    minimum angular gap apart, sized so their disks don't touch), so e.g. two subnets that share
+    a load balancer end up adjacent rather than parked at distant even slots. Implemented as an
+    L2 isotonic projection: sort by target, cut the circle at its widest gap (so the unavoidable
+    wrap-around slack lands where it's least binding), then find the ordered positions closest to
+    the targets subject to the min-gap — a min-gap-shifted isotonic regression. Reorders
+    ``members`` in place to match the placement.
     """
     n = len(members)
     if n == 0:
         return
-    slots = [2 * math.pi * i / n for i in range(n)]
-    phi = _circular_mean([target[m["id"]] - slots[i] for i, m in enumerate(members)])
-    for i, m in enumerate(members):
-        _place_at_angle(m, cx, cy, radius, slots[i] + phi)
+    members.sort(key=lambda m: (target[m["id"]], m["id"]))
+    if n == 1:
+        _place_at_angle(members[0], cx, cy, radius, target[members[0]["id"]])
+        return
+
+    ts = [target[m["id"]] for m in members]  # ascending in (-π, π]
+    max_r = max(_node_radius(m) for m in members)
+    gap = min((2 * max_r + 8.0) / radius, 2 * math.pi / n)  # never exceed even spacing
+
+    # Cut after the widest gap between consecutive (circular) targets.
+    gaps = [(ts[(i + 1) % n] - ts[i]) % (2 * math.pi) for i in range(n)]
+    cut = max(range(n), key=lambda i: gaps[i])
+    order = [(cut + 1 + k) % n for k in range(n)]
+
+    # Unwrap the targets into a monotonically increasing sequence in this order.
+    unwrapped: list[float] = []
+    for idx in order:
+        a = ts[idx]
+        while unwrapped and a < unwrapped[-1] - 1e-12:
+            a += 2 * math.pi
+        unwrapped.append(a)
+
+    # Positions minimizing Σ(p_i - t_i)² s.t. p_{i+1} - p_i ≥ gap: subtract i·gap, project to
+    # non-decreasing, add it back.
+    shifted = _isotonic_l2([a - i * gap for i, a in enumerate(unwrapped)])
+    reordered = [members[i] for i in order]
+    for k, m in enumerate(reordered):
+        _place_at_angle(m, cx, cy, radius, shifted[k] + k * gap)
+    members[:] = reordered
 
 
 def _node_radius(node: dict) -> float:
@@ -336,23 +398,97 @@ def _nudge_overlaps(nodes: list, iterations: int = 12, pad: float = 6.0) -> None
         m["x"], m["y"] = round(m["x"], 2), round(m["y"], 2)
 
 
-def _optimize_cluster(bucket: dict, cx: float, cy: float, rs: list, adj: dict, passes: int) -> None:
-    """Reorder nodes within each ring to pull connected nodes together, then nudge out overlaps.
+def _orient(a: tuple, b: tuple, c: tuple) -> int:
+    """Sign of the cross product (a→b)×(a→c): +1 ccw, −1 cw, 0 collinear."""
+    v = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+    return (v > 1e-9) - (v < -1e-9)
 
-    A barycenter (mean-of-neighbours) heuristic: on each ring, every node is aimed at the mean
-    angle of its neighbours on the *other* rings, the ring is re-sorted by that angle and placed
-    evenly (overlap-free), and the sweep repeats up to ``passes`` times — outward then back in
-    each pass so the ordering propagates across all four rings. This is what unclumps an LB whose
-    ENIs sit in far-apart subnets: the shared subnets migrate next to each other and the LB's
-    edges stop crossing the circle. The centre VPC (ring 0) has no angle and is skipped as a
-    neighbour. Converges early when a full pass changes no ring's order.
+
+def _reduce_crossings(node_by_id: dict, cedges: list, rings: dict, cx: float, cy: float, rs: list):
+    """Greedy local search: relocate each node to the same-ring slot with the fewest crossings.
+
+    Moving a single node only changes crossings on that node's own edges (all its edges share it
+    as an endpoint, so they never cross each other), so accepting a move that strictly lowers its
+    incident-crossing count never raises the global total — the search is a monotone crossing
+    minimiser. It complements the barycenter passes, which optimise proximity but get stuck in
+    local minima where whole spokes still cross (dominant on the outer ring, where a load
+    balancer fans edges to ENIs in several subnets). Candidate slots are the mid-angles of the
+    gaps between the other nodes on the ring; ``_nudge_overlaps`` afterwards fixes any tight
+    insertion. Deterministic (nodes visited in id order; only strict improvements accepted).
+    """
+
+    def pt(nid: str) -> tuple:
+        m = node_by_id[nid]
+        return (m["x"], m["y"])
+
+    incident: dict[str, list[int]] = {}
+    for k, (a, b) in enumerate(cedges):
+        incident.setdefault(a, []).append(k)
+        incident.setdefault(b, []).append(k)
+
+    def crosses(k: int, j: int) -> bool:
+        e, f = cedges[k], cedges[j]
+        if e[0] in f or e[1] in f:  # edges sharing a node don't count as a crossing
+            return False
+        p, q, r, s = pt(e[0]), pt(e[1]), pt(f[0]), pt(f[1])
+        return _orient(p, q, r) != _orient(p, q, s) and _orient(r, s, p) != _orient(r, s, q)
+
+    def incident_crossings(nid: str) -> int:
+        return sum(
+            1 for k in incident.get(nid, ()) for j in range(len(cedges)) if j != k and crosses(k, j)
+        )
+
+    for _ in range(_RELOC_SWEEPS):
+        moved = False
+        for r in (1, 2, 3):
+            ids = rings.get(r, [])
+            if len(ids) < 3:
+                continue
+            radius = rs[r - 1]
+            for nid in sorted(ids):
+                m = node_by_id[nid]
+                start_xy = (m["x"], m["y"])
+                best_xy, best = start_xy, incident_crossings(nid)
+                others = sorted(math.atan2(pt(x)[1] - cy, pt(x)[0] - cx) for x in ids if x != nid)
+                for i in range(len(others)):
+                    wrap = 2 * math.pi if i + 1 == len(others) else 0
+                    mid = (others[i] + others[(i + 1) % len(others)] + wrap) / 2
+                    m["x"] = round(cx + radius * math.cos(mid), 2)
+                    m["y"] = round(cy + radius * math.sin(mid), 2)
+                    c = incident_crossings(nid)
+                    if c < best:  # strict improvement only -> deterministic, monotone
+                        best, best_xy = c, (m["x"], m["y"])
+                m["x"], m["y"] = best_xy
+                if best_xy != start_xy:
+                    moved = True
+        if not moved:
+            break
+
+
+def _optimize_cluster(bucket: dict, cx: float, cy: float, rs: list, adj: dict, passes: int) -> None:
+    """Move nodes within each ring toward their neighbours to cut crossings, then de-overlap.
+
+    A barycenter (mean-of-neighbours) heuristic: on each ring every node is aimed at the mean
+    angle of its neighbours on the *other* rings and placed there — as close as a minimum,
+    overlap-free gap allows (:func:`_place_min_gap`), so connected nodes genuinely cluster rather
+    than snapping to distant even slots. The sweep repeats up to ``passes`` times, outward then
+    back inward each pass so positions propagate across all four rings. This is what pulls two
+    subnets that share a load balancer next to each other, so its edges stop crossing the circle.
+    The centre VPC (ring 0) has no angle and is skipped as a neighbour. Stops early once a full
+    pass moves every node less than a small epsilon (so extra passes never churn the layout).
     """
     ring_of = {m["id"]: r for r in range(_RING_COUNT) for m in bucket[r]}
     angle = {m["id"]: math.atan2(m["y"] - cy, m["x"] - cx) for r in (1, 2, 3) for m in bucket[r]}
 
+    # Cooling: each node is moved only a fraction `alpha` of the way to its barycenter, and
+    # `alpha` decays every pass. Without it the barycenter iteration on a real graph never
+    # settles — it drifts around a limit cycle of equal-crossing layouts, so the coordinates
+    # (and the emitted bytes) would depend on the exact pass count. Geometric cooling forces the
+    # movement to zero, so the layout *freezes* and any large pass count yields the same result.
+    alpha = 1.0
     for _ in range(passes):
-        changed = False
-        for r in (1, 2, 3, 2):  # outward then back inward, so orderings propagate both ways
+        max_move = 0.0
+        for r in (1, 2, 3, 2):  # outward then back inward, so positions propagate both ways
             members = bucket[r]
             if not members:
                 continue
@@ -363,16 +499,34 @@ def _optimize_cluster(bucket: dict, cx: float, cy: float, rs: list, adj: dict, p
                     for nid in adj.get(m["id"], ())
                     if ring_of.get(nid, 0) != 0 and nid in angle
                 ]
-                target[m["id"]] = _circular_mean(neigh) if neigh else angle[m["id"]]
-            before = [m["id"] for m in members]
-            members.sort(key=lambda m: (target[m["id"]], m["id"]))
-            if [m["id"] for m in members] != before:
-                changed = True
-            _place_even_anchored(members, cx, cy, rs[r - 1], target)
+                cur = angle[m["id"]]
+                bary = _circular_mean(neigh) if neigh else cur
+                target[m["id"]] = cur + alpha * _ang_diff(bary, cur)  # damped step toward it
+            _place_min_gap(members, cx, cy, rs[r - 1], target)
             for m in members:
-                angle[m["id"]] = math.atan2(m["y"] - cy, m["x"] - cx)
-        if not changed:
+                a = math.atan2(m["y"] - cy, m["x"] - cx)
+                max_move = max(max_move, abs(_ang_diff(a, angle[m["id"]])))
+                angle[m["id"]] = a
+        alpha *= _OPT_COOLING
+        if max_move < 1e-4:  # frozen — further passes would not change anything
             break
+
+    # Greedy crossing-reduction on the settled layout: relocate nodes to lower-crossing slots.
+    # The barycenter passes optimise proximity but leave whole spokes crossing (mostly on the
+    # outer ring); this directly removes those. Bounded to modest clusters so it stays cheap.
+    node_by_id = {m["id"]: m for r in range(_RING_COUNT) for m in bucket[r]}
+    if 0 < len(node_by_id) <= _RELOC_MAX_NODES:
+        ids_set = set(node_by_id)
+        cedges = sorted(
+            {
+                tuple(sorted((nid, nb)))
+                for nid in ids_set
+                for nb in adj.get(nid, ())
+                if nb in ids_set
+            }
+        )
+        rings = {r: [m["id"] for m in bucket[r]] for r in (1, 2, 3)}
+        _reduce_crossings(node_by_id, cedges, rings, cx, cy, rs)
 
     _nudge_overlaps([m for r in (1, 2, 3) for m in bucket[r]])
 

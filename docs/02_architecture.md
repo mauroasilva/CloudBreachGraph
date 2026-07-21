@@ -233,9 +233,16 @@ Requirements:
   interfaces; orphan resources collect into a final ring-cluster (empty center). Ring positions are
   computed deterministically in Python (no in-browser force sim), and the same `MAX_NODES`/
   `MAX_HTML_BYTES` guard and `.dot` fallback apply. The `--optimize-passes N` flag runs up to
-  N barycenter passes (`html_export._optimize_cluster`) that reorder nodes *within* their rings
-  to pull connected nodes together (fewer crossing edges) and then nudge apart any overlaps —
-  rings preserved, output still deterministic; `N=0` (default) is the exact ENI-aligned layout.
+  N barycenter passes (`html_export._optimize_cluster`) that move each node toward the mean
+  angle of its neighbours, placed via an L2 isotonic min-gap projection (`_place_min_gap`) so
+  connected nodes cluster as close as an overlap-free gap allows (not merely reordered), then
+  nudge apart any residual overlaps. A geometric cooling schedule shrinks each pass's movement
+  so the iteration freezes to a stable layout (otherwise it limit-cycles on dense graphs and the
+  bytes would depend on the pass count). A final greedy crossing-reduction local search
+  (`_reduce_crossings`) relocates each node to the same-ring slot with the fewest incident edge
+  crossings — a monotone minimiser (moving one node only changes crossings on its own edges), it
+  clears whole spokes the barycenter passes leave crossing. Rings preserved, output
+  deterministic; `N=0` (default) is the exact ENI-aligned layout.
 - **Anonymising existing output** (`cloudbreachgraph-anonymize`, `anonymize.py`): an auxiliary
   console entry point that rewrites a previously written `graph.json` into a scrubbed copy safe
   to share as a debugging/example graph. It **keeps every node and edge** but replaces all

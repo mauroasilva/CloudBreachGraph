@@ -67,6 +67,73 @@
 - Barycenter is a heuristic (global crossing minimisation is NP-hard); it cuts crossings
   sharply but doesn't guarantee the optimum.
 
+## 6b. Follow-up — min-gap placement (real improvement after user feedback)
+- The first cut placed each ring **evenly** after reordering and converged on **order** change.
+  That barely improved real layouts: on a ring with few nodes, "adjacent" is still a huge
+  angular gap, so two subnets sharing an LB became neighbours but stayed ~180° apart; and
+  order-based convergence meant 2000 passes ≈ 5 passes.
+- Replaced even placement with **`_place_min_gap`**: place each node at (near) its true
+  barycenter angle subject only to a minimum angular gap (sized so disks don't touch). Done as
+  an **L2 isotonic (pool-adjacent-violators) projection**: sort by target, cut the circle at
+  its widest gap, unwrap to a monotonic sequence, subtract `i·gap`, project to non-decreasing
+  (`_isotonic_l2`), add `i·gap` back. This lets connected nodes actually sit close.
+  - New helpers: `_isotonic_l2`, `_place_min_gap`, `_ang_diff`. Removed `_place_even_anchored`.
+  - Convergence is now **position-based** (max angular move < 1e-4 per pass), so a large `N`
+    still stops once stable but the optimiser can keep improving while it's actually moving.
+  - Result on the crafted 4-subnet/2-instance case: two subnets sharing an instance go from
+    **180° → ~11.5°** apart; total edge length **3363 → 1806** (was 2475 with even placement);
+    min node gap 30px (no overlaps); deterministic; `build(20) == build(2000)`.
+  - **Gotcha:** the widest-gap cut guarantees the wrap slack ≥ min-gap because the largest
+    circular gap ≥ average gap `2π/n` ≥ the chosen `gap` (which is capped at `2π/n`). The
+    `_nudge_overlaps` pass remains as a safety net for any residual overlap.
+- New test `test_ringed_optimize_places_lb_sharing_subnets_adjacent` locks the ~180°→<45°
+  behaviour in.
+
+## 6c. Follow-up — cooling schedule (fixes non-convergence on real graphs)
+- Testing on a real 124-node/4-VPC capture exposed that the position-based convergence check
+  **never triggered**: the barycenter+min-gap iteration doesn't settle on a dense graph — it
+  wanders a **limit cycle** of equal-crossing layouts (pairwise distances shifted up to ~140px
+  between pass 150 and 300), so the coordinates — and the emitted bytes — depended on the exact
+  pass count. `build(150) != build(300)`. The earlier "stable for large N" claim held only for
+  simple graphs that happen to reach a true fixed point.
+- Fix: a **geometric cooling schedule** in `_optimize_cluster`. Each pass moves a node only
+  `alpha` of the way to its barycenter (`cur + alpha·angdiff(bary, cur)` fed into
+  `_place_min_gap`), and `alpha *= _OPT_COOLING` (0.9) per pass. Movement decays to zero, the
+  `max_move < 1e-4` break fires (~pass 90 for the real graph), and the layout **freezes** — so
+  `build(100) == build(300) == build(2000)`, independent of N. `_OPT_COOLING` is a module const.
+- Real-graph result (`--optimize-passes 100`): crossings **79 → 28**, total edge length
+  **32185 → 23729 (−26%)**, min node gap **0 → 26px** (the baseline ringed layout actually had
+  *overlapping* nodes — cooling+min-gap fixes that too). Crossings reach 28 by ~pass 10.
+- Cost: the frozen state has 1 more crossing than the un-cooled limit-cycle minimum (28 vs 27)
+  — a negligible price for byte-stable, converging output.
+- New regression test `test_ringed_optimize_freezes_on_tangled_graph` builds a densely
+  cross-linked graph (instances spanning several subnets) and asserts `build(120) == build(600)`
+  — this fails without cooling.
+
+## 6d. Follow-up — greedy crossing-reduction local search
+- Even after cooling+min-gap, the real capture kept 28 crossings, and a breakdown showed **25 of
+  28 were `attached_to`×`attached_to`** — outer-ring nodes (LB/EC2) whose spokes to their ENIs
+  cross each other. Barycenter optimises proximity, not crossings, so it leaves these.
+- Added **`_reduce_crossings`** (runs after the cooling loop, per cluster): a greedy local search
+  that relocates each ring node to the gap-midpoint slot with the fewest **incident** edge
+  crossings. Key property — moving one node only changes crossings on *its own* edges (they all
+  share it as an endpoint, so never cross each other), so `Δtotal == Δincident`: accepting strict
+  incident improvements is a **monotone total-crossing minimiser**. Deterministic (nodes visited
+  in id order, first strict-best wins). `_orient` helper added; `_nudge_overlaps` still runs after
+  to clean any tight insertion (min gap stayed 26px in practice).
+- Bounded by `_RELOC_SWEEPS` (8, early-exits ~2) and gated by `_RELOC_MAX_NODES` (260 per
+  cluster) so the O(ring²·edges) sweep can't blow up on a huge cluster — beyond that the
+  barycenter result stands.
+- Real-graph result: crossings **28 → 24** (79 → 24 vs the plain ringed layout, −70%). **30
+  random-restart + greedy runs could not beat 24**, so 24 is at/near the floor for this rigid
+  concentric-ring topology; the residual are structural (multi-AZ NLBs with ENIs in 3 subnets).
+- Test `test_ringed_crossing_reduction_beats_barycenter_only` monkeypatches `_RELOC_MAX_NODES=0`
+  to get the barycenter-only baseline on an interleaved-LB graph (13 crossings) and asserts the
+  full pipeline does strictly better (8). `_count_crossings` helper added to the tests.
+- **Follow-up idea (not done):** to go below the structural floor you must relax the rigid rings
+  — e.g. give outer LB nodes small radial freedom, collapse a multi-AZ LB's per-AZ ENIs into one
+  node, or fall back to the force layout for the outer ring.
+
 ## 7. Git note (this session)
 - PR #13 was merged into `main`. This work is on branch
   `claude/cloudbreachgraph-no-ring-circles` (which also carried the "stop drawing ring circles"
@@ -75,7 +142,7 @@
 ## 8. How to verify
 ```bash
 pip install -e '.[dev]'
-pytest                       # 132 tests, all offline
+pytest                       # 135 tests, all offline
 ruff check . && ruff format --check .
 cloudbreachgraph --from-cache tests/fixtures --output-dir /tmp/cbg-out
 cloudbreachgraph-to-html /tmp/cbg-out/graph.json --ringed --optimize-passes 20 -o /tmp/opt.html
