@@ -416,3 +416,110 @@ def test_convert_ringed_falls_back_to_dot_when_too_large(graph, tmp_path, monkey
     assert not out.exists()  # HTML skipped
     assert (tmp_path / "big.dot").is_file()  # fallback .dot written
     assert "too large" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- #
+# Ringed layout — crossing-reduction / overlap-nudge optimizer (--optimize-passes)
+# --------------------------------------------------------------------------- #
+def _crossing_graph():
+    # 4 subnets, each with one ENI; instance i-1 spans subnets 1 & 3, i-2 spans 2 & 4. In the
+    # id-ordered baseline the connected subnets land on opposite sides, so their edges cross the
+    # circle — exactly the case the optimizer should untangle.
+    def eni(name, subnet, instance):
+        return {
+            "NetworkInterfaceId": name,
+            "SubnetId": subnet,
+            "VpcId": "vpc-1",
+            "InterfaceType": "interface",
+            "Description": "",
+            "Attachment": {"InstanceId": instance},
+            "PrivateIpAddresses": [],
+            "Groups": [],
+        }
+
+    return build_graph(
+        {
+            "meta": {},
+            "network_interfaces": [
+                eni("eni-1", "subnet-1", "i-1"),
+                eni("eni-2", "subnet-2", "i-2"),
+                eni("eni-3", "subnet-3", "i-1"),
+                eni("eni-4", "subnet-4", "i-2"),
+            ],
+        }
+    )
+
+
+def _total_edge_length(data):
+    import math
+
+    pos = {n["id"]: n for n in data["nodes"]}
+    return sum(
+        math.hypot(
+            pos[e["source"]]["x"] - pos[e["target"]]["x"],
+            pos[e["source"]]["y"] - pos[e["target"]]["y"],
+        )
+        for e in data["edges"]
+    )
+
+
+def test_ringed_optimize_reduces_edge_length():
+    # Fewer/shorter crossing edges: pulling connected nodes together shrinks total edge length.
+    g = _crossing_graph()
+    base = _total_edge_length(html_export._ringed_view_data(g, 0))
+    opt = _total_edge_length(html_export._ringed_view_data(g, 20))
+    assert opt < base
+
+
+def test_ringed_optimize_leaves_no_overlaps():
+    import math
+
+    g = _crossing_graph()
+    data = html_export._ringed_view_data(g, 20)
+    ns = data["nodes"]
+    for i in range(len(ns)):
+        for j in range(i + 1, len(ns)):
+            dist = math.hypot(ns[i]["x"] - ns[j]["x"], ns[i]["y"] - ns[j]["y"])
+            # Disks must not overlap (their drawn radii must fit).
+            assert dist >= html_export._node_radius(ns[i]) + html_export._node_radius(ns[j])
+
+
+def test_ringed_optimize_is_deterministic():
+    g = _crossing_graph()
+    assert html_export.build_ringed_html(g, 20) == html_export.build_ringed_html(g, 20)
+
+
+def test_ringed_passes_zero_is_unchanged(graph):
+    # The default (0 passes) must be byte-identical to the pre-optimizer placement.
+    assert html_export.build_ringed_html(graph, 0) == html_export.build_ringed_html(graph)
+    assert html_export._ringed_view_data(graph, 0) == html_export._ringed_view_data(graph)
+
+
+def test_ringed_optimize_converges_early():
+    # Asking for many passes must not change the result once it has converged (no drift).
+    g = _crossing_graph()
+    assert html_export.build_ringed_html(g, 20) == html_export.build_ringed_html(g, 200)
+
+
+def test_convert_ringed_optimize_passes(graph, tmp_path):
+    jp = json_export.write_json(graph, tmp_path / "graph.json")
+    out = tmp_path / "opt.html"
+    rc = convert.main([str(jp), "--ringed", "--optimize-passes", "10", "-o", str(out)])
+    assert rc == 0
+    assert out.read_text() == html_export.build_ringed_html(graph, 10)
+
+
+def test_convert_optimize_passes_negative_errors(graph, tmp_path):
+    jp = json_export.write_json(graph, tmp_path / "graph.json")
+    rc = convert.main([str(jp), "--ringed", "--optimize-passes", "-1"])
+    assert rc == 2
+
+
+def test_convert_optimize_passes_ignored_without_ringed(graph, tmp_path, capsys):
+    jp = json_export.write_json(graph, tmp_path / "graph.json")
+    out = tmp_path / "force.html"
+    rc = convert.main([str(jp), "--optimize-passes", "5", "-o", str(out)])
+    assert rc == 0
+    # Force-directed page still written, and it ignores the flag (produces the plain force HTML).
+    assert out.read_text() == html_export.build_html(graph)
+    assert "only affects --ringed" in capsys.readouterr().err

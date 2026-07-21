@@ -63,6 +63,16 @@ _TYPE_COLORS: dict[str, str] = {
 }
 _DEFAULT_COLOR = "#CFD8DC"
 
+# Drawn node radius per type — kept in step with the page's ``radiusFor`` so the Python-side
+# overlap check uses the same disk sizes the browser draws.
+_NODE_RADII: dict[str, float] = {
+    "vpc": 16.0,
+    "load_balancer": 13.0,
+    "ec2_instance": 11.0,
+    "subnet": 11.0,
+}
+_DEFAULT_NODE_RADIUS = 9.0
+
 
 def _view_data(graph: Graph) -> dict:
     """The minimal, already-sorted node/edge payload the page's JS needs to lay out.
@@ -270,6 +280,112 @@ def _place_aligned_to_enis(
         _place_at_angle(m, cx, cy, radius, -math.pi / 2 + (2 * math.pi * i / count if count else 0))
 
 
+def _place_even_anchored(members: list, cx: float, cy: float, radius: float, target: dict) -> None:
+    """Place ``members`` (already sorted by their target angle) evenly, rotated to fit targets.
+
+    Even spacing guarantees no two nodes on the ring collide; the whole ring is then rotated by
+    the single offset that best matches each node's ``target`` angle (the circular mean of the
+    per-node offset between an even slot and its target), so connected nodes stay as close to
+    their neighbours as an even, overlap-free ring allows.
+    """
+    n = len(members)
+    if n == 0:
+        return
+    slots = [2 * math.pi * i / n for i in range(n)]
+    phi = _circular_mean([target[m["id"]] - slots[i] for i, m in enumerate(members)])
+    for i, m in enumerate(members):
+        _place_at_angle(m, cx, cy, radius, slots[i] + phi)
+
+
+def _node_radius(node: dict) -> float:
+    return _NODE_RADII.get(node["type"], _DEFAULT_NODE_RADIUS)
+
+
+def _nudge_overlaps(nodes: list, iterations: int = 12, pad: float = 6.0) -> None:
+    """Separate any overlapping node disks with small symmetric push-apart steps.
+
+    Even placement already prevents intra-ring overlap and the ring gap prevents cross-ring
+    overlap, so on real topologies this early-exits after one clean scan; it's a safety net for
+    pathological small-radius clusters. Deterministic: coincident nodes are split along a fixed
+    axis. Kept O(n²) per iteration but bounded and early-exiting.
+    """
+    for _ in range(iterations):
+        moved = False
+        for i in range(len(nodes)):
+            a = nodes[i]
+            for j in range(i + 1, len(nodes)):
+                b = nodes[j]
+                dx, dy = a["x"] - b["x"], a["y"] - b["y"]
+                dist = math.hypot(dx, dy)
+                mind = _node_radius(a) + _node_radius(b) + pad
+                if dist >= mind:
+                    continue
+                if dist < 1e-9:  # exactly coincident: split along x, deterministically
+                    a["x"] += mind / 2
+                    b["x"] -= mind / 2
+                else:
+                    push = (mind - dist) / 2
+                    a["x"] += dx / dist * push
+                    a["y"] += dy / dist * push
+                    b["x"] -= dx / dist * push
+                    b["y"] -= dy / dist * push
+                moved = True
+        if not moved:
+            break
+    for m in nodes:
+        m["x"], m["y"] = round(m["x"], 2), round(m["y"], 2)
+
+
+def _optimize_cluster(bucket: dict, cx: float, cy: float, rs: list, adj: dict, passes: int) -> None:
+    """Reorder nodes within each ring to pull connected nodes together, then nudge out overlaps.
+
+    A barycenter (mean-of-neighbours) heuristic: on each ring, every node is aimed at the mean
+    angle of its neighbours on the *other* rings, the ring is re-sorted by that angle and placed
+    evenly (overlap-free), and the sweep repeats up to ``passes`` times — outward then back in
+    each pass so the ordering propagates across all four rings. This is what unclumps an LB whose
+    ENIs sit in far-apart subnets: the shared subnets migrate next to each other and the LB's
+    edges stop crossing the circle. The centre VPC (ring 0) has no angle and is skipped as a
+    neighbour. Converges early when a full pass changes no ring's order.
+    """
+    ring_of = {m["id"]: r for r in range(_RING_COUNT) for m in bucket[r]}
+    angle = {m["id"]: math.atan2(m["y"] - cy, m["x"] - cx) for r in (1, 2, 3) for m in bucket[r]}
+
+    for _ in range(passes):
+        changed = False
+        for r in (1, 2, 3, 2):  # outward then back inward, so orderings propagate both ways
+            members = bucket[r]
+            if not members:
+                continue
+            target = {}
+            for m in members:
+                neigh = [
+                    angle[nid]
+                    for nid in adj.get(m["id"], ())
+                    if ring_of.get(nid, 0) != 0 and nid in angle
+                ]
+                target[m["id"]] = _circular_mean(neigh) if neigh else angle[m["id"]]
+            before = [m["id"] for m in members]
+            members.sort(key=lambda m: (target[m["id"]], m["id"]))
+            if [m["id"] for m in members] != before:
+                changed = True
+            _place_even_anchored(members, cx, cy, rs[r - 1], target)
+            for m in members:
+                angle[m["id"]] = math.atan2(m["y"] - cy, m["x"] - cx)
+        if not changed:
+            break
+
+    _nudge_overlaps([m for r in (1, 2, 3) for m in bucket[r]])
+
+
+def _adjacency(graph: Graph) -> dict[str, list[str]]:
+    """Undirected node adjacency from the graph's edges (deterministic order)."""
+    adj: dict[str, list[str]] = {}
+    for e in graph.edges:
+        adj.setdefault(e.source, []).append(e.target)
+        adj.setdefault(e.target, []).append(e.source)
+    return adj
+
+
 def _vpc_group_of(graph: Graph) -> dict[str, str]:
     """Map each node id to the id of the VPC it belongs to (or ``_UNASSIGNED``).
 
@@ -302,13 +418,18 @@ def _vpc_group_of(graph: Graph) -> dict[str, str]:
     return group
 
 
-def _ringed_view_data(graph: Graph) -> dict:
+def _ringed_view_data(graph: Graph, passes: int = 0) -> dict:
     """Build the ringed page payload: nodes with fixed x/y, edges, and per-cluster metadata.
 
     Reuses :func:`_view_data`'s per-node fields (colors, exposure flag, detail line) and adds
     computed ``x``/``y``. ``clusters`` carries each VPC cluster's center, ring radii and label
     — used to place the cluster label and fit the view; the rings themselves are conveyed by
     node position alone (no guide circles are drawn).
+
+    With ``passes > 0`` each cluster is post-processed by :func:`_optimize_cluster`: up to that
+    many barycenter passes reorder nodes within their rings to pull connected nodes together
+    (fewer crossing edges) and separate any overlaps. ``passes == 0`` (the default) leaves the
+    deterministic ENI-aligned placement byte-for-byte unchanged.
     """
     base = _view_data(graph)
     by_id = {n["id"]: n for n in base["nodes"]}
@@ -350,6 +471,7 @@ def _ringed_view_data(graph: Graph) -> dict:
     cluster_r = {g: max([*radii[g], 60.0]) + _CLUSTER_MARGIN for g in order}
     cell = 2 * (max(cluster_r.values(), default=0.0)) + _CLUSTER_PAD
     cols = max(1, math.ceil(math.sqrt(len(order))))
+    adj = _adjacency(graph) if passes > 0 else {}
 
     clusters = []
     for i, g in enumerate(order):
@@ -366,6 +488,9 @@ def _ringed_view_data(graph: Graph) -> dict:
         _place_aligned_to_enis(groups[g][1], cx, cy, rs[0], eni_angle, enis_of_subnet)
         # ring 3: EC2/LBs aligned to the mean angle of the ENIs attached to each.
         _place_aligned_to_enis(groups[g][3], cx, cy, rs[2], eni_angle, enis_of_lb)
+        # Optional: reorder within rings to cut edge crossings and nudge apart overlaps.
+        if passes > 0:
+            _optimize_cluster(groups[g], cx, cy, rs, adj, passes)
         clusters.append(
             {
                 "cx": round(cx, 2),
@@ -379,9 +504,13 @@ def _ringed_view_data(graph: Graph) -> dict:
     return base
 
 
-def build_ringed_html(graph: Graph) -> str:
-    """Return the complete, self-contained ringed HTML document for ``graph`` as a string."""
-    data_json = json.dumps(_ringed_view_data(graph), ensure_ascii=False, default=str)
+def build_ringed_html(graph: Graph, passes: int = 0) -> str:
+    """Return the complete, self-contained ringed HTML document for ``graph`` as a string.
+
+    ``passes`` (default 0) is the max number of crossing-reduction passes; see
+    :func:`_ringed_view_data`.
+    """
+    data_json = json.dumps(_ringed_view_data(graph, passes), ensure_ascii=False, default=str)
     return (
         _RINGED_TEMPLATE.replace("__GRAPH_DATA__", data_json)
         .replace("__NODE_COUNT__", str(len(graph.nodes)))
@@ -395,6 +524,7 @@ def write_ringed_html(
     *,
     max_nodes: int | None = None,
     max_bytes: int | None = None,
+    passes: int = 0,
 ) -> Path | None:
     """Write ``graph`` to ``path`` as the self-contained **ringed** HTML page.
 
@@ -402,6 +532,8 @@ def write_ringed_html(
     of a force layout): returns the :class:`~pathlib.Path` written, or ``None`` when the graph
     is too large (more than ``max_nodes`` nodes, or a rendered page over ``max_bytes`` bytes),
     in which case **no file is written** so the caller can fall back to the ``.dot`` output.
+    ``passes`` (default 0) is the max number of crossing-reduction passes; see
+    :func:`_ringed_view_data`.
     """
     node_cap = MAX_NODES if max_nodes is None else max_nodes
     byte_cap = MAX_HTML_BYTES if max_bytes is None else max_bytes
@@ -409,7 +541,7 @@ def write_ringed_html(
     if len(graph.nodes) > node_cap:
         return None
 
-    html = build_ringed_html(graph)
+    html = build_ringed_html(graph, passes)
     if len(html.encode("utf-8")) > byte_cap:
         return None
 

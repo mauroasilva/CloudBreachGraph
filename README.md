@@ -219,6 +219,22 @@ same **Zoom In / Zoom Out** buttons and **lock scroll-zoom** toggle as the defau
 the **same size guard** — if the graph is too large it warns and writes the `.dot` fallback,
 exactly like the default HTML mode.
 
+#### Reducing crossings (`--optimize-passes N`)
+
+By default a subnet/EC2/LB sits at the *mean* angle of its ENIs, which can push a resource
+into an awkward spot when its ENIs span subnets on opposite sides of the ring (long, crossing
+edges). Add `--optimize-passes N` (ringed layout only) to run up to **N passes** that
+**reorder the nodes within each ring** to pull connected nodes together — subnets that share a
+load balancer migrate next to each other, so its edges stop crossing the circle — and then
+**nudge apart** any overlapping nodes. The rings are preserved (nodes keep their VPC/subnet/
+ENI/outer ring); only their angular order and tiny overlap offsets change. Passes stop early
+once the ordering converges, and `--optimize-passes 0` (the default) keeps the exact
+ENI-aligned placement. Output stays deterministic.
+
+```bash
+cloudbreachgraph-to-html out/graph.json --ringed --optimize-passes 20
+```
+
 ## Future roles (flow logs, etc.)
 
 v1 maps the **`network`** role. VPC Flow Logs (`flow_logs`) — often published to a separate
