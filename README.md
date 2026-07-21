@@ -235,6 +235,39 @@ ENI-aligned placement. Output stays deterministic.
 cloudbreachgraph-to-html out/graph.json --ringed --optimize-passes 20
 ```
 
+## Anonymising a graph for sharing
+
+Need to share a `graph.json` for a bug report or as an example, without leaking real account
+ids, IPs, DNS names or resource ids? The auxiliary `cloudbreachgraph-anonymize` tool rewrites
+a graph into a **scrubbed copy that keeps every node and relationship** but replaces all
+identifying values with random, format-preserving stand-ins — **no AWS calls, purely local**:
+
+```bash
+cloudbreachgraph-anonymize out/graph.json                    # writes out/anonymised_graph.json
+cloudbreachgraph-anonymize out/graph.json -o example.json    # explicit output path
+cloudbreachgraph-anonymize out/graph.json --seed 42          # reproducible randomisation
+```
+
+What it randomises: resource ids (`vpc-…`, `subnet-…`, `eni-…`, `i-…`, `sg-…`, `nat-…`, …),
+ARNs, private/public IPv4 addresses and CIDRs, DNS names, 12-digit account ids, regions and
+AZs, opaque hash tokens, and human names/labels (subnet/VPC/instance/load-balancer names).
+
+The one guarantee is **referential consistency**: a value maps to exactly one replacement
+*everywhere it appears*, including where it's embedded inside another string. If `10.1.2.3`
+becomes `10.44.9.7` then every reference changes; if the ALB name `my-alb` becomes
+`brisk-otter-7` then its ARN node id, the edge that targets it, its DNS name, and the fronting
+ENI's `Description` token (`ELB app/my-alb/…`) all change together. Format is preserved so the
+result still looks real (a private IP stays private, a `/24` stays a `/24`, an id keeps its
+prefix and suffix length). Structural vocabulary — node `type`, edge `relationship`, attribute
+keys, the `match_rule` set — is left untouched, and the mapping is injective so two distinct
+nodes never collapse into one. With `--seed` the output is byte-for-byte reproducible;
+without it a fresh random mapping is used each run. The output is the same deterministic,
+sorted `graph.json` shape, so you can feed it straight back into `cloudbreachgraph-to-html`.
+
+**Caveat:** replacement is literal-substring based, so a human name that is also a common
+substring of structural text (e.g. a VPC literally named `network`) could over-match; give
+resources ordinary names if you plan to anonymise.
+
 ## Future roles (flow logs, etc.)
 
 v1 maps the **`network`** role. VPC Flow Logs (`flow_logs`) — often published to a separate

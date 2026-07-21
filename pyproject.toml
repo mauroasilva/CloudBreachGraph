@@ -30,6 +30,8 @@ graphviz = ["graphviz>=0.20"]
 cloudbreachgraph = "cloudbreachgraph.cli:main"
 # Auxiliary tool: convert an existing graph.json/graph.dot into the interactive HTML view.
 cloudbreachgraph-to-html = "cloudbreachgraph.convert:main"
+# Auxiliary tool: anonymise an existing graph.json into a shareable example graph.
+cloudbreachgraph-anonymize = "cloudbreachgraph.anonymize:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
