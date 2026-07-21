@@ -4,8 +4,13 @@
 no third-party runtime dependency — ``docs/04_conventions.md``): the graph is inlined as
 JSON and drawn on an HTML5 canvas by a small vanilla-JavaScript force simulation that
 **self-distributes the nodes** (repulsion between every pair + springs along edges +
-collision separation) so they settle without sitting on top of one another. The page
-supports drag, wheel-zoom, and background pan.
+collision separation) so they settle without sitting on top of one another. To also keep
+the picture readable, the layout actively **reduces edge crossings**: repulsion is scaled
+by node degree so hubs fan their spokes out, an angular-resolution force spreads a hub's
+edges toward even spacing, and the sim is warmed up before the first paint so it opens at a
+low-energy, less-tangled state (globally minimizing crossings is NP-hard, so these are
+heuristics — they cut crossings sharply on typical topologies but can't guarantee zero).
+The page supports drag, wheel-zoom, and background pan.
 
 This is an **opt-in** output (the CLI ``--html`` flag) — it is never produced by default;
 ``graph.json`` and ``graph.dot`` remain the defaults.
@@ -230,12 +235,24 @@ const edges = GRAPH.edges
   .filter((e) => e.s && e.t);
 
 // --- force simulation ------------------------------------------------------
-const REPULSION = 5200;      // Coulomb-like node-node repulsion
-const SPRING = 0.02;         // edge spring stiffness
-const SPRING_LEN = 90;       // preferred edge length
+const REPULSION = 4200;      // base Coulomb-like node-node repulsion
+const SPRING = 0.03;         // edge spring stiffness
 const GRAVITY = 0.012;       // pull toward the layout center (keeps it on screen)
 const DAMPING = 0.86;        // velocity damping per tick
+const ANGULAR = 22;          // hub spoke-spreading strength (angular resolution)
 let alpha = 1.0;             // cooling factor (1 -> 0)
+
+// Degree-weighted charge + adjacency: high-degree hubs repel harder, so their neighbors
+// fan out evenly instead of bunching on one side — this unfolds star clusters (a subnet
+// with many ENIs) and is the single biggest lever for reducing edge crossings here. The
+// per-node neighbor list is built once so the angular pass below stays O(edges)/tick.
+for (const n of nodes) { n.deg = 0; n.adj = []; }
+for (const e of edges) { e.s.deg++; e.t.deg++; e.s.adj.push(e.t); e.t.adj.push(e.s); }
+for (const n of nodes) n.charge = REPULSION * (1 + 0.7 * Math.sqrt(n.deg));
+
+// Give each edge a rest length that grows with its endpoints' degree, so hub spokes get
+// the room they need to spread rather than being pulled back into a tangle.
+for (const e of edges) e.len = 70 + 9 * Math.sqrt(Math.max(e.s.deg, e.t.deg));
 
 function step() {
   if (alpha > 0.005) alpha *= 0.992;
@@ -248,7 +265,7 @@ function step() {
       let d2 = dx * dx + dy * dy;
       if (d2 < 0.01) { dx = (rand() - 0.5); dy = (rand() - 0.5); d2 = dx * dx + dy * dy; }
       const dist = Math.sqrt(d2);
-      const f = (REPULSION / d2) * alpha;
+      const f = (Math.sqrt(a.charge * b.charge) / d2) * alpha;
       const fx = (dx / dist) * f, fy = (dy / dist) * f;
       a.vx += fx; a.vy += fy; b.vx -= fx; b.vy -= fy;
       // Hard collision: never let two node disks overlap.
@@ -260,13 +277,36 @@ function step() {
       }
     }
   }
-  // Springs along edges.
+  // Springs along edges (per-edge rest length).
   for (const e of edges) {
     let dx = e.t.x - e.s.x, dy = e.t.y - e.s.y;
     const dist = Math.sqrt(dx * dx + dy * dy) || 0.01;
-    const f = SPRING * (dist - SPRING_LEN) * alpha;
+    const f = SPRING * (dist - e.len) * alpha;
     const fx = (dx / dist) * f, fy = (dy / dist) * f;
     e.s.vx += fx; e.s.vy += fy; e.t.vx -= fx; e.t.vy -= fy;
+  }
+  // Angular resolution: fan a hub's spokes out toward an even radial spacing. For each
+  // adjacent pair (by angle) that sits closer than the ideal gap, nudge the two neighbors
+  // apart *tangentially* (perpendicular to their radius from the hub) so they rotate around
+  // it rather than fold across each other. Cheap: only nodes with degree >= 3.
+  for (const h of nodes) {
+    if (h.deg < 3) continue;
+    const spokes = h.adj.slice();
+    spokes.sort((p, q) => Math.atan2(p.y - h.y, p.x - h.x) - Math.atan2(q.y - h.y, q.x - h.x));
+    const want = (2 * Math.PI) / spokes.length;
+    for (let k = 0; k < spokes.length; k++) {
+      const a = spokes[k], b = spokes[(k + 1) % spokes.length];
+      let gap = Math.atan2(b.y - h.y, b.x - h.x) - Math.atan2(a.y - h.y, a.x - h.x);
+      while (gap <= 0) gap += 2 * Math.PI;
+      if (gap >= want) continue;                       // already spread enough
+      const push = ANGULAR * (want - gap) * alpha;     // >0, separate the pair
+      for (const [node, sign] of [[a, -1], [b, 1]]) {  // a rotates back, b rotates forward
+        const dx = node.x - h.x, dy = node.y - h.y;
+        const d = Math.sqrt(dx * dx + dy * dy) || 0.01;
+        node.vx += sign * push * (-dy / d);            // unit tangent = (-dy, dx)/d
+        node.vy += sign * push * (dx / d);
+      }
+    }
   }
   // Gravity + integrate.
   for (const n of nodes) {
@@ -276,6 +316,12 @@ function step() {
     n.x += n.vx; n.y += n.vy;
   }
 }
+
+// Warm up synchronously so the page opens already relaxed at a low-energy (fewer-crossing)
+// state instead of visibly untangling from the initial placement. The iteration count is
+// bounded by a work budget so even a near-MAX_NODES graph loads without a long stall.
+const WARMUP = Math.max(60, Math.min(500, Math.floor(3.0e7 / (nodes.length * nodes.length + 1))));
+for (let i = 0; i < WARMUP; i++) step();
 
 // --- view transform (pan/zoom) --------------------------------------------
 let scale = 1, panX = 0, panY = 0, centered = false;

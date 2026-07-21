@@ -33,6 +33,28 @@
   monkeypatched `MAX_NODES`).
 - **Docs:** `README.md` (flags table + Outputs), `docs/02_architecture.md §7`.
 
+## 1a. Follow-up in the same session: edge-crossing reduction
+The canvas force sim in the HTML template was extended to actively minimise **edge
+crossings** (the initial version left visible crossings on the fixture graph):
+- **Degree-weighted repulsion** — each node gets `charge = REPULSION*(1+0.7*sqrt(deg))` and
+  the pairwise force uses `sqrt(charge_a*charge_b)`, so hubs push their neighbors apart and
+  star clusters unfold. Biggest single lever for these hub-and-spoke topologies.
+- **Angular-resolution force** — for every node with `deg>=3`, its spokes are sorted by
+  angle and adjacent pairs closer than the ideal even gap are nudged apart *tangentially*
+  (rotated around the hub). Uses a precomputed per-node adjacency list (`n.adj`, built once)
+  so the pass is **O(edges)/tick**, not O(nodes*edges).
+- **Per-edge rest length** — `e.len = 70 + 9*sqrt(max degree)` gives hub spokes room.
+- **Synchronous warm-up** before first paint — `WARMUP` iterations, bounded by a work budget
+  `clamp(60, 500, 3e7/n²)` so a near-`MAX_NODES` graph still loads fast; the page opens
+  already relaxed instead of visibly untangling from an early (tangled) local minimum.
+- Result on the checked-in fixtures: crossings **2 → 0** (measured in headless Chromium with
+  a segment-intersection counter), node-disk overlaps still 0, output still deterministic.
+- **Caveat (told to the user):** minimizing crossings globally is NP-hard; these are
+  heuristics. Dense/large graphs still show crossings — that regime is where the `.dot`
+  fallback (Graphviz's hierarchical/orthogonal layouts) is the better view anyway.
+- New tunables live as JS consts in the template: `REPULSION`, `SPRING`, `ANGULAR`,
+  `GRAVITY`, `DAMPING`, `WARMUP`. Adjust `ANGULAR` (spoke spreading) / `REPULSION` first.
+
 ## 2. Interface contract for the next change
 - Output writers live in `src/cloudbreachgraph/output/`. The HTML writer signature is
   `write_html(graph, path, *, max_nodes=None, max_bytes=None) -> Path | None`. **`None` means
