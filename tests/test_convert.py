@@ -245,6 +245,73 @@ def test_ringed_view_data_groups_by_vpc_and_ring(graph):
             assert d == round(rings[2], 1)
 
 
+def _angle_of(node, cx, cy):
+    import math
+
+    return math.atan2(node["y"] - cy, node["x"] - cx)
+
+
+def _angles_close(a, b, tol=1e-6):
+    import math
+
+    # Compare on the circle: the difference's unit vector must be ~ (1, 0).
+    return abs(math.cos(a - b) - 1.0) < tol
+
+
+def test_ringed_outer_node_aligns_with_its_single_eni(graph):
+    # Each EC2/LB in the fixture is fronted by exactly one ENI, so it must sit on that spoke.
+    data = html_export._ringed_view_data(graph)
+    pos = {n["id"]: n for n in data["nodes"]}
+    cx, cy = data["clusters"][0]["cx"], data["clusters"][0]["cy"]
+    enis_of = {}
+    for e in graph.edges:
+        if e.relationship == "attached_to":
+            enis_of.setdefault(e.target, []).append(e.source)
+    assert enis_of  # sanity: the fixture has attachments
+    for target, enis in enis_of.items():
+        assert len(enis) == 1
+        assert _angles_close(_angle_of(pos[target], cx, cy), _angle_of(pos[enis[0]], cx, cy))
+
+
+def test_ringed_outer_node_uses_average_angle_of_multiple_enis():
+    # An EC2 fronted by two ENIs must land at the circular mean of *their* two angles. Two
+    # further ENIs attach elsewhere so ring 2 is non-degenerate (the two spokes aren't
+    # antipodal) and the mean is a genuine intermediate angle.
+    import math
+
+    def eni(name, instance):
+        return {
+            "NetworkInterfaceId": name,
+            "SubnetId": "subnet-1",
+            "VpcId": "vpc-1",
+            "InterfaceType": "interface",
+            "Description": "",
+            "Attachment": {"InstanceId": instance},
+            "PrivateIpAddresses": [],
+            "Groups": [],
+        }
+
+    collected = {
+        "meta": {},
+        "network_interfaces": [
+            eni("eni-a", "i-shared"),
+            eni("eni-b", "i-shared"),
+            eni("eni-c", "i-other"),
+            eni("eni-d", "i-other"),
+        ],
+    }
+    g = build_graph(collected)
+    data = html_export._ringed_view_data(g)
+    pos = {n["id"]: n for n in data["nodes"]}
+    cx, cy = data["clusters"][0]["cx"], data["clusters"][0]["cy"]
+    a, b = _angle_of(pos["eni-a"], cx, cy), _angle_of(pos["eni-b"], cx, cy)
+    expected = math.atan2(math.sin(a) + math.sin(b), math.cos(a) + math.cos(b))
+    got = _angle_of(pos["i-shared"], cx, cy)
+    assert _angles_close(got, expected)
+    # It is genuinely averaged — between its two ENIs, on neither's exact spoke.
+    assert not _angles_close(got, a) and not _angles_close(got, b)
+
+
 def test_ringed_unassigned_nodes_form_their_own_cluster():
     # An ENI in no subnet (thus no VPC) collects into the trailing "unassigned" cluster.
     collected = {

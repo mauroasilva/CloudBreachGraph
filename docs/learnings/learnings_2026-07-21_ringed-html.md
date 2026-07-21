@@ -35,6 +35,17 @@
   keys — the ringed template's guide-circle drawing and `autoCenter` were updated to iterate
   `c.rings` (`Math.max(0, ...c.rings, 40)`). Tests that asserted on `cluster["r1"]/["r2"]`
   now assert on `cluster["rings"]` and check ENIs sit on a strictly-inner ring vs EC2/LBs.
+- **Follow-up — outer ring aligns angularly to its ENIs:** each ring-3 node (EC2/LB) is now
+  placed at the **circular mean** of the angles of the ENIs attached to it (via `attached_to`),
+  so it lines up radially with its interface(s); a single ENI puts it exactly on that spoke.
+  New helpers in `html_export.py`: `_place_at_angle`, `_circular_mean` (averages unit vectors,
+  so it's robust to the −π/π wraparound), and `_place_outer_ring`. `_place_on_ring` now
+  **returns** an id→angle map (ring 2's ENIs feed ring 3). `_ringed_view_data` builds an
+  `enis_of: target→[eni ids]` map from the sorted edges (deterministic). Outer nodes with no
+  attached ENI (orphans) fall back to even spacing. **Gotcha:** the circular mean of angles
+  that sum to the zero vector (e.g. 3 evenly-spaced or 2 antipodal spokes) is degenerate —
+  `atan2(0, 0)` returns 0; the multi-ENI test deliberately uses a non-antipodal pair to avoid
+  testing that degenerate path.
 
 ## 2. Interface contract for the next session
 - `html_export.write_ringed_html` has the **same signature and return contract** as
