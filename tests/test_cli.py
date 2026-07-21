@@ -17,7 +17,7 @@ from conftest import FIXTURES, load_fixture
 
 from cloudbreachgraph import cli
 from cloudbreachgraph.aws import runner
-from cloudbreachgraph.output import dot_export
+from cloudbreachgraph.output import dot_export, html_export
 
 _COMMAND_FIXTURES = {
     ("ec2", "describe-network-interfaces"): "ec2_describe-network-interfaces.json",
@@ -183,6 +183,42 @@ def test_render_without_dot_degrades_gracefully(tmp_path, monkeypatch, capsys):
     assert (out / "graph.dot").is_file()
     assert not (out / "graph.png").exists()
     assert "`dot` not found" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- #
+# --html (opt-in interactive output) + size fallback to .dot
+# --------------------------------------------------------------------------- #
+def test_html_not_written_by_default(tmp_path):
+    out = tmp_path / "out"
+    rc = cli.main(["--from-cache", str(FIXTURES), "--output-dir", str(out)])
+    assert rc == 0
+    assert not (out / "graph.html").exists()  # opt-in only
+
+
+def test_html_flag_writes_self_contained_page(tmp_path):
+    out = tmp_path / "out"
+    rc = cli.main(["--from-cache", str(FIXTURES), "--output-dir", str(out), "--html"])
+    assert rc == 0
+    html = out / "graph.html"
+    assert html.is_file()
+    text = html.read_text()
+    assert text.startswith("<!DOCTYPE html>")
+    assert "const GRAPH =" in text
+    # The defaults (json + dot) are still produced alongside the HTML.
+    assert (out / "graph.json").is_file()
+    assert (out / "graph.dot").is_file()
+
+
+def test_html_falls_back_to_dot_when_too_large(tmp_path, monkeypatch, capsys):
+    # Force the "too big" branch by capping the node budget to zero.
+    monkeypatch.setattr(html_export, "MAX_NODES", 0)
+    out = tmp_path / "out"
+    rc = cli.main(["--from-cache", str(FIXTURES), "--output-dir", str(out), "--html"])
+    assert rc == 0
+    assert not (out / "graph.html").exists()  # skipped
+    assert (out / "graph.dot").is_file()  # fallback is the always-written .dot
+    err = capsys.readouterr().err
+    assert "too large" in err and "graph.dot" in err
 
 
 def test_all_accounts_writes_one_graph_each(tmp_path, fake_aws):

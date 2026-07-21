@@ -19,6 +19,21 @@ CLI v2 must be installed and on `PATH`, with a read-only profile per account. To
 the graph to PNG/SVG you also need [Graphviz](https://graphviz.org/) (`dot`) on `PATH` —
 this is optional; without it the tool still writes the `.dot` file.
 
+### Updating to the latest version
+
+After pulling new commits, reinstall so any new or changed console scripts (e.g.
+`cloudbreachgraph-to-html`) and metadata are picked up:
+
+```bash
+git pull
+pip install -e .          # or: pip install -e '.[dev]' to also refresh dev tools
+```
+
+Because the package is installed in editable mode (`-e`), day-to-day code changes take
+effect without reinstalling — but a reinstall is required whenever `pyproject.toml` changes
+(new entry points, dependencies, or version), which a `git pull` may include. When in doubt,
+just rerun the command above; it's cheap and idempotent.
+
 ## Quick start
 
 Build a map of an account and write `graph.json` + `graph.dot` into `out/`:
@@ -127,6 +142,8 @@ cloudbreachgraph --from-cache tests/fixtures --output-dir out/
 --include-orphans          also emit collected resources no ENI references
 --output-dir DIR           where to write outputs (default: .)
 --render {png,svg}         also rasterize the .dot with Graphviz (needs `dot`)
+--html                     also write an interactive, self-contained HTML view
+                             (falls back to .dot when the graph is too large)
 ```
 
 ## Outputs
@@ -140,8 +157,39 @@ cloudbreachgraph --from-cache tests/fixtures --output-dir out/
   a public IP is also linked to a generic `Internet` node to highlight internet exposure.
 - `graph.<fmt>` — only with `--render`; requires `dot`. If `dot` is absent the tool warns
   and still writes the `.dot`.
+- `graph.html` — **only with `--html`** (never produced by default). A single,
+  **self-contained** HTML page (no CDN, no external assets) that draws the graph on an
+  HTML5 canvas with a small vanilla-JavaScript **force layout**: nodes self-distribute
+  (repulsion + edge springs + collision separation) so they don't sit on top of each other.
+  Drag a node to pin it, scroll to zoom, drag the background to pan; nodes are colored by
+  type and ENIs with a public IP get a red "exposed" outline. For very large graphs an
+  in-browser force layout stops being responsive, so if the graph exceeds the render budget
+  the tool **warns and skips the HTML**, pointing you at the always-written `.dot` (which
+  Graphviz can lay out offline at any scale). Just open the file in any browser — it works
+  fully offline.
 
-With `--all-accounts` the files are named per account: `graph.<alias>.json` / `.dot`.
+With `--all-accounts` the files are named per account: `graph.<alias>.json` / `.dot`
+(and `.html` with `--html`).
+
+## Converting an existing graph to HTML
+
+Already have a `graph.json` or `graph.dot` from an earlier run (e.g. from `--from-cache`, a
+colleague's capture, or a run without `--html`)? The auxiliary `cloudbreachgraph-to-html`
+tool renders the same interactive HTML view from it — **no AWS calls, purely local**:
+
+```bash
+cloudbreachgraph-to-html out/graph.json                 # writes out/graph.html
+cloudbreachgraph-to-html out/graph.dot -o topology.html # explicit output path
+cloudbreachgraph-to-html capture.data --format json     # force the input format
+```
+
+- **From JSON** the conversion is **lossless** — it reproduces exactly the page `--html`
+  would have written.
+- **From DOT** it's **best-effort** (DOT is a lossy rendering, and only *this tool's own*
+  `.dot` is understood): node ids/types/names, the public-exposure and unresolved flags, the
+  per-type detail (interface/LB type, CIDR, instance state), and every edge are recovered.
+- The same size guard applies: if the graph is too large for a browser force layout, it warns
+  and writes a `.dot` fallback instead (skipping it if the input already is that `.dot`).
 
 ## Future roles (flow logs, etc.)
 
