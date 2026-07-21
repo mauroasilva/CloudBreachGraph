@@ -348,13 +348,16 @@ _TEMPLATE = """<!DOCTYPE html>
   #legend { margin-top: 8px; display: grid; grid-template-columns: auto 1fr; gap: 3px 6px; }
   #legend .swatch { width: 12px; height: 12px; border-radius: 3px; align-self: center; }
   #legend .exposed { border: 2px solid #e53935; }
-  #controls { margin-top: 10px; }
+  #controls { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
   #controls button {
     font: inherit; font-size: 12px; cursor: pointer; padding: 5px 10px;
     border: 1px solid #b0bec5; border-radius: 6px; background: #eceff1; color: #263238;
   }
+  #controls button.zoom { padding: 5px 9px; font-weight: 600; }
   #controls button:hover { background: #cfd8dc; }
   #controls button:active { transform: translateY(1px); }
+  #controls label { font-size: 12px; cursor: pointer; display: inline-flex;
+    align-items: center; gap: 4px; }
   #hint { margin-top: 8px; color: #607d8b; }
   @media (prefers-color-scheme: dark) {
     body { background: #202124; color: #e8eaed; }
@@ -373,12 +376,16 @@ _TEMPLATE = """<!DOCTYPE html>
     <span id="ecount">__EDGE_COUNT__</span> edges</div>
   <div id="legend"></div>
   <div id="controls">
+    <button id="zoomIn" class="zoom" title="Zoom in">+</button>
+    <button id="zoomOut" class="zoom" title="Zoom out">−</button>
     <button id="recompute" title="Tidy the layout from its current positions: release pins
 and gently settle, resolving overlaps and easing clusters apart — your arrangement is kept,
 not re-solved. Click again to refine further.">↻ Recompute layout</button>
+    <label title="When on, the mouse wheel no longer zooms — use the + / − buttons instead.">
+      <input type="checkbox" id="noscroll"> lock scroll-zoom</label>
   </div>
-  <div id="hint">drag a node to pin · scroll to zoom · drag background to pan ·
-    Recompute gently tidies from where nodes are now</div>
+  <div id="hint">drag a node to pin · scroll to zoom (or lock it and use + / −) ·
+    drag background to pan · Recompute gently tidies from where nodes are now</div>
 </div>
 <script>
 "use strict";
@@ -637,13 +644,27 @@ window.addEventListener("mousemove", (ev) => {
   }
 });
 window.addEventListener("mouseup", () => { dragNode = null; dragging = false; });
-canvas.addEventListener("wheel", (ev) => {
-  ev.preventDefault();
-  const factor = ev.deltaY < 0 ? 1.1 : 1 / 1.1;
-  const w = fromScreen(ev.clientX, ev.clientY);
+
+// Zoom about a screen point, clamped, keeping that point stationary. Shared by the wheel and
+// the +/- buttons (which zoom about the viewport center).
+function zoomAround(px, py, factor) {
+  const w = fromScreen(px, py);
   scale = Math.max(0.1, Math.min(6, scale * factor));
-  panX = ev.clientX - w.x * scale; panY = ev.clientY - w.y * scale; centered = true;
+  panX = px - w.x * scale; panY = py - w.y * scale; centered = true;
+}
+let scrollZoomEnabled = true;   // the "lock scroll-zoom" toggle flips this off
+canvas.addEventListener("wheel", (ev) => {
+  if (!scrollZoomEnabled) return;               // locked: only the +/- buttons zoom
+  ev.preventDefault();
+  zoomAround(ev.clientX, ev.clientY, ev.deltaY < 0 ? 1.1 : 1 / 1.1);
 }, { passive: false });
+document.getElementById("zoomIn")
+  .addEventListener("click", () => zoomAround(W / 2, H / 2, 1.2));
+document.getElementById("zoomOut")
+  .addEventListener("click", () => zoomAround(W / 2, H / 2, 1 / 1.2));
+document.getElementById("noscroll").addEventListener("change", (ev) => {
+  scrollZoomEnabled = !ev.target.checked;
+});
 
 // --- recompute layout ------------------------------------------------------
 // Tidy the layout *from wherever the nodes are now* — NOT a global re-solve. The old full
@@ -720,11 +741,23 @@ _RINGED_TEMPLATE = """<!DOCTYPE html>
   #legend { margin-top: 8px; display: grid; grid-template-columns: auto 1fr; gap: 3px 6px; }
   #legend .swatch { width: 12px; height: 12px; border-radius: 3px; align-self: center; }
   #legend .exposed { border: 2px solid #e53935; }
+  #controls { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  #controls button {
+    font: inherit; font-size: 12px; cursor: pointer; padding: 5px 10px;
+    border: 1px solid #b0bec5; border-radius: 6px; background: #eceff1; color: #263238;
+  }
+  #controls button.zoom { padding: 5px 9px; font-weight: 600; }
+  #controls button:hover { background: #cfd8dc; }
+  #controls button:active { transform: translateY(1px); }
+  #controls label { font-size: 12px; cursor: pointer; display: inline-flex;
+    align-items: center; gap: 4px; }
   #hint { margin-top: 8px; color: #607d8b; }
   @media (prefers-color-scheme: dark) {
     body { background: #202124; color: #e8eaed; }
     #hud { background: rgba(40,42,45,0.92); border-color: #3c4043; }
     #hud .muted, #hint { color: #9aa0a6; }
+    #controls button { background: #3c4043; border-color: #5f6368; color: #e8eaed; }
+    #controls button:hover { background: #4a4d51; }
   }
 </style>
 </head>
@@ -735,8 +768,14 @@ _RINGED_TEMPLATE = """<!DOCTYPE html>
   <div class="muted"><span id="ncount">__NODE_COUNT__</span> nodes ·
     <span id="ecount">__EDGE_COUNT__</span> edges</div>
   <div id="legend"></div>
+  <div id="controls">
+    <button id="zoomIn" class="zoom" title="Zoom in">+</button>
+    <button id="zoomOut" class="zoom" title="Zoom out">−</button>
+    <label title="When on, the mouse wheel no longer zooms — use the + / − buttons instead.">
+      <input type="checkbox" id="noscroll"> lock scroll-zoom</label>
+  </div>
   <div id="hint">VPC at each center · subnets on the inner ring · everything else on the
-    outer ring · drag a node · scroll to zoom · drag background to pan</div>
+    outer ring · drag a node · scroll to zoom (or lock it and use + / −) · drag to pan</div>
 </div>
 <script>
 "use strict";
@@ -872,13 +911,27 @@ window.addEventListener("mousemove", (ev) => {
   }
 });
 window.addEventListener("mouseup", () => { dragNode = null; dragging = false; });
-canvas.addEventListener("wheel", (ev) => {
-  ev.preventDefault();
-  const factor = ev.deltaY < 0 ? 1.1 : 1 / 1.1;
-  const w = fromScreen(ev.clientX, ev.clientY);
+
+// Zoom about a screen point, clamped, keeping that point stationary, then repaint. Shared by
+// the wheel and the +/- buttons (which zoom about the viewport center).
+function zoomAround(px, py, factor) {
+  const w = fromScreen(px, py);
   scale = Math.max(0.1, Math.min(6, scale * factor));
-  panX = ev.clientX - w.x * scale; panY = ev.clientY - w.y * scale; draw();
+  panX = px - w.x * scale; panY = py - w.y * scale; draw();
+}
+let scrollZoomEnabled = true;   // the "lock scroll-zoom" toggle flips this off
+canvas.addEventListener("wheel", (ev) => {
+  if (!scrollZoomEnabled) return;               // locked: only the +/- buttons zoom
+  ev.preventDefault();
+  zoomAround(ev.clientX, ev.clientY, ev.deltaY < 0 ? 1.1 : 1 / 1.1);
 }, { passive: false });
+document.getElementById("zoomIn")
+  .addEventListener("click", () => zoomAround(W / 2, H / 2, 1.2));
+document.getElementById("zoomOut")
+  .addEventListener("click", () => zoomAround(W / 2, H / 2, 1 / 1.2));
+document.getElementById("noscroll").addEventListener("change", (ev) => {
+  scrollZoomEnabled = !ev.target.checked;
+});
 
 // --- legend ----------------------------------------------------------------
 (function legend() {

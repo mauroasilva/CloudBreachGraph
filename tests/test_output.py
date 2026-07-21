@@ -179,6 +179,19 @@ def test_write_html_embeds_public_exposure(graph, tmp_path):
     assert '"public": true' in text
 
 
+def test_write_html_has_zoom_controls_and_scroll_lock(graph, tmp_path):
+    text = html_export.write_html(graph, tmp_path / "graph.html").read_text()
+    # Zoom In / Zoom Out buttons wired to a shared zoomAround() helper (about the viewport center).
+    assert 'id="zoomIn"' in text and 'id="zoomOut"' in text
+    assert "function zoomAround(" in text
+    assert 'getElementById("zoomIn")' in text and "zoomAround(W / 2, H / 2, 1.2)" in text
+    assert 'getElementById("zoomOut")' in text and "zoomAround(W / 2, H / 2, 1 / 1.2)" in text
+    # A checkbox toggle disables wheel zoom so only the buttons work; the wheel handler honors it.
+    assert 'id="noscroll"' in text
+    assert "let scrollZoomEnabled = true" in text
+    assert "if (!scrollZoomEnabled) return;" in text
+
+
 def test_write_html_is_deterministic(graph, tmp_path):
     a = html_export.write_html(graph, tmp_path / "a.html").read_text()
     b = html_export.write_html(graph, tmp_path / "b.html").read_text()
@@ -230,6 +243,17 @@ def test_write_ringed_html_is_deterministic(graph, tmp_path):
     a = html_export.write_ringed_html(graph, tmp_path / "a.html").read_text()
     b = html_export.write_ringed_html(graph, tmp_path / "b.html").read_text()
     assert a == b  # positions computed from sorted nodes/edges; no timestamps
+
+
+def test_write_ringed_html_has_zoom_controls_and_scroll_lock(graph, tmp_path):
+    text = html_export.write_ringed_html(graph, tmp_path / "ringed.html").read_text()
+    assert 'id="zoomIn"' in text and 'id="zoomOut"' in text
+    assert "function zoomAround(" in text
+    assert 'getElementById("zoomIn")' in text and "zoomAround(W / 2, H / 2, 1.2)" in text
+    assert 'getElementById("zoomOut")' in text and "zoomAround(W / 2, H / 2, 1 / 1.2)" in text
+    assert 'id="noscroll"' in text
+    assert "let scrollZoomEnabled = true" in text
+    assert "if (!scrollZoomEnabled) return;" in text
 
 
 def test_write_ringed_html_embeds_public_exposure(graph, tmp_path):

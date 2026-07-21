@@ -18,6 +18,14 @@
 - Tests: `tests/test_output.py` (5 ringed writer tests) and `tests/test_convert.py`
   (grouping/ring-membership, unassigned cluster, determinism, CLI, size-guard fallback).
 - Docs: `README.md` (new "Ringed layout" subsection + example), `docs/02_architecture.md §7`.
+- **Follow-up in the same session — zoom controls on *both* HTML pages:** added **Zoom In /
+  Zoom Out** buttons and a **lock scroll-zoom** checkbox to both `_TEMPLATE` (force) and
+  `_RINGED_TEMPLATE` (ringed). Both pages now share a `zoomAround(px, py, factor)` helper
+  (buttons zoom about the viewport center `W/2, H/2`; the wheel still zooms about the cursor)
+  and a `scrollZoomEnabled` flag the checkbox flips — when off, the `wheel` handler early-
+  returns so only the buttons zoom. In the ringed page `zoomAround` also calls `draw()` since
+  it renders on demand (no animation loop); the force page relies on its existing frame loop.
+  Covered by `test_write_html_has_zoom_controls_and_scroll_lock` and its ringed twin.
 
 ## 2. Interface contract for the next session
 - `html_export.write_ringed_html` has the **same signature and return contract** as
@@ -66,7 +74,7 @@
 ## 7. How to verify
 ```bash
 pip install -e '.[dev]'
-pytest                       # 118 tests (10 new ringed tests), all offline
+pytest                       # 120 tests (10 ringed + 2 zoom-control tests), all offline
 ruff check . && ruff format --check .
 # End-to-end, offline, against checked-in fixtures:
 cloudbreachgraph --from-cache tests/fixtures --output-dir /tmp/cbg-out

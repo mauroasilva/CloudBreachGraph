@@ -162,7 +162,9 @@ cloudbreachgraph --from-cache tests/fixtures --output-dir out/
   HTML5 canvas with a small vanilla-JavaScript **force layout**: nodes self-distribute
   (repulsion + edge springs + collision separation) so they don't sit on top of each other,
   and disconnected clusters (e.g. separate VPCs) repel each other so they settle apart rather
-  than mingling. Drag a node to pin it, scroll to zoom, drag the background to pan. A
+  than mingling. Drag a node to pin it, scroll to zoom, drag the background to pan. **Zoom
+  In / Zoom Out** buttons zoom about the center, and a **lock scroll-zoom** toggle disables
+  wheel zoom so only those buttons change the zoom. A
   **Recompute layout** button *gently tidies the layout from wherever the nodes are now* — it
   anchors each node to its current position and only relieves local crowding (resolving
   overlaps, easing clusters apart), so a layout you arranged by hand is preserved rather than
@@ -206,7 +208,8 @@ and **everything else** under that VPC (ENIs, EC2 instances, load balancers) for
 that resolves to no VPC (an orphan) collects into a final ring-cluster with an empty center.
 Faint guide circles and a per-cluster VPC label make the ring structure legible. Unlike the
 force view, positions are computed deterministically (no in-browser relaxation, no Recompute
-button); you can still drag a node, scroll to zoom, and drag the background to pan. It obeys
+button); you can still drag a node, scroll to zoom, and drag the background to pan, plus the
+same **Zoom In / Zoom Out** buttons and **lock scroll-zoom** toggle as the default view. It obeys
 the **same size guard** — if the graph is too large it warns and writes the `.dot` fallback,
 exactly like the default HTML mode.
 
