@@ -35,6 +35,38 @@
   keys — the ringed template's guide-circle drawing and `autoCenter` were updated to iterate
   `c.rings` (`Math.max(0, ...c.rings, 40)`). Tests that asserted on `cluster["r1"]/["r2"]`
   now assert on `cluster["rings"]` and check ENIs sit on a strictly-inner ring vs EC2/LBs.
+- **Follow-up — outer ring aligns angularly to its ENIs:** each ring-3 node (EC2/LB) is now
+  placed at the **circular mean** of the angles of the ENIs attached to it (via `attached_to`),
+  so it lines up radially with its interface(s); a single ENI puts it exactly on that spoke.
+  New helpers in `html_export.py`: `_place_at_angle`, `_circular_mean` (averages unit vectors,
+  so it's robust to the −π/π wraparound), and `_place_outer_ring`. `_place_on_ring` now
+  **returns** an id→angle map (ring 2's ENIs feed ring 3). `_ringed_view_data` builds an
+  `enis_of: target→[eni ids]` map from the sorted edges (deterministic). Outer nodes with no
+  attached ENI (orphans) fall back to even spacing. **Gotcha:** the circular mean of angles
+  that sum to the zero vector (e.g. 3 evenly-spaced or 2 antipodal spokes) is degenerate —
+  `atan2(0, 0)` returns 0; the multi-ENI test deliberately uses a non-antipodal pair to avoid
+  testing that degenerate path.
+- **Follow-up — subnets align to their ENIs too (ENIs grouped near their subnet):** the
+  ENI ring is now the angular anchor for *both* neighbours. `_place_outer_ring` was
+  generalized/renamed to **`_place_aligned_to_enis(members, cx, cy, radius, eni_angle,
+  enis_by_member)`** and is used for the subnet ring (map = `enis_of_subnet`) and the outer
+  ring (map = `enis_of_lb`). On ring 2 the ENIs are now **ordered by `(subnet_id, eni_id)`**
+  so each subnet's ENIs form one contiguous arc; the subnet then sits at the circular mean of
+  that arc, keeping its interfaces angularly adjacent. `_ringed_view_data` builds
+  `enis_of_subnet` and `subnet_of_eni` from the sorted `in_subnet` edges alongside the
+  existing `enis_of_lb`. Tests: subnet = mean-angle-of-its-ENIs, and a "every ENI's nearest
+  subnet is its own" grouping check.
+  - **Known minor gap:** subnets are no longer evenly spaced on ring 1 (they follow their ENI
+    blocks), so in pathological cases two subnets with adjacent small ENI blocks could sit
+    close on the (smaller-radius) subnet ring. Not observed on real topologies; revisit with a
+    subnet-node de-collision pass if it ever bites.
+
+## GIT NOTE (this session)
+- PR #12 (first three commits: ringed HTML, zoom controls, ENI ring split) was **merged** as a
+  real merge commit into `main`. The angular-alignment commit and this subnet-alignment commit
+  are **new, unmerged work**: the branch was rebased onto the post-merge `main` so it carries
+  only the unmerged commits (no duplicate already-merged history), then force-with-lease pushed.
+  Any PR opened for this branch now is a **new** PR, not #12.
 
 ## 2. Interface contract for the next session
 - `html_export.write_ringed_html` has the **same signature and return contract** as

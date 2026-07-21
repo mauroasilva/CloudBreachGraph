@@ -18,7 +18,9 @@ This is an **opt-in** output (the CLI ``--html`` flag) — it is never produced 
 An alternative **ringed** layout (:func:`write_ringed_html` / :func:`build_ringed_html`,
 exposed by the ``cloudbreachgraph-to-html --ringed`` auxiliary flag) draws each VPC at the
 center of its own cluster and successive concentric rings around it — subnets, then ENIs,
-then everything else (EC2 instances, load balancers).
+then everything else (EC2 instances, load balancers). The ENI ring is the angular anchor: a
+subnet is placed at the mean angle of the ENIs it contains, and an EC2/LB at the mean angle
+of the ENIs attached to it, so each stays radially next to its interfaces.
 Unlike the force layout its positions are computed deterministically in Python, so the page
 needs no in-browser relaxation. It shares the same :data:`MAX_NODES` / :data:`MAX_HTML_BYTES`
 size guard and the same ``None``-means-fall-back-to-``.dot`` contract.
@@ -153,7 +155,10 @@ def write_html(
 # An alternative, deterministic layout (no force simulation): every VPC is the *center* of
 # its own cluster, its subnets sit on the **first ring**, its **ENIs** on their own dedicated
 # **second ring**, and everything else that lives under that VPC (EC2 instances, load
-# balancers) sits on the **outer ring**. Multiple
+# balancers) sits on the **outer ring**. The ENI ring is the **angular anchor**: each subnet
+# is placed at the **mean angle of the ENIs it contains** and each EC2/LB at the **mean angle
+# of the ENIs attached to it**, and ENIs are ordered by subnet on their ring so a subnet's
+# interfaces form one contiguous arc it sits radially inside. Multiple
 # VPC clusters are tiled in a grid so they don't overlap; resources that resolve to no VPC
 # (orphans) collect into one final ring-cluster with an empty center. Positions are computed
 # here in Python from the already-sorted nodes/edges, so the page is byte-stable and needs no
@@ -208,13 +213,61 @@ def _ring_radii(counts: list[int]) -> list[float]:
     return radii
 
 
-def _place_on_ring(members: list, cx: float, cy: float, radius: float) -> None:
-    """Assign ``x``/``y`` to each member evenly around a circle of ``radius`` about (cx, cy)."""
+def _place_at_angle(member: dict, cx: float, cy: float, radius: float, angle: float) -> None:
+    """Assign ``x``/``y`` to a single member at ``angle`` on a circle of ``radius`` about center."""
+    member["x"] = round(cx + radius * math.cos(angle), 2)
+    member["y"] = round(cy + radius * math.sin(angle), 2)
+
+
+def _place_on_ring(members: list, cx: float, cy: float, radius: float) -> dict[str, float]:
+    """Place each member evenly around a circle of ``radius`` about (cx, cy).
+
+    Returns a map of member id -> the angle (radians) it was placed at, so a subsequent ring
+    can align its nodes with these (e.g. the outer ring aligning to its ENIs).
+    """
     count = len(members)
+    angles: dict[str, float] = {}
     for i, m in enumerate(members):
         angle = -math.pi / 2 + (2 * math.pi * i / count if count else 0.0)
-        m["x"] = round(cx + radius * math.cos(angle), 2)
-        m["y"] = round(cy + radius * math.sin(angle), 2)
+        _place_at_angle(m, cx, cy, radius, angle)
+        angles[m["id"]] = angle
+    return angles
+
+
+def _circular_mean(angles: list[float]) -> float:
+    """Mean of ``angles`` on the circle (averages unit vectors), robust to the −π/π wraparound."""
+    sin_sum = math.fsum(math.sin(a) for a in angles)
+    cos_sum = math.fsum(math.cos(a) for a in angles)
+    return math.atan2(sin_sum, cos_sum)
+
+
+def _place_aligned_to_enis(
+    members: list,
+    cx: float,
+    cy: float,
+    radius: float,
+    eni_angle: dict[str, float],
+    enis_by_member: dict[str, list[str]],
+) -> None:
+    """Place each member at the (circular-mean) angle of the ENIs associated with it.
+
+    ``enis_by_member`` maps a member id to the ENI ids it should line up with, and
+    ``eni_angle`` gives each ENI's angle on its own ring. Used for both neighbours of the ENI
+    ring: the **subnet** ring (a subnet aligns to the ENIs it contains) and the **outer** ring
+    (an EC2 instance / load balancer aligns to the ENIs attached to it). A single ENI puts the
+    member on exactly that spoke; several average out. Members with no associated ENI (e.g.
+    orphans surfaced by ``--include-orphans``) fall back to even spacing.
+    """
+    aligned: list[tuple[dict, float]] = []
+    unaligned: list[dict] = []
+    for m in members:
+        angs = [eni_angle[e] for e in enis_by_member.get(m["id"], []) if e in eni_angle]
+        (aligned.append((m, _circular_mean(angs))) if angs else unaligned.append(m))
+    for m, angle in aligned:
+        _place_at_angle(m, cx, cy, radius, angle)
+    count = len(unaligned)
+    for i, m in enumerate(unaligned):
+        _place_at_angle(m, cx, cy, radius, -math.pi / 2 + (2 * math.pi * i / count if count else 0))
 
 
 def _vpc_group_of(graph: Graph) -> dict[str, str]:
@@ -260,6 +313,21 @@ def _ringed_view_data(graph: Graph) -> dict:
     by_id = {n["id"]: n for n in base["nodes"]}
     group_of = _vpc_group_of(graph)
 
+    # ENI adjacency used to angle-align the ENI ring's two neighbours. graph.edges is sorted,
+    # so every per-node ENI list is deterministic.
+    #  * enis_of_lb: outer-ring node (ec2/lb) -> the ENIs attached to it (via `attached_to`).
+    #  * enis_of_subnet: subnet -> the ENIs it contains (via `in_subnet`).
+    #  * subnet_of_eni: ENI -> its subnet, used to group ENIs by subnet on ring 2.
+    enis_of_lb: dict[str, list[str]] = {}
+    enis_of_subnet: dict[str, list[str]] = {}
+    subnet_of_eni: dict[str, str] = {}
+    for e in graph.edges:
+        if e.relationship == "attached_to":
+            enis_of_lb.setdefault(e.target, []).append(e.source)
+        elif e.relationship == "in_subnet":
+            enis_of_subnet.setdefault(e.target, []).append(e.source)
+            subnet_of_eni.setdefault(e.source, e.target)
+
     # Bucket nodes into groups, and within a group into rings, preserving the deterministic
     # (type, id) order the Graph already sorted them into.
     groups: dict[str, dict[int, list]] = {}
@@ -288,8 +356,15 @@ def _ringed_view_data(graph: Graph) -> dict:
         cy = (i // cols) * cell
         rs = radii[g]
         _place_on_ring(groups[g][0], cx, cy, 0.0)  # VPC center (0..1 nodes)
-        for r in range(1, _RING_COUNT):  # ring 1 subnets, ring 2 ENIs, ring 3 everything else
-            _place_on_ring(groups[g][r], cx, cy, rs[r - 1])
+        # ring 2: ENIs, evenly spaced but ordered so a subnet's ENIs are contiguous (grouped by
+        # subnet id, then ENI id) — this makes each subnet's ENIs a single arc it can center on.
+        enis = sorted(groups[g][2], key=lambda m: (subnet_of_eni.get(m["id"], ""), m["id"]))
+        eni_angle = _place_on_ring(enis, cx, cy, rs[1])
+        # ring 1: subnets aligned to the mean angle of the ENIs they contain, so a subnet sits
+        # radially inward from its own block of ENIs (its interfaces stay near it).
+        _place_aligned_to_enis(groups[g][1], cx, cy, rs[0], eni_angle, enis_of_subnet)
+        # ring 3: EC2/LBs aligned to the mean angle of the ENIs attached to each.
+        _place_aligned_to_enis(groups[g][3], cx, cy, rs[2], eni_angle, enis_of_lb)
         clusters.append(
             {
                 "cx": round(cx, 2),
