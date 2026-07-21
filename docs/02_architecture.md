@@ -224,6 +224,12 @@ Requirements:
   (recovers node id/type/name, public/synthetic flags, the one display attribute per type,
   and every edge + `match_rule`; folds the DOT-only `Internet` decoration back into
   `public_ips`). The converter reuses the same `write_html` size guard and `.dot` fallback.
+  Its `--ringed` flag selects an alternative **concentric-ringed** layout
+  (`html_export.write_ringed_html`/`build_ringed_html`): each VPC is a cluster center, its
+  subnets are the inner ring, and everything else under that VPC is the outer ring, with
+  orphan resources collected into a final ring-cluster (empty center). Ring positions are
+  computed deterministically in Python (no in-browser force sim), and the same `MAX_NODES`/
+  `MAX_HTML_BYTES` guard and `.dot` fallback apply.
 
 ## 8. Regions
 

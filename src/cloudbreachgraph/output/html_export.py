@@ -15,6 +15,13 @@ The page supports drag, wheel-zoom, and background pan.
 This is an **opt-in** output (the CLI ``--html`` flag) — it is never produced by default;
 ``graph.json`` and ``graph.dot`` remain the defaults.
 
+An alternative **ringed** layout (:func:`write_ringed_html` / :func:`build_ringed_html`,
+exposed by the ``cloudbreachgraph-to-html --ringed`` auxiliary flag) draws each VPC at the
+center of its own cluster, its subnets on an inner ring and everything else on an outer ring.
+Unlike the force layout its positions are computed deterministically in Python, so the page
+needs no in-browser relaxation. It shares the same :data:`MAX_NODES` / :data:`MAX_HTML_BYTES`
+size guard and the same ``None``-means-fall-back-to-``.dot`` contract.
+
 **Size guard / graceful fallback (``docs/02_architecture.md §7``).** An O(n²) force layout
 in the browser only stays responsive up to a point, and the inlined JSON grows with the
 graph. When a graph would exceed :data:`MAX_NODES` nodes or the rendered page would exceed
@@ -31,6 +38,7 @@ always relaxes the same way. No timestamps are written.
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 from ..model.graph import Graph
@@ -129,6 +137,182 @@ def write_html(
         return None
 
     html = build_html(graph)
+    if len(html.encode("utf-8")) > byte_cap:
+        return None
+
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(html, encoding="utf-8")
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Ringed layout — concentric rings centered on each VPC.
+#
+# An alternative, deterministic layout (no force simulation): every VPC is the *center* of
+# its own cluster, its subnets sit on the **inner ring**, and everything else that lives
+# under that VPC (ENIs, EC2 instances, load balancers) sits on the **outer ring**. Multiple
+# VPC clusters are tiled in a grid so they don't overlap; resources that resolve to no VPC
+# (orphans) collect into one final ring-cluster with an empty center. Positions are computed
+# here in Python from the already-sorted nodes/edges, so the page is byte-stable and needs no
+# in-browser relaxation — the JS only draws, pans, zooms and lets you drag a node.
+# --------------------------------------------------------------------------- #
+_UNASSIGNED = "__unassigned__"  # pseudo-group key for resources that resolve to no VPC
+
+# Ring geometry (pixels). Arc is the minimum spacing between adjacent nodes on a ring, so a
+# ring's radius grows with how many nodes sit on it (keeping them from colliding).
+_RING_ARC = 92.0
+_RING1_MIN = 150.0  # inner (subnet) ring never smaller than this
+_RING_GAP = 150.0  # radial gap between the inner and outer ring
+_CLUSTER_MARGIN = 80.0  # empty room around a cluster's outermost ring
+_CLUSTER_PAD = 130.0  # extra gap between adjacent clusters in the grid
+
+
+def _ring_of(node_type: str) -> int:
+    """Ring index for a node type: VPC center (0), subnet inner ring (1), else outer ring (2)."""
+    if node_type == "vpc":
+        return 0
+    if node_type == "subnet":
+        return 1
+    return 2
+
+
+def _ring_radii(n_inner: int, n_outer: int) -> tuple[float, float]:
+    """Inner/outer ring radii sized so ``n_inner``/``n_outer`` nodes fit without colliding."""
+    r1 = max(_RING1_MIN, n_inner * _RING_ARC / (2 * math.pi)) if n_inner else 0.0
+    if n_outer:
+        base = (r1 + _RING_GAP) if r1 else _RING1_MIN
+        r2 = max(base, n_outer * _RING_ARC / (2 * math.pi))
+    else:
+        r2 = 0.0
+    return r1, r2
+
+
+def _place_on_ring(members: list, cx: float, cy: float, radius: float) -> None:
+    """Assign ``x``/``y`` to each member evenly around a circle of ``radius`` about (cx, cy)."""
+    count = len(members)
+    for i, m in enumerate(members):
+        angle = -math.pi / 2 + (2 * math.pi * i / count if count else 0.0)
+        m["x"] = round(cx + radius * math.cos(angle), 2)
+        m["y"] = round(cy + radius * math.sin(angle), 2)
+
+
+def _vpc_group_of(graph: Graph) -> dict[str, str]:
+    """Map each node id to the id of the VPC it belongs to (or ``_UNASSIGNED``).
+
+    Traces the model's edges: subnet →(in_vpc)→ vpc, eni →(in_subnet)→ subnet, and
+    ec2/lb ←(attached_to)← eni. A node that can't be traced to a VPC lands in ``_UNASSIGNED``.
+    """
+    eni_subnet: dict[str, str] = {}
+    subnet_vpc: dict[str, str] = {}
+    node_eni: dict[str, str] = {}  # ec2/lb (attach target) -> the ENI attached to it
+    for e in graph.edges:
+        if e.relationship == "in_subnet":
+            eni_subnet.setdefault(e.source, e.target)
+        elif e.relationship == "in_vpc":
+            subnet_vpc.setdefault(e.source, e.target)
+        elif e.relationship == "attached_to":
+            node_eni.setdefault(e.target, e.source)
+
+    group: dict[str, str] = {}
+    for n in graph.nodes:
+        if n.type == "vpc":
+            g: str | None = n.id
+        elif n.type == "subnet":
+            g = subnet_vpc.get(n.id)
+        elif n.type == "eni":
+            g = subnet_vpc.get(eni_subnet.get(n.id, ""))
+        else:
+            eni = node_eni.get(n.id)
+            g = subnet_vpc.get(eni_subnet.get(eni, "")) if eni else None
+        group[n.id] = g or _UNASSIGNED
+    return group
+
+
+def _ringed_view_data(graph: Graph) -> dict:
+    """Build the ringed page payload: nodes with fixed x/y, edges, and per-cluster ring guides.
+
+    Reuses :func:`_view_data`'s per-node fields (colors, exposure flag, detail line) and adds
+    computed ``x``/``y``. ``clusters`` carries each VPC cluster's center, ring radii and label
+    so the page can draw the guide circles that make the rings legible.
+    """
+    base = _view_data(graph)
+    by_id = {n["id"]: n for n in base["nodes"]}
+    group_of = _vpc_group_of(graph)
+
+    # Bucket nodes into groups, and within a group into rings, preserving the deterministic
+    # (type, id) order the Graph already sorted them into.
+    groups: dict[str, dict[int, list]] = {}
+    labels: dict[str, str] = {}
+    for n in graph.nodes:
+        g = group_of[n.id]
+        groups.setdefault(g, {0: [], 1: [], 2: []})[_ring_of(n.type)].append(by_id[n.id])
+        if n.type == "vpc":
+            labels[g] = n.label
+
+    # Deterministic group order: real VPC clusters by id, the orphan cluster (if any) last.
+    order = sorted(k for k in groups if k != _UNASSIGNED)
+    if _UNASSIGNED in groups:
+        order.append(_UNASSIGNED)
+
+    radii = {g: _ring_radii(len(groups[g][1]), len(groups[g][2])) for g in order}
+    cluster_r = {g: max(radii[g][0], radii[g][1], 60.0) + _CLUSTER_MARGIN for g in order}
+    cell = 2 * (max(cluster_r.values(), default=0.0)) + _CLUSTER_PAD
+    cols = max(1, math.ceil(math.sqrt(len(order))))
+
+    clusters = []
+    for i, g in enumerate(order):
+        cx = (i % cols) * cell
+        cy = (i // cols) * cell
+        r1, r2 = radii[g]
+        _place_on_ring(groups[g][0], cx, cy, 0.0)  # VPC center (0..1 nodes)
+        _place_on_ring(groups[g][1], cx, cy, r1)  # subnet inner ring
+        _place_on_ring(groups[g][2], cx, cy, r2)  # everything-else outer ring
+        clusters.append(
+            {
+                "cx": round(cx, 2),
+                "cy": round(cy, 2),
+                "r1": round(r1, 2),
+                "r2": round(r2, 2),
+                "label": labels.get(g, "unassigned"),
+            }
+        )
+
+    base["clusters"] = clusters
+    return base
+
+
+def build_ringed_html(graph: Graph) -> str:
+    """Return the complete, self-contained ringed HTML document for ``graph`` as a string."""
+    data_json = json.dumps(_ringed_view_data(graph), ensure_ascii=False, default=str)
+    return (
+        _RINGED_TEMPLATE.replace("__GRAPH_DATA__", data_json)
+        .replace("__NODE_COUNT__", str(len(graph.nodes)))
+        .replace("__EDGE_COUNT__", str(len(graph.edges)))
+    )
+
+
+def write_ringed_html(
+    graph: Graph,
+    path: str | Path,
+    *,
+    max_nodes: int | None = None,
+    max_bytes: int | None = None,
+) -> Path | None:
+    """Write ``graph`` to ``path`` as the self-contained **ringed** HTML page.
+
+    Same contract and size guard as :func:`write_html` (VPC-centered concentric rings instead
+    of a force layout): returns the :class:`~pathlib.Path` written, or ``None`` when the graph
+    is too large (more than ``max_nodes`` nodes, or a rendered page over ``max_bytes`` bytes),
+    in which case **no file is written** so the caller can fall back to the ``.dot`` output.
+    """
+    node_cap = MAX_NODES if max_nodes is None else max_nodes
+    byte_cap = MAX_HTML_BYTES if max_bytes is None else max_bytes
+
+    if len(graph.nodes) > node_cap:
+        return None
+
+    html = build_ringed_html(graph)
     if len(html.encode("utf-8")) > byte_cap:
         return None
 
@@ -503,6 +687,219 @@ document.getElementById("recompute").addEventListener("click", recompute);
     el.appendChild(sw); el.appendChild(lb);
   }
 })();
+</script>
+</body>
+</html>
+"""
+
+
+# --------------------------------------------------------------------------- #
+# Ringed page template. Positions are precomputed in Python (GRAPH.nodes have x/y and
+# GRAPH.clusters carry the ring guides), so there is no force simulation — the JS only draws
+# and handles pan/zoom/drag. Self-contained: inline CSS + JS, no external assets.
+# --------------------------------------------------------------------------- #
+_RINGED_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CloudBreachGraph — ringed</title>
+<style>
+  :root { color-scheme: light dark; }
+  html, body { margin: 0; height: 100%; font-family: Helvetica, Arial, sans-serif; }
+  body { background: #fafafa; color: #263238; }
+  #canvas { display: block; width: 100vw; height: 100vh; cursor: grab; }
+  #canvas:active { cursor: grabbing; }
+  #hud {
+    position: fixed; top: 12px; left: 12px; background: rgba(255,255,255,0.92);
+    border: 1px solid #cfd8dc; border-radius: 8px; padding: 10px 12px; font-size: 12px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.12); max-width: 260px;
+  }
+  #hud h1 { font-size: 14px; margin: 0 0 4px; }
+  #hud .muted { color: #607d8b; }
+  #legend { margin-top: 8px; display: grid; grid-template-columns: auto 1fr; gap: 3px 6px; }
+  #legend .swatch { width: 12px; height: 12px; border-radius: 3px; align-self: center; }
+  #legend .exposed { border: 2px solid #e53935; }
+  #hint { margin-top: 8px; color: #607d8b; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #202124; color: #e8eaed; }
+    #hud { background: rgba(40,42,45,0.92); border-color: #3c4043; }
+    #hud .muted, #hint { color: #9aa0a6; }
+  }
+</style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<div id="hud">
+  <h1>CloudBreachGraph <span class="muted">· ringed</span></h1>
+  <div class="muted"><span id="ncount">__NODE_COUNT__</span> nodes ·
+    <span id="ecount">__EDGE_COUNT__</span> edges</div>
+  <div id="legend"></div>
+  <div id="hint">VPC at each center · subnets on the inner ring · everything else on the
+    outer ring · drag a node · scroll to zoom · drag background to pan</div>
+</div>
+<script>
+"use strict";
+const GRAPH = __GRAPH_DATA__;
+
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+let W = 0, H = 0, dpr = 1;
+
+function resize() {
+  dpr = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = Math.round(W * dpr);
+  canvas.height = Math.round(H * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  draw();
+}
+window.addEventListener("resize", resize);
+
+function radiusFor(t) {
+  if (t === "vpc") return 16;
+  if (t === "load_balancer") return 13;
+  if (t === "ec2_instance" || t === "subnet") return 11;
+  return 9;
+}
+
+// Nodes already carry precomputed x/y from the Python layout; positions are authoritative.
+const nodes = GRAPH.nodes.map((n) => ({ ...n, r: radiusFor(n.type) }));
+const index = new Map(nodes.map((n) => [n.id, n]));
+const edges = GRAPH.edges
+  .map((e) => ({ s: index.get(e.source), t: index.get(e.target) }))
+  .filter((e) => e.s && e.t);
+const clusters = GRAPH.clusters || [];
+
+// --- view transform (pan/zoom), fit to the whole layout on first paint ------
+let scale = 1, panX = 0, panY = 0, centered = false;
+function toScreen(n) { return { x: n.x * scale + panX, y: n.y * scale + panY }; }
+function fromScreen(sx, sy) { return { x: (sx - panX) / scale, y: (sy - panY) / scale }; }
+
+function autoCenter() {
+  if (centered || nodes.length === 0) return;
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const c of clusters) {
+    const r = Math.max(c.r2, c.r1, 40) + 30;
+    minX = Math.min(minX, c.cx - r); minY = Math.min(minY, c.cy - r);
+    maxX = Math.max(maxX, c.cx + r); maxY = Math.max(maxY, c.cy + r);
+  }
+  for (const n of nodes) {
+    minX = Math.min(minX, n.x); minY = Math.min(minY, n.y);
+    maxX = Math.max(maxX, n.x); maxY = Math.max(maxY, n.y);
+  }
+  const gw = Math.max(maxX - minX, 1), gh = Math.max(maxY - minY, 1);
+  scale = Math.min(2, 0.9 * Math.min(W / gw, H / gh));
+  panX = W / 2 - ((minX + maxX) / 2) * scale;
+  panY = H / 2 - ((minY + maxY) / 2) * scale;
+  centered = true;
+}
+
+// --- rendering -------------------------------------------------------------
+function draw() {
+  autoCenter();
+  ctx.clearRect(0, 0, W, H);
+  const dark = getComputedStyle(document.body).color === "rgb(232, 234, 237)";
+
+  // Ring guide circles + cluster labels first, so nodes/edges sit on top.
+  ctx.strokeStyle = dark ? "rgba(160,170,180,0.30)" : "rgba(96,125,139,0.28)";
+  ctx.fillStyle = dark ? "#9aa0a6" : "#607d8b";
+  ctx.textAlign = "center";
+  ctx.font = "12px Helvetica, Arial, sans-serif";
+  for (const c of clusters) {
+    const p = toScreen({ x: c.cx, y: c.cy });
+    for (const rr of [c.r1, c.r2]) {
+      if (rr <= 0) continue;
+      ctx.beginPath(); ctx.arc(p.x, p.y, rr * scale, 0, Math.PI * 2); ctx.stroke();
+    }
+    const top = Math.max(c.r1, c.r2, 40) * scale;
+    if (scale > 0.4) ctx.fillText(c.label, p.x, p.y - top - 6);
+  }
+
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = dark ? "rgba(200,200,200,0.35)" : "rgba(96,125,139,0.35)";
+  for (const e of edges) {
+    const s = toScreen(e.s), t = toScreen(e.t);
+    ctx.beginPath(); ctx.moveTo(s.x, s.y); ctx.lineTo(t.x, t.y); ctx.stroke();
+  }
+
+  const showLabels = scale > 0.55;
+  for (const n of nodes) {
+    const p = toScreen(n);
+    const r = n.r * scale;
+    ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+    ctx.fillStyle = n.color; ctx.fill();
+    if (n.public) { ctx.lineWidth = 2.5; ctx.strokeStyle = "#e53935"; ctx.stroke(); }
+    ctx.lineWidth = n.synthetic ? 1.5 : 1;
+    ctx.setLineDash(n.synthetic ? [3, 3] : []);
+    ctx.strokeStyle = "#37474f"; ctx.stroke(); ctx.setLineDash([]);
+    if (showLabels) {
+      ctx.fillStyle = getComputedStyle(document.body).color;
+      ctx.font = "11px Helvetica, Arial, sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText(n.label || n.id, p.x, p.y + r + 12);
+      if (n.detail) {
+        ctx.fillStyle = "#78909c"; ctx.font = "9px Helvetica, Arial, sans-serif";
+        ctx.fillText(n.detail, p.x, p.y + r + 23);
+      }
+    }
+  }
+}
+
+// --- interaction (drag a node, drag background to pan, wheel to zoom) -------
+let dragNode = null, dragging = false, lastX = 0, lastY = 0;
+function nodeAt(sx, sy) {
+  const w = fromScreen(sx, sy);
+  for (let i = nodes.length - 1; i >= 0; i--) {
+    const n = nodes[i];
+    const dx = n.x - w.x, dy = n.y - w.y;
+    if (dx * dx + dy * dy <= (n.r + 3) * (n.r + 3)) return n;
+  }
+  return null;
+}
+canvas.addEventListener("mousedown", (ev) => {
+  lastX = ev.clientX; lastY = ev.clientY;
+  dragNode = nodeAt(ev.clientX, ev.clientY);
+  if (!dragNode) dragging = true;
+});
+window.addEventListener("mousemove", (ev) => {
+  if (dragNode) {
+    const w = fromScreen(ev.clientX, ev.clientY);
+    dragNode.x = w.x; dragNode.y = w.y; draw();
+  } else if (dragging) {
+    panX += ev.clientX - lastX; panY += ev.clientY - lastY;
+    lastX = ev.clientX; lastY = ev.clientY; draw();
+  }
+});
+window.addEventListener("mouseup", () => { dragNode = null; dragging = false; });
+canvas.addEventListener("wheel", (ev) => {
+  ev.preventDefault();
+  const factor = ev.deltaY < 0 ? 1.1 : 1 / 1.1;
+  const w = fromScreen(ev.clientX, ev.clientY);
+  scale = Math.max(0.1, Math.min(6, scale * factor));
+  panX = ev.clientX - w.x * scale; panY = ev.clientY - w.y * scale; draw();
+}, { passive: false });
+
+// --- legend ----------------------------------------------------------------
+(function legend() {
+  const el = document.getElementById("legend");
+  const seen = new Map();
+  for (const n of GRAPH.nodes) if (!seen.has(n.type)) seen.set(n.type, n.color);
+  for (const [type, color] of seen) {
+    const sw = document.createElement("span");
+    sw.className = "swatch"; sw.style.background = color;
+    const lb = document.createElement("span"); lb.textContent = type;
+    el.appendChild(sw); el.appendChild(lb);
+  }
+  if (GRAPH.nodes.some((n) => n.public)) {
+    const sw = document.createElement("span");
+    sw.className = "swatch exposed"; sw.style.background = "transparent";
+    const lb = document.createElement("span"); lb.textContent = "public IP (exposed)";
+    el.appendChild(sw); el.appendChild(lb);
+  }
+})();
+
+resize();
 </script>
 </body>
 </html>

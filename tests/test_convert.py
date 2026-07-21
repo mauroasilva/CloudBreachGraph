@@ -208,3 +208,84 @@ def test_convert_too_large_does_not_clobber_input_dot(graph, tmp_path, monkeypat
     assert rc == 0
     assert dp.read_text() == before  # input untouched
     assert "too large" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- #
+# Ringed layout (--ringed)
+# --------------------------------------------------------------------------- #
+def test_ringed_view_data_groups_by_vpc_and_ring(graph):
+    # Every node in the fixture resolves under the one VPC; rings split by type.
+    group = html_export._vpc_group_of(graph)
+    vpc = next(n for n in graph.nodes if n.type == "vpc")
+    assert all(g == vpc.id for g in group.values())  # single-VPC fixture -> one cluster
+
+    data = html_export._ringed_view_data(graph)
+    assert len(data["clusters"]) == 1
+    cluster = data["clusters"][0]
+    assert cluster["label"] == vpc.label
+    assert 0 < cluster["r1"] < cluster["r2"]  # inner (subnets) inside outer (everything else)
+
+    pos = {n["id"]: n for n in data["nodes"]}
+    # The VPC sits at the cluster center; subnets on the inner ring; ENIs on the outer ring.
+    assert (pos[vpc.id]["x"], pos[vpc.id]["y"]) == (cluster["cx"], cluster["cy"])
+    for n in graph.nodes:
+        d = round(
+            ((pos[n.id]["x"] - cluster["cx"]) ** 2 + (pos[n.id]["y"] - cluster["cy"]) ** 2) ** 0.5,
+            1,
+        )
+        if n.type == "vpc":
+            assert d == 0.0
+        elif n.type == "subnet":
+            assert d == round(cluster["r1"], 1)
+        else:
+            assert d == round(cluster["r2"], 1)
+
+
+def test_ringed_unassigned_nodes_form_their_own_cluster():
+    # An ENI in no subnet (thus no VPC) collects into the trailing "unassigned" cluster.
+    collected = {
+        "meta": {},
+        "network_interfaces": [
+            {
+                "NetworkInterfaceId": "eni-lonely",
+                "SubnetId": None,
+                "VpcId": None,
+                "InterfaceType": "interface",
+                "Description": "",
+                "Attachment": {"InstanceId": None},
+                "PrivateIpAddresses": [],
+                "Groups": [],
+            }
+        ],
+    }
+    g = build_graph(collected)
+    group = html_export._vpc_group_of(g)
+    assert group["eni-lonely"] == html_export._UNASSIGNED
+    data = html_export._ringed_view_data(g)
+    assert data["clusters"][-1]["label"] == "unassigned"
+
+
+def test_ringed_build_is_deterministic(graph):
+    assert html_export.build_ringed_html(graph) == html_export.build_ringed_html(graph)
+
+
+def test_convert_ringed_json_to_html(graph, tmp_path):
+    jp = json_export.write_json(graph, tmp_path / "graph.json")
+    rc = convert.main([str(jp), "--ringed", "-o", str(tmp_path / "ringed.html")])
+    assert rc == 0
+    text = (tmp_path / "ringed.html").read_text()
+    assert text.startswith("<!DOCTYPE html>")
+    assert "ringed" in text  # ringed title/HUD
+    # Reproduces exactly what the ringed writer produces directly.
+    assert text == html_export.build_ringed_html(graph)
+
+
+def test_convert_ringed_falls_back_to_dot_when_too_large(graph, tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(html_export, "MAX_NODES", 0)
+    jp = json_export.write_json(graph, tmp_path / "graph.json")
+    out = tmp_path / "big.html"
+    rc = convert.main([str(jp), "--ringed", "-o", str(out)])
+    assert rc == 0
+    assert not out.exists()  # HTML skipped
+    assert (tmp_path / "big.dot").is_file()  # fallback .dot written
+    assert "too large" in capsys.readouterr().err

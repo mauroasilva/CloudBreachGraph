@@ -207,6 +207,48 @@ def test_write_html_size_guard_defaults_allow_small_graph(tmp_path):
     assert path is not None and path.is_file()
 
 
+# --------------------------------------------------------------------------- #
+# HTML export — ringed layout
+# --------------------------------------------------------------------------- #
+def test_write_ringed_html_is_self_contained(graph, tmp_path):
+    path = html_export.write_ringed_html(graph, tmp_path / "ringed.html")
+    assert path is not None and path.is_file()
+    text = path.read_text()
+    assert text.startswith("<!DOCTYPE html>")
+    assert text.rstrip().endswith("</html>")
+    # Fully self-contained: no external assets / network references at all.
+    assert "http://" not in text and "https://" not in text
+    assert "<script src" not in text and 'link rel="stylesheet"' not in text
+    assert "__GRAPH_DATA__" not in text and "const GRAPH =" in text
+    # Ringed page: precomputed positions + cluster ring guides, NOT a force simulation.
+    assert "GRAPH.clusters" in text
+    assert "REPULSION" not in text and "requestAnimationFrame" not in text
+    assert "eni-00instance0000001" in text
+
+
+def test_write_ringed_html_is_deterministic(graph, tmp_path):
+    a = html_export.write_ringed_html(graph, tmp_path / "a.html").read_text()
+    b = html_export.write_ringed_html(graph, tmp_path / "b.html").read_text()
+    assert a == b  # positions computed from sorted nodes/edges; no timestamps
+
+
+def test_write_ringed_html_embeds_public_exposure(graph, tmp_path):
+    text = html_export.write_ringed_html(graph, tmp_path / "ringed.html").read_text()
+    assert '"public": true' in text
+
+
+def test_write_ringed_html_falls_back_when_too_many_nodes(graph, tmp_path):
+    result = html_export.write_ringed_html(graph, tmp_path / "ringed.html", max_nodes=0)
+    assert result is None
+    assert not (tmp_path / "ringed.html").exists()
+
+
+def test_write_ringed_html_falls_back_when_too_many_bytes(graph, tmp_path):
+    result = html_export.write_ringed_html(graph, tmp_path / "ringed.html", max_bytes=10)
+    assert result is None
+    assert not (tmp_path / "ringed.html").exists()
+
+
 def test_render_without_dot_returns_none(graph, tmp_path, monkeypatch):
     dot_path = dot_export.write_dot(graph, tmp_path / "graph.dot")
     monkeypatch.setattr(dot_export.shutil, "which", lambda _: None)
