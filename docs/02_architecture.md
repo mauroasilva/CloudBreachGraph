@@ -236,6 +236,27 @@ Requirements:
   N barycenter passes (`html_export._optimize_cluster`) that reorder nodes *within* their rings
   to pull connected nodes together (fewer crossing edges) and then nudge apart any overlaps —
   rings preserved, output still deterministic; `N=0` (default) is the exact ENI-aligned layout.
+- **Anonymising existing output** (`cloudbreachgraph-anonymize`, `anonymize.py`): an auxiliary
+  console entry point that rewrites a previously written `graph.json` into a scrubbed copy safe
+  to share as a debugging/example graph. It **keeps every node and edge** but replaces all
+  identifying *values* — resource ids, ARNs, IPv4 addresses/CIDRs, DNS names, 12-digit account
+  ids, regions/AZs, hash tokens, and human names/labels — with random, **format-preserving**
+  stand-ins (a private IP stays private, a `/24` stays a `/24`, an id keeps its prefix and
+  suffix length, an AZ keeps its region-consistent letter). The invariant is **referential
+  consistency**: `Anonymizer` scans every string value with an ordered regex battery (CIDR,
+  IPv4, resource id, account, AZ, region, hex hash, digit run — overlaps resolved
+  longest-first via per-string span consumption), treats any `id`/`label` with *no* pattern
+  match as a human name, builds one **injective** source→replacement map (seeded by `--seed`
+  for reproducibility), then rewrites every value in a **single left-to-right alternation pass**
+  (longest token first) so a freshly-substituted value can never be re-scrambled. Because ARN
+  and DNS *components* (account, region, name, hash) are each their own token, an ARN or DNS
+  name is anonymised piecewise and stays consistent with the same tokens wherever else they
+  appear (edge targets, ENI `Description`). Dict **keys** and non-string scalars are left
+  untouched, so structural vocabulary (`type`, `relationship`, attribute keys, `match_rule`)
+  survives verbatim. Output round-trips through `graph_from_dict` → `write_json`, so it's the
+  same sorted/deterministic shape as every other writer. Read-only and AWS-free (local file
+  I/O only). Known limitation: literal-substring replacement can over-match a human name that
+  is also a substring of structural text (e.g. a VPC named `network`).
 
 ## 8. Regions
 
