@@ -4,7 +4,8 @@ Covers every rule in ``docs/02_architecture.md §5`` plus the graph invariants r
 ``docs/03_phase_plan.md``:
 
 * instance-attached ENI, ALB ENI, NLB ENI, Classic-ELB ENI,
-* unattached service ENI (NAT gateway), InterfaceType fallback,
+* NAT-gateway ENI and VPC-endpoint ENI (owned via their resource's ENI list), InterfaceType
+  fallback,
 * missing-subnet / missing-VPC synthetic nodes,
 * no ENI attached to both instance and LB; one ``in_subnet`` per ENI; one ``in_vpc`` per subnet;
 * deterministic ordering.
@@ -28,6 +29,8 @@ _COMMAND_FIXTURES = {
     ("ec2", "describe-vpcs"): "ec2_describe-vpcs.json",
     ("ec2", "describe-security-groups"): "ec2_describe-security-groups.json",
     ("ec2", "describe-route-tables"): "ec2_describe-route-tables.json",
+    ("ec2", "describe-nat-gateways"): "ec2_describe-nat-gateways.json",
+    ("ec2", "describe-vpc-endpoints"): "ec2_describe-vpc-endpoints.json",
 }
 
 
@@ -249,15 +252,91 @@ def test_classic_elb_eni_matches_by_name():
 
 
 # --------------------------------------------------------------------------- #
-# §5.4 tail — unattached service ENI (NAT gateway)
+# §5.4 — NAT gateway ENI attribution (owned via NatGatewayAddresses[].NetworkInterfaceId)
 # --------------------------------------------------------------------------- #
-def test_nat_gateway_eni_has_no_attachment(full_bundle):
+def test_nat_gateway_eni_attaches_to_its_nat_gateway(full_bundle):
     graph = build_graph(full_bundle)
     eni_id = "eni-00natgw000000004"
-    assert _attached_targets(graph, eni_id) == []
+    attached = _attached_targets(graph, eni_id)
+    assert len(attached) == 1
+    edge = attached[0]
+    assert edge.target == "nat-0abc00000000005"
+    assert edge.attributes == {"match_rule": "nat_gateway_address"}
+    nat = graph.get_node("nat-0abc00000000005")
+    assert nat.type == "nat_gateway"
+    assert nat.label == "prod-natgw"
+    assert nat.attributes["state"] == "available"
+    assert nat.attributes["public_ips"] == ["34.201.10.20"]
     # Still mapped to its subnet, and tagged with its interface type so the map explains it.
     assert len(_edges_from(graph, eni_id, "in_subnet")) == 1
     assert graph.get_node(eni_id).attributes["interface_type"] == "nat_gateway"
+
+
+# --------------------------------------------------------------------------- #
+# §5.4 — VPC endpoint ENI attribution (owned via NetworkInterfaceIds[])
+# --------------------------------------------------------------------------- #
+def test_vpc_endpoint_eni_attaches_to_its_endpoint(full_bundle):
+    graph = build_graph(full_bundle)
+    eni_id = "eni-00vpce00000000006"
+    attached = _attached_targets(graph, eni_id)
+    assert len(attached) == 1
+    edge = attached[0]
+    assert edge.target == "vpce-0abc00000000006"
+    assert edge.attributes == {"match_rule": "vpc_endpoint_interface"}
+    vpce = graph.get_node("vpce-0abc00000000006")
+    assert vpce.type == "vpc_endpoint"
+    assert vpce.label == "secretsmanager-endpoint"
+    assert vpce.attributes["service_name"].endswith("secretsmanager")
+
+
+def test_nat_gateway_and_endpoint_own_at_most_one_eni_each(full_bundle):
+    # The ownership map keys on the ENI id each resource publishes, so an ENI attaches once.
+    graph = build_graph(full_bundle)
+    for eni_id in ("eni-00natgw000000004", "eni-00vpce00000000006"):
+        assert len(_attached_targets(graph, eni_id)) == 1
+
+
+def test_instance_attachment_still_wins_over_owner_map():
+    # If an ENI were both instance-attached AND in an owner list, §5.3 keeps the instance.
+    bundle = _bundle(
+        network_interfaces=[_eni("eni-dual", instance_id="i-dual")],
+        nat_gateways=[
+            {
+                "NatGatewayId": "nat-dual",
+                "VpcId": "vpc-1",
+                "SubnetId": "subnet-1",
+                "State": "available",
+                "ConnectivityType": "public",
+                "NatGatewayAddresses": [{"NetworkInterfaceId": "eni-dual", "PublicIp": "1.2.3.4"}],
+                "Tags": [],
+            }
+        ],
+    )
+    graph = build_graph(bundle)
+    attached = _attached_targets(graph, "eni-dual")
+    assert len(attached) == 1
+    assert attached[0].target == "i-dual"  # instance wins; NAT gateway ignored
+
+
+def test_gateway_endpoint_without_enis_is_hidden_unless_orphans():
+    # A Gateway (S3/DynamoDB) endpoint owns no ENI -> no attribution; only shown with orphans.
+    bundle = _bundle(
+        network_interfaces=[_eni("eni-a")],
+        vpc_endpoints=[
+            {
+                "VpcEndpointId": "vpce-gw",
+                "VpcEndpointType": "Gateway",
+                "VpcId": "vpc-1",
+                "ServiceName": "com.amazonaws.us-east-1.s3",
+                "State": "available",
+                "NetworkInterfaceIds": [],
+                "SubnetIds": [],
+                "Tags": [],
+            }
+        ],
+    )
+    assert build_graph(bundle).get_node("vpce-gw") is None
+    assert build_graph(bundle, include_orphans=True).get_node("vpce-gw") is not None
 
 
 # --------------------------------------------------------------------------- #

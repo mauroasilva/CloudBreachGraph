@@ -86,7 +86,7 @@ _NAME_NOUN: tuple[str, ...] = (
 # AWS resource-id prefixes we anonymise (kept as-is; only the suffix is scrambled). Longest
 # first so the alternation prefers e.g. ``eipalloc`` over a shorter accidental match.
 _ID_PREFIXES: tuple[str, ...] = (
-    "eipalloc", "eni-attach", "subnet", "igw", "vgw", "tgw", "pcx", "rtb", "acl", "nacl",
+    "eipalloc", "eni-attach", "subnet", "vpce", "igw", "vgw", "tgw", "pcx", "rtb", "acl", "nacl",
     "dopt", "snap", "vpc", "eni", "sg", "nat", "ami", "vol", "lgw", "fl", "i",
 )  # fmt: skip
 

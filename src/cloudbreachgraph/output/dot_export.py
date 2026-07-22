@@ -41,6 +41,10 @@ _TYPE_STYLE: dict[str, tuple[str, str]] = {
     "eni": ("#E8F5E9", "ellipse"),  # light green
     "ec2_instance": ("#FFF3E0", "box3d"),  # light orange
     "load_balancer": ("#F3E5F5", "component"),  # light purple
+    # NAT gateways / VPC endpoints share the load balancer's role class (network in/out of the
+    # VPC), so they use the ``component`` shape too, in their own distinct fills (§5.4).
+    "nat_gateway": ("#E0F2F1", "component"),  # teal
+    "vpc_endpoint": ("#E8EAF6", "component"),  # indigo tint
     # Reachability sources (docs/02_architecture.md §5.5) — who can reach an ENI.
     "internet": ("#FFEBEE", "doubleoctagon"),  # the whole internet (0.0.0.0/0 / ::/0), per-ENI
     "cidr": ("#FFF8E1", "note"),  # a specific source CIDR
@@ -84,8 +88,14 @@ def _node_vpc(
     if node.type == "eni":
         subnet = subnet_of_eni.get(node.id)
         return vpc_of_subnet.get(subnet) if subnet else None
-    if node.type in ("ec2_instance", "load_balancer", "security_group"):
-        # Security groups are VPC-scoped; cluster them with their VPC when known (§5.5).
+    if node.type in (
+        "ec2_instance",
+        "load_balancer",
+        "nat_gateway",
+        "vpc_endpoint",
+        "security_group",
+    ):
+        # These are all VPC-scoped; cluster them with their VPC when known (§5.4/§5.5).
         return node.attributes.get("vpc_id")
     return None
 
@@ -110,6 +120,13 @@ def _node_lines(node: Node) -> list[str]:
             lines.append("Public IP: " + ", ".join(attrs["public_ips"]))
     elif node.type == "load_balancer" and attrs.get("lb_type"):
         lines.append(str(attrs["lb_type"]))
+    elif node.type == "nat_gateway":
+        if attrs.get("state"):
+            lines.append(str(attrs["state"]))
+        if attrs.get("public_ips"):
+            lines.append("Public IP: " + ", ".join(attrs["public_ips"]))
+    elif node.type == "vpc_endpoint" and attrs.get("service_name"):
+        lines.append(str(attrs["service_name"]))
     elif node.type == "subnet" and attrs.get("cidr"):
         lines.append(str(attrs["cidr"]))
     elif node.type == "vpc" and attrs.get("cidr"):

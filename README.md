@@ -1,9 +1,9 @@
 # CloudBreachGraph
 
 A read-only command-line tool that maps an AWS account's network topology — Network
-Interfaces (ENIs) → EC2 instances / load balancers → subnets → VPCs — using the **AWS
-CLI** (not boto3) as its data source. Output is a graph you can serialize to JSON and
-render with Graphviz.
+Interfaces (ENIs) → their owner (EC2 instance, load balancer, NAT gateway or VPC endpoint) →
+subnets → VPCs — using the **AWS CLI** (not boto3) as its data source. Output is a graph you
+can serialize to JSON and render with Graphviz.
 
 CloudBreachGraph is **read-only by construction**: it only ever runs AWS `describe-*`
 calls plus the read-only `sts get-caller-identity` check. It never mutates your account.
@@ -191,6 +191,26 @@ cloudbreachgraph --from-cache tests/fixtures --output-dir out/
 With `--all-accounts` the files are named per account: `graph.<alias>.json` / `.dot`
 (and `.html` with `--html`).
 
+## ENI ownership (who owns each interface)
+
+Every ENI is attributed to the resource that **owns** it, so the map has no ownerless interfaces.
+Each ENI attaches to **at most one** owner, resolved in priority order (the rule that matched is
+recorded on the edge as `match_rule`):
+
+| Owner | Node type | How it's attributed |
+|-------|-----------|---------------------|
+| EC2 instance | `ec2_instance` | `Attachment.InstanceId` (wins over everything) |
+| NAT gateway | `nat_gateway` | `aws ec2 describe-nat-gateways` → `NatGatewayAddresses[].NetworkInterfaceId` |
+| VPC endpoint (Interface / GWLB) | `vpc_endpoint` | `aws ec2 describe-vpc-endpoints` → `NetworkInterfaceIds[]` |
+| Load balancer (ALB/NLB/GWLB/Classic) | `load_balancer` | ENI `Description` (`ELB app/…`, `ELB <name>`) |
+
+NAT gateways and VPC endpoints are attributed from each resource's **own authoritative ENI list**
+(no fragile description parsing), and — because they move traffic in and out of the VPC, a role
+much like a load balancer's — they render into the **same visual ring/layer as the load
+balancers**. A handful of service ENIs (RDS, Lambda, EFS, …) still have no owner because AWS
+offers no clean ENI-ownership list for them yet; they stay attached to just their subnet/VPC,
+tagged with their `InterfaceType`. See `docs/05_roadmap.md`.
+
 ## ENI reachability (who can connect)
 
 Beyond mapping what each ENI *is*, CloudBreachGraph maps **how each ENI is reachable**. It reads
@@ -281,7 +301,8 @@ cloudbreachgraph-to-html docs/examples/example-graph.json --ringed -o example.ht
 Pass `--ringed` to render a **concentric-ringed** view instead of the force-directed one:
 each **VPC** sits at the center of its own cluster, ringed by its **subnets**, then its
 **ENIs** on their own dedicated ring, then **everything else** under that VPC (EC2 instances,
-load balancers), then a **security-group** ring, then a final **outermost ring** of the **IP
+load balancers, and the **NAT gateways / VPC endpoints** that share the load balancer's role
+class), then a **security-group** ring, then a final **outermost ring** of the **IP
 sources** (`Internet` / CIDR nodes). With `--no-security-groups` the security-group ring is empty
 and the source ring nests straight onto the ENIs. The ENI ring is the **angular anchor**: each
 **subnet** is placed at the **mean angle of the ENIs it contains** (and ENIs are grouped by subnet

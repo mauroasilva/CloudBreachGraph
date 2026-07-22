@@ -72,6 +72,8 @@ flags. The AWS CLI auto-paginates by default, returning the full result set.
 | VPCs | `aws ec2 describe-vpcs --region <r>` | `.Vpcs[]` |
 | Security Groups | `aws ec2 describe-security-groups --region <r>` | `.SecurityGroups[]` |
 | Route Tables | `aws ec2 describe-route-tables --region <r>` | `.RouteTables[]` |
+| NAT Gateways | `aws ec2 describe-nat-gateways --region <r>` | `.NatGateways[]` |
+| VPC Endpoints | `aws ec2 describe-vpc-endpoints --region <r>` | `.VpcEndpoints[]` |
 | Caller identity (account check) | `aws sts get-caller-identity` | `.Account`, `.Arn` |
 
 Notes for the collection layer (Phase 1):
@@ -120,6 +122,17 @@ Notes for the collection layer (Phase 1):
 sources: `IpRanges[].CidrIp` (IPv4), `Ipv6Ranges[].CidrIpv6` (IPv6), and `UserIdGroupPairs[].GroupId`
 (a referencing security group). An ENI's `Groups[].GroupId` (see above) says which SGs apply to it.
 
+**NAT Gateway** (`.NatGateways[]`): `NatGatewayId`, `VpcId`, `SubnetId`, `State`,
+`ConnectivityType` (`public`/`private`), `Tags[]` (Name), and `NatGatewayAddresses[]` — each with
+`NetworkInterfaceId` (**the authoritative ENI-ownership signal**, §5.4) and `PublicIp`. A NAT
+gateway owns one ENI per address it holds.
+
+**VPC Endpoint** (`.VpcEndpoints[]`): `VpcEndpointId`, `VpcEndpointType`
+(`Interface`/`Gateway`/`GatewayLoadBalancer`), `VpcId`, `ServiceName`, `State`, `Tags[]` (Name),
+and `NetworkInterfaceIds[]` — the ENIs an **Interface**/**GatewayLoadBalancer** endpoint owns
+(§5.4). A **Gateway** endpoint (S3/DynamoDB) owns **no** ENI (it is a route-table target), so its
+list is empty.
+
 **Route Table** (`.RouteTables[]`): `RouteTableId`, `VpcId`, `Associations[]` (`SubnetId`, `Main`
 — the VPC's implicit fallback RT), `Routes[]` (`DestinationCidrBlock`/`DestinationIpv6CidrBlock`,
 the next-hop id in one of `GatewayId` (`local`/`igw-`/`vgw-`), `NatGatewayId`, `TransitGatewayId`,
@@ -145,11 +158,25 @@ If `Attachment.InstanceId` is present **and** non-empty → edge `attached_to` f
 that EC2 instance node. This is the unambiguous, preferred signal. When it's present, the
 ENI is instance-attached and you do **not** also attribute it to a load balancer.
 
-### 5.4 ENI → Load Balancer  (the tricky one)
-Service-managed ENIs (no `Attachment.InstanceId`) may belong to a load balancer. Resolve in
-this priority order and record which rule fired in edge metadata (`match_rule`):
+### 5.4 ENI → owner (NAT gateway / VPC endpoint / load balancer)
+A service-managed ENI (no `Attachment.InstanceId`) belongs to some **owning resource**. The goal
+is that **every** ENI resolves to an owner, not just instance- and LB-fronted ones. Resolve in
+this priority order, attaching at most one owner and recording which rule fired in edge metadata
+(`match_rule`):
 
-1. **ELBv2 (ALB/NLB/GWLB) via Description prefix.** ELBv2-owned ENIs have a `Description`
+1. **NAT gateway / VPC endpoint via the resource's own ENI list (authoritative).** These owners
+   publish exactly which ENIs they hold, so we key on the ENI id directly — no fragile description
+   parsing:
+   - a NAT gateway's `NatGatewayAddresses[].NetworkInterfaceId` → edge `attached_to`
+     (ENI → `nat_gateway` node), `match_rule = "nat_gateway_address"`.
+   - a VPC endpoint's `NetworkInterfaceIds[]` → edge `attached_to` (ENI → `vpc_endpoint` node),
+     `match_rule = "vpc_endpoint_interface"`.
+
+   NAT gateways and VPC endpoints share the load balancer's **role class** — they move traffic in
+   and out of the VPC — so they render into the same visual ring/layer as the load balancers
+   (`§7`, `_ring_of`).
+
+2. **ELBv2 (ALB/NLB/GWLB) via Description prefix.** ELBv2-owned ENIs have a `Description`
    shaped like:
    - ALB: `ELB app/<lb-name>/<lb-id>`
    - NLB: `ELB net/<lb-name>/<lb-id>`
@@ -158,23 +185,25 @@ this priority order and record which rule fired in edge metadata (`match_rule`):
    suffix of each ELBv2 `LoadBalancerArn` (the ARN ends with `:loadbalancer/app/<name>/<id>`).
    On match → edge `attached_to` (ENI → that load balancer), `match_rule = "elbv2_description"`.
 
-2. **Classic ELB via Description.** Classic-ELB ENIs have `Description = "ELB <lb-name>"`
+3. **Classic ELB via Description.** Classic-ELB ENIs have `Description = "ELB <lb-name>"`
    (no `app/`/`net/` segment). Match `<lb-name>` against Classic `LoadBalancerName`.
    On match → edge `attached_to`, `match_rule = "classic_elb_description"`.
 
-3. **InterfaceType fallback.** If `InterfaceType == "network_load_balancer"` or
+4. **InterfaceType fallback.** If `InterfaceType == "network_load_balancer"` or
    `"gateway_load_balancer"` but the description didn't resolve to a known LB, still create
    the LB-type attachment to an `unresolved` load balancer node keyed by the parsed name,
    and flag it. Record `match_rule = "interface_type_fallback"`.
 
-If none of these fire, the ENI has **no** compute/LB attachment (e.g. NAT gateway, VPC
-endpoint, RDS, Lambda ENI). That's expected — leave it attached only to its subnet/VPC and
-tag the ENI node with its `InterfaceType` so the map still explains what it is. Do **not**
-invent an attachment.
+If none of these fire, the ENI has **no** resolvable owner yet (e.g. RDS, Lambda, ElastiCache,
+EFS mount-target ENIs — service-managed ENIs identified only by description/requester, without a
+clean authoritative `describe-*` ENI list). That's expected — leave it attached only to its
+subnet/VPC and tag the ENI node with its `InterfaceType` so the map still explains what it is. Do
+**not** invent an attachment. These are the follow-up owners to add next (see `docs/05_roadmap.md`).
 
-> **Edge-case guidance to capture in `learnings_phase2.md`:** the `ELB ` description format
-> is the documented, stable way to attribute ELB ENIs; verify against a real capture and note
-> any account where it didn't hold. Never attribute an ENI to both an instance and an LB.
+> **Edge-case guidance:** the NAT-gateway/VPC-endpoint ENI lists and the `ELB ` description format
+> are the documented, stable attribution signals; verify against a real capture and note any
+> account where they didn't hold. Never attribute an ENI to more than one owner — instance
+> attachment (§5.3) always wins over every owner in this section.
 
 ### 5.5 ENI reachability — who can connect to it (security-group inbound rules)
 
@@ -253,7 +282,8 @@ A minimal, serialization-friendly model:
 Node:
   id:    str            # eni-..., i-..., subnet-..., vpc-..., LB arn/name, or a reachability
                         #   source: internet:<eni>, cidr:<cidr>, sg-source:<gid>
-  type:  str            # "eni" | "ec2_instance" | "load_balancer" | "subnet" | "vpc"
+  type:  str            # "eni" | "ec2_instance" | "load_balancer" | "nat_gateway"
+                        #   | "vpc_endpoint" | "subnet" | "vpc"
                         #   | "security_group" | "internet" | "cidr"   (reachability, §5.5)
   label: str            # human-friendly (Name tag or id)
   attributes: dict      # type-specific metadata (state, cidr, interface_type, synthetic, ...)
@@ -284,8 +314,10 @@ Requirements:
 - **JSON** (`graph.json`): `Graph.to_dict()`, pretty-printed, stable ordering.
 - **Graphviz DOT** (`graph.dot`): nodes grouped/colored by type; edge labels show the
   relationship (and `match_rule` for LB edges, `ports` for `can_reach` edges, when useful).
-  Consider `subgraph cluster_*` per VPC so the layout groups subnets/ENIs (and `security_group`
-  nodes, which are VPC-scoped) inside their VPC visually. Reachability (§5.5): with SGs shown each
+  Consider `subgraph cluster_*` per VPC so the layout groups subnets/ENIs (and `security_group`,
+  `nat_gateway` and `vpc_endpoint` nodes, which are VPC-scoped) inside their VPC visually.
+  `nat_gateway`/`vpc_endpoint` share the load balancer's role class, so they get the same
+  `component` shape (distinct fills). Reachability (§5.5): with SGs shown each
   ENI has a dashed `secured_by` edge to its SG and the `internet`/`cidr` sources link to the SG;
   hidden, the sources link straight to the ENIs and the edge is colored by **routability** (§5.6):
   `routable_can_reach` solid red, `not_routable_can_reach` grey dashed, plain `can_reach` default.
@@ -327,7 +359,7 @@ Requirements:
   guard and `.dot` fallback. Its `--ringed` flag selects an alternative **concentric-ringed** layout
   (`html_export.write_ringed_html`/`build_ringed_html`): each VPC is a cluster center, ringed
   by its subnets, then its ENIs on a dedicated ring, then everything else under that VPC (EC2
-  instances, load balancers), then a **security-group** ring, then a new **outermost** ring of the
+  instances, load balancers, NAT gateways, VPC endpoints), then a **security-group** ring, then a new **outermost** ring of the
   IP sources (`internet`/`cidr`, §5.5). The ENI ring is the angular anchor: each subnet is placed at
   the mean angle of the ENIs it contains (ENIs are grouped by subnet on their ring), each
   EC2/LB at the mean angle of the ENIs attached to it, each security group at the mean angle of the
@@ -507,7 +539,7 @@ form an extensible registry; new features add new roles without changing the con
 
 | Role | Resources | Status |
 |------|-----------|--------|
-| `network` | ENIs, EC2 instances, load balancers, subnets, VPCs, security groups (everything in §3 today) | **v1** |
+| `network` | ENIs, EC2 instances, load balancers, NAT gateways, VPC endpoints, subnets, VPCs, security groups, route tables (everything in §3 today) | **v1** |
 | `flow_logs` | VPC Flow Logs (CloudWatch Logs log groups / S3), the flow-log configs on VPCs/subnets/ENIs | **future** (design for it now, don't build in v1) |
 
 Additional future roles (e.g. `dns`, `cloudtrail`) plug in the same way. See `05_roadmap.md`.
@@ -600,6 +632,8 @@ ROLE_COLLECTORS: dict[str, list[Collector]] = {
         collect_vpcs,                 # aws ec2   describe-vpcs                 -> .Vpcs[]
         collect_security_groups,      # aws ec2   describe-security-groups      -> .SecurityGroups[]
         collect_route_tables,         # aws ec2   describe-route-tables         -> .RouteTables[]
+        collect_nat_gateways,         # aws ec2   describe-nat-gateways         -> .NatGateways[]
+        collect_vpc_endpoints,        # aws ec2   describe-vpc-endpoints        -> .VpcEndpoints[]
     ],
     # ── future (Phase 4; do NOT implement in v1, see 05_roadmap.md) ───────────────
     # "flow_logs": [
@@ -611,7 +645,8 @@ ROLE_COLLECTORS: dict[str, list[Collector]] = {
 # The output key each role writes into the collected bundle (see §11.7).
 ROLE_RESULT_KEYS: dict[str, list[str]] = {
     "network": ["network_interfaces", "ec2_instances", "load_balancers_v2",
-                "load_balancers_classic", "subnets", "vpcs", "security_groups", "route_tables"],
+                "load_balancers_classic", "subnets", "vpcs", "security_groups", "route_tables",
+                "nat_gateways", "vpc_endpoints"],
     # "flow_logs": ["flow_logs", "log_destinations"],  # future
 }
 ```

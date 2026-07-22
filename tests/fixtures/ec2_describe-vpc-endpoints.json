@@ -1,0 +1,14 @@
+{
+  "VpcEndpoints": [
+    {
+      "VpcEndpointId": "vpce-0abc00000000006",
+      "VpcEndpointType": "Interface",
+      "VpcId": "vpc-0aaaaaaaaaaaaaaaa",
+      "ServiceName": "com.amazonaws.us-east-1.secretsmanager",
+      "State": "available",
+      "SubnetIds": ["subnet-022222222222222"],
+      "NetworkInterfaceIds": ["eni-00vpce00000000006"],
+      "Tags": [{"Key": "Name", "Value": "secretsmanager-endpoint"}]
+    }
+  ]
+}

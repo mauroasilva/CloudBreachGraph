@@ -34,6 +34,8 @@ _COMMAND_FIXTURES = {
     ("ec2", "describe-vpcs"): "ec2_describe-vpcs.json",
     ("ec2", "describe-security-groups"): "ec2_describe-security-groups.json",
     ("ec2", "describe-route-tables"): "ec2_describe-route-tables.json",
+    ("ec2", "describe-nat-gateways"): "ec2_describe-nat-gateways.json",
+    ("ec2", "describe-vpc-endpoints"): "ec2_describe-vpc-endpoints.json",
 }
 
 
