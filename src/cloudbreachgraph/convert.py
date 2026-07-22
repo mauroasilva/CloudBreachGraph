@@ -63,6 +63,16 @@ def build_parser() -> argparse.ArgumentParser:
         "pull connected nodes together (fewer crossing edges) and nudge apart any overlaps. "
         "0 (default) keeps the deterministic ENI-aligned placement.",
     )
+    p.add_argument(
+        "--max-passes",
+        type=int,
+        default=0,
+        metavar="N",
+        help="render the overlap-free layout: run up to N graph-optimisation passes that spread "
+        "the nodes so no two node disks overlap and no edge is drawn across a node, then minimise "
+        "edge crossings as a secondary goal. Stops early once it converges. 0 (default) keeps the "
+        "force-directed / ringed layout. Takes precedence over --ringed / --optimize-passes.",
+    )
     return p
 
 
@@ -74,6 +84,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.optimize_passes < 0:
         print("cloudbreachgraph-to-html: --optimize-passes must be >= 0", file=sys.stderr)
         return 2
+    if args.max_passes < 0:
+        print("cloudbreachgraph-to-html: --max-passes must be >= 0", file=sys.stderr)
+        return 2
 
     try:
         graph = load_graph(in_path, fmt=args.format)
@@ -81,7 +94,22 @@ def main(argv: list[str] | None = None) -> int:
         print(f"cloudbreachgraph-to-html: {exc}", file=sys.stderr)
         return 2
 
-    if args.ringed:
+    if args.max_passes > 0:
+        # The overlap-free layout is its own thing; the ringed knobs don't apply to it.
+        if args.ringed:
+            print(
+                "cloudbreachgraph-to-html: warning: --max-passes renders the overlap-free "
+                "layout; ignoring --ringed.",
+                file=sys.stderr,
+            )
+        if args.optimize_passes:
+            print(
+                "cloudbreachgraph-to-html: warning: --max-passes renders the overlap-free "
+                "layout; ignoring --optimize-passes.",
+                file=sys.stderr,
+            )
+        result = html_export.write_optimized_html(graph, out_path, max_passes=args.max_passes)
+    elif args.ringed:
         result = html_export.write_ringed_html(graph, out_path, passes=args.optimize_passes)
     else:
         if args.optimize_passes:

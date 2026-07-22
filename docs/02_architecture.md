@@ -242,7 +242,23 @@ Requirements:
   (`_reduce_crossings`) relocates each node to the same-ring slot with the fewest incident edge
   crossings — a monotone minimiser (moving one node only changes crossings on its own edges), it
   clears whole spokes the barycenter passes leave crossing. Rings preserved, output
-  deterministic; `N=0` (default) is the exact ENI-aligned layout.
+  deterministic; `N=0` (default) is the exact ENI-aligned layout. The `--max-passes N` flag
+  instead selects a third, **overlap-free** layout (`html_export.write_optimized_html`/
+  `build_optimized_html`, sharing the draw-only template via `_render_static_layout`): it runs up
+  to N deterministic *optimisation passes* — a cooled force-directed unfolding
+  (`_OPT_FORCE_PASSES` cap) followed by hard geometric projection sweeps (`_optimize_layout`) —
+  and stops the moment the drawing has **zero node-node overlaps** and **zero edge-over-node
+  overlaps** (a non-incident node's disk intersecting an edge segment). Real topologies are
+  non-planar (the example graph's largest VPC alone contains a non-planar minor), so zero edge
+  *crossings* is impossible; this layout targets the two overlaps that hurt legibility instead. A
+  projection sweep that moves nothing certifies both counts are zero (`_count_overlaps` verifies).
+  A third **crossing-reduction** phase (`_reduce_crossings_free`, `_count_crossings`) then greedily
+  relocates each crossing-incident node to the nearby candidate slot with the fewest incident
+  crossings (a monotone move) and re-projects; it is a *secondary* objective (crossings ~halve on
+  the example graph, 39→18) that never sacrifices the overlap guarantee — if the relocation lands
+  somewhere the capped projection can't clear, the layout reverts to the phase-2 result.
+  `--max-passes` takes precedence over `--ringed`/`--optimize-passes`; `N=0` (default) keeps the
+  force/ringed layout. Same `MAX_NODES`/`MAX_HTML_BYTES` guard and `.dot` fallback.
 - **Anonymising existing output** (`cloudbreachgraph-anonymize`, `anonymize.py`): an auxiliary
   console entry point that rewrites a previously written `graph.json` into a scrubbed copy safe
   to share as a debugging/example graph. It **keeps every node and edge** but replaces all

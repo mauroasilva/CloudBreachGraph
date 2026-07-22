@@ -275,6 +275,36 @@ def test_write_ringed_html_falls_back_when_too_many_bytes(graph, tmp_path):
     assert not (tmp_path / "ringed.html").exists()
 
 
+# HTML export — overlap-free layout
+
+
+def test_write_optimized_html_is_self_contained(graph, tmp_path):
+    path = html_export.write_optimized_html(graph, tmp_path / "opt.html", max_passes=500)
+    assert path is not None
+    text = path.read_text()
+    assert text.startswith("<!DOCTYPE html>")
+    assert "overlap-free" in text
+    assert "http://" not in text and "https://" not in text
+
+
+def test_write_optimized_html_is_deterministic(graph, tmp_path):
+    a = html_export.write_optimized_html(graph, tmp_path / "a.html", max_passes=500).read_text()
+    b = html_export.write_optimized_html(graph, tmp_path / "b.html", max_passes=500).read_text()
+    assert a == b
+
+
+def test_write_optimized_html_falls_back_when_too_many_nodes(graph, tmp_path):
+    result = html_export.write_optimized_html(graph, tmp_path / "opt.html", max_nodes=0)
+    assert result is None
+    assert not (tmp_path / "opt.html").exists()
+
+
+def test_write_optimized_html_falls_back_when_too_many_bytes(graph, tmp_path):
+    result = html_export.write_optimized_html(graph, tmp_path / "opt.html", max_bytes=10)
+    assert result is None
+    assert not (tmp_path / "opt.html").exists()
+
+
 def test_render_without_dot_returns_none(graph, tmp_path, monkeypatch):
     dot_path = dot_export.write_dot(graph, tmp_path / "graph.dot")
     monkeypatch.setattr(dot_export.shutil, "which", lambda _: None)
