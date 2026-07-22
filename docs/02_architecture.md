@@ -252,6 +252,11 @@ Requirements:
   non-planar (the example graph's largest VPC alone contains a non-planar minor), so zero edge
   *crossings* is impossible; this layout targets the two overlaps that hurt legibility instead. A
   projection sweep that moves nothing certifies both counts are zero (`_count_overlaps` verifies).
+  A third **crossing-reduction** phase (`_reduce_crossings_free`, `_count_crossings`) then greedily
+  relocates each crossing-incident node to the nearby candidate slot with the fewest incident
+  crossings (a monotone move) and re-projects; it is a *secondary* objective (crossings ~halve on
+  the example graph, 39→18) that never sacrifices the overlap guarantee — if the relocation lands
+  somewhere the capped projection can't clear, the layout reverts to the phase-2 result.
   `--max-passes` takes precedence over `--ringed`/`--optimize-passes`; `N=0` (default) keeps the
   force/ringed layout. Same `MAX_NODES`/`MAX_HTML_BYTES` guard and `.dot` fallback.
 - **Anonymising existing output** (`cloudbreachgraph-anonymize`, `anonymize.py`): an auxiliary

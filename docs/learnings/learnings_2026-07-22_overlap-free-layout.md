@@ -5,10 +5,16 @@
   `--max-passes N` flag (the "max number of passes for graph optimisation").
 - `src/cloudbreachgraph/output/html_export.py`:
   - `_optimize_layout(nodes, edges, max_passes) -> int` — computes deterministic x/y that leave
-    **0 node-node overlaps** and **0 edge-over-node overlaps**; returns passes used.
+    **0 node-node overlaps** and **0 edge-over-node overlaps**, then minimises crossings as a
+    secondary goal; returns passes used.
   - `_seg_point_dist(...)` — point-to-segment distance helper (used by projection + counting).
   - `_count_overlaps(nodes, edges) -> (node_node, edge_node)` — strict overlap counter using the
     drawn radii (`_NODE_RADII`); the verification/acceptance oracle.
+  - `_separate_overlaps(...)` / `_has_overlap(...)` — one projection sweep / a strict feasibility
+    check, both operating on the internal `xs`/`ys` arrays.
+  - `_seg_seg_cross(...)` / `_count_crossings(nodes, edges)` — segment-crossing predicate + counter.
+  - `_reduce_crossings_free(...)` — the phase-3 greedy crossing-reduction local search + capped
+    final projection (see §3).
   - `_optimized_view_data`, `build_optimized_html`, `write_optimized_html` — payload/page/writer,
     mirroring the ringed trio's signatures and size-guard contract.
   - Refactor: the ringed page template `_RINGED_TEMPLATE` became a **shared** draw-only template
@@ -56,6 +62,18 @@
   rings and so can't clear edge-over-node overlaps that radial edges create).
 - **Shared template refactor** instead of a second ~230-line template copy — keeps modules small
   per `docs/04_conventions.md`.
+- **Crossing reduction is phase 3, secondary to overlaps** (follow-up requested after the first
+  cut). Greedy relocation of each crossing-incident node to the nearby candidate slot (neighbour
+  barycenter + a ring of probes) with the fewest *incident* crossings — monotone, so a strict
+  improvement can't raise the global total. It cut the example graph 39→18 crossings. Two traps
+  I hit and guarded:
+  - The post-relocation projection can **oscillate inside the `_OPT_MARGIN` band forever** (it
+    reports "moved" while the drawing is already strictly overlap-free), which burned the whole
+    10000-pass budget (117s). Fix: stop the final projection as soon as `_has_overlap` (strict, no
+    margin) is clean, and cap it at `_OPT_REDUCE_PROJECT_CAP` sweeps. Now ~405 passes / ~2.5s.
+  - If relocation ever lands in a genuinely tight spot the capped projection can't clear, revert
+    to the phase-2 positions (saved as `safe_xs/safe_ys`) so the **overlap guarantee always
+    holds** even at the cost of keeping more crossings.
 
 ## 4. Deviations from the plan
 - None structurally. `docs/05_roadmap.md` roles untouched (no new resource type). This is a
@@ -77,9 +95,10 @@
   `pyproject.toml` and nothing at runtime imports it. Runtime stays stdlib-only.
 
 ## 6. Known gaps / follow-ups
-- The overlap-free layout ignores edge *crossings* entirely (can't be zeroed). If a future
-  session wants "fewest crossings *and* no overlaps", it'd need a crossing term added to phase 1
-  and would still not hit zero.
+- Crossings are *minimised* best-effort (39→18 on the example), not zeroed — impossible on a
+  non-planar graph. The greedy phase-3 search is a local optimum; a stronger (e.g. subtree-move
+  or SA) search could push lower but with more runtime and no zero guarantee. `_OPT_REDUCE_SWEEPS`
+  / `_OPT_REDUCE_RADII` / `_OPT_REDUCE_ANGLES` are the tuning knobs.
 - Not wired into the main `cloudbreachgraph --html` path (that renders a browser-side force sim,
   no Python positions). Kept scope to the HTML-generation command the acceptance uses.
 - No perf tuning for near-`MAX_NODES` graphs beyond the existing byte/node guard.

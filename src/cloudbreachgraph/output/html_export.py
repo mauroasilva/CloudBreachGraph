@@ -32,7 +32,9 @@ optimisation passes and guarantees that, once it converges, **no two node disks 
 **no edge is drawn across a node it is not connected to** (an "edge overlap"). Real topologies
 are non-planar (the example graph's largest VPC alone contains a non-planar minor), so zero
 edge *crossings* is impossible — this layout instead removes the two overlaps that actually
-hurt readability. It shares the same size guard and ``.dot`` fallback as the other two.
+hurt readability and, as a **secondary** objective, minimises edge crossings (a bounded greedy
+local search, ~halving them on the example graph) without giving up the overlap guarantee. It
+shares the same size guard and ``.dot`` fallback as the other two.
 
 **Size guard / graceful fallback (``docs/02_architecture.md §7``).** An O(n²) force layout
 in the browser only stays responsive up to a point, and the inlined JSON grows with the
@@ -738,6 +740,13 @@ def write_ringed_html(
 #      certificate that both overlap counts are exactly zero. With the room phase 1 created this
 #      converges quickly (~100 sweeps on the example graph); if the budget runs out first the
 #      best arrangement reached is emitted.
+#   3. **Crossing reduction** — a bounded greedy local search that relocates each crossing-incident
+#      node to the nearby candidate slot with the fewest incident edge crossings (moving one node
+#      only changes crossings on its own edges, so an accepted strict improvement never raises the
+#      global total). Real topologies are non-planar so zero crossings is unreachable, but this is
+#      a *secondary* objective — it typically roughly halves the crossings (39 -> 18 on the example
+#      graph) — and a **final projection** afterwards restores the overlap-free guarantee that
+#      remains the layout's primary promise.
 #
 # Determinism (``docs/04_conventions.md``): positions come from a fixed initial spiral, a fixed
 # PRNG seed (used only to jitter exactly-coincident nodes), a fixed iteration order over the
@@ -758,6 +767,16 @@ _OPT_DAMPING = 0.9
 _OPT_GRAVITY = 0.005
 _OPT_COOL = 0.99  # per-pass cooling of the force alpha
 _OPT_ALPHA_FLOOR = 0.05
+
+# Phase-3 crossing-reduction constants. Candidate slots for a relocated node are the neighbour
+# barycenter plus a ring of probes around it (radii x angles); bounded sweeps keep it cheap.
+_OPT_REDUCE_SWEEPS = 8
+_OPT_REDUCE_RADII = (25.0, 55.0, 95.0, 150.0)
+_OPT_REDUCE_ANGLES = 12
+# The relocation can leave a tight spot the projection can only oscillate in; cap the restoring
+# projection so it can't burn the whole budget, and fall back to the phase-2 layout if it doesn't
+# settle overlap-free within the cap (crossings not reduced, but the primary guarantee is kept).
+_OPT_REDUCE_PROJECT_CAP = 400
 
 
 def _seg_point_dist(px: float, py: float, ax: float, ay: float, bx: float, by: float) -> tuple:
@@ -803,6 +822,86 @@ def _count_overlaps(nodes: list, edges: list) -> tuple[int, int]:
             if d < pr - 1e-6:
                 edge_node += 1
     return node_node, edge_node
+
+
+def _seg_seg_cross(
+    ax: float, ay: float, bx: float, by: float, cx: float, cy: float, dx: float, dy: float
+) -> bool:
+    """Whether open segments ``ab`` and ``cd`` properly cross (callers exclude shared endpoints)."""
+    d1 = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+    d2 = (bx - ax) * (dy - ay) - (by - ay) * (dx - ax)
+    d3 = (dx - cx) * (ay - cy) - (dy - cy) * (ax - cx)
+    d4 = (dx - cx) * (by - cy) - (dy - cy) * (bx - cx)
+    s1 = (d1 > 1e-9) - (d1 < -1e-9)
+    s2 = (d2 > 1e-9) - (d2 < -1e-9)
+    s3 = (d3 > 1e-9) - (d3 < -1e-9)
+    s4 = (d4 > 1e-9) - (d4 < -1e-9)
+    return s1 != s2 and s3 != s4
+
+
+def _count_crossings(nodes: list, edges: list) -> int:
+    """Number of pairs of edges whose segments cross (shared-endpoint pairs never count)."""
+    pos = {n["id"]: (n["x"], n["y"]) for n in nodes}
+    ep = [(e["source"], e["target"]) for e in edges if e["source"] in pos and e["target"] in pos]
+    total = 0
+    for i in range(len(ep)):
+        a, b = ep[i]
+        ax, ay = pos[a]
+        bx, by = pos[b]
+        for j in range(i + 1, len(ep)):
+            c, d = ep[j]
+            if a == c or a == d or b == c or b == d:
+                continue
+            cx, cy = pos[c]
+            dx, dy = pos[d]
+            if _seg_seg_cross(ax, ay, bx, by, cx, cy, dx, dy):
+                total += 1
+    return total
+
+
+def _separate_overlaps(xs: list, ys: list, epairs: list, radii: list, n: int) -> bool:
+    """One hard geometric projection sweep; returns whether it moved anything.
+
+    (a) separates overlapping node disks, then (b) pushes any node off an edge it is drawn across
+    (to :data:`_OPT_MARGIN` beyond touching). A sweep that returns ``False`` is a certificate that
+    no node-node and no edge-over-node overlap remains.
+    """
+    moved = False
+    for i in range(n):
+        for j in range(i + 1, n):
+            dx = xs[i] - xs[j]
+            dy = ys[i] - ys[j]
+            dist = math.hypot(dx, dy)
+            mind = radii[i] + radii[j] + _OPT_MARGIN
+            if dist < mind:
+                if dist < 1e-9:  # exactly coincident: split along a fixed axis
+                    dx, dy, dist = 1.0, 0.0, 1.0
+                push = (mind - dist) / 2.0
+                ux, uy = dx / dist, dy / dist
+                xs[i] += ux * push
+                ys[i] += uy * push
+                xs[j] -= ux * push
+                ys[j] -= uy * push
+                moved = True
+    for a, b in epairs:
+        ax, ay, bx, by = xs[a], ys[a], xs[b], ys[b]
+        for kidx in range(n):
+            if kidx == a or kidx == b:
+                continue
+            d, cx, cy = _seg_point_dist(xs[kidx], ys[kidx], ax, ay, bx, by)
+            need = radii[kidx] + _OPT_MARGIN
+            if d < need:
+                ddx = xs[kidx] - cx
+                ddy = ys[kidx] - cy
+                dl = math.hypot(ddx, ddy)
+                if dl < 1e-9:  # node sits on the segment: push along the edge normal
+                    ddx, ddy = -(by - ay), (bx - ax)
+                    dl = math.hypot(ddx, ddy) or 1.0
+                push = need - d
+                xs[kidx] += ddx / dl * push
+                ys[kidx] += ddy / dl * push
+                moved = True
+    return moved
 
 
 def _optimize_layout(nodes: list, edges: list, max_passes: int) -> int:
@@ -896,51 +995,122 @@ def _optimize_layout(nodes: list, edges: list, max_passes: int) -> int:
 
     # Phase 2: hard geometric projection until a sweep moves nothing (0/0) or the budget is spent.
     while passes < max_passes:
-        moved = False
-        # (a) separate overlapping node disks.
-        for i in range(n):
-            for j in range(i + 1, n):
-                dx = xs[i] - xs[j]
-                dy = ys[i] - ys[j]
-                dist = math.hypot(dx, dy)
-                mind = radii[i] + radii[j] + _OPT_MARGIN
-                if dist < mind:
-                    if dist < 1e-9:  # exactly coincident: split along a fixed axis
-                        dx, dy, dist = 1.0, 0.0, 1.0
-                    push = (mind - dist) / 2.0
-                    ux, uy = dx / dist, dy / dist
-                    xs[i] += ux * push
-                    ys[i] += uy * push
-                    xs[j] -= ux * push
-                    ys[j] -= uy * push
-                    moved = True
-        # (b) push any node off an edge it is drawn across.
-        for a, b in epairs:
-            ax, ay, bx, by = xs[a], ys[a], xs[b], ys[b]
-            for kidx in range(n):
-                if kidx == a or kidx == b:
-                    continue
-                d, cx, cy = _seg_point_dist(xs[kidx], ys[kidx], ax, ay, bx, by)
-                need = radii[kidx] + _OPT_MARGIN
-                if d < need:
-                    ddx = xs[kidx] - cx
-                    ddy = ys[kidx] - cy
-                    dl = math.hypot(ddx, ddy)
-                    if dl < 1e-9:  # node sits on the segment: push along the edge normal
-                        ddx, ddy = -(by - ay), (bx - ax)
-                        dl = math.hypot(ddx, ddy) or 1.0
-                    push = need - d
-                    xs[kidx] += ddx / dl * push
-                    ys[kidx] += ddy / dl * push
-                    moved = True
+        moved = _separate_overlaps(xs, ys, epairs, radii, n)
         passes += 1
         if not moved:  # a sweep that changes nothing == no overlaps remain
             break
+
+    # Phase 3: reduce edge crossings (best effort), then re-project to keep the overlap-free
+    # guarantee. Crossings can't be zeroed (non-planar), so this is a bounded greedy local search.
+    # Phase 2 already produced an overlap-free layout; keep it as a safe fallback so the primary
+    # guarantee survives even if relocation lands somewhere the projection can't fully clear.
+    if passes < max_passes and len(epairs) > 1:
+        safe_xs, safe_ys = xs[:], ys[:]
+        passes = _reduce_crossings_free(xs, ys, epairs, radii, n, max_passes, passes)
+        if _has_overlap(xs, ys, epairs, radii, n):
+            xs[:], ys[:] = safe_xs, safe_ys
 
     for i, node in enumerate(nodes):
         node["x"] = round(xs[i], 2)
         node["y"] = round(ys[i], 2)
     return passes
+
+
+def _reduce_crossings_free(
+    xs: list, ys: list, epairs: list, radii: list, n: int, max_passes: int, passes: int
+) -> int:
+    """Greedy crossing-reduction on free positions, then a final overlap projection. Returns passes.
+
+    Relocates each crossing-incident node to the nearby candidate slot (neighbour barycenter, or a
+    ring of probes around it) with the fewest *incident* crossings — a monotone move, since a
+    node's edges all share it and so never cross one another, an accepted strict improvement can't
+    raise the global crossing count. Bounded to :data:`_OPT_REDUCE_SWEEPS` sweeps. A final
+    :func:`_separate_overlaps` loop restores the zero-overlap property the relocation may perturb.
+    Deterministic: nodes visited most-crossed-first with the index breaking ties.
+    """
+    nbr: list = [[] for _ in range(n)]
+    inc: list = [[] for _ in range(n)]
+    for k, (a, b) in enumerate(epairs):
+        nbr[a].append(b)
+        nbr[b].append(a)
+        inc[a].append(k)
+        inc[b].append(k)
+    m_edges = len(epairs)
+
+    def incident_crossings(v: int) -> int:
+        total = 0
+        for k in inc[v]:
+            a, b = epairs[k]
+            ax, ay, bx, by = xs[a], ys[a], xs[b], ys[b]
+            for j in range(m_edges):
+                if j == k:
+                    continue
+                c, d = epairs[j]
+                if a == c or a == d or b == c or b == d:
+                    continue
+                if _seg_seg_cross(ax, ay, bx, by, xs[c], ys[c], xs[d], ys[d]):
+                    total += 1
+        return total
+
+    for _ in range(_OPT_REDUCE_SWEEPS):
+        if passes >= max_passes:
+            break
+        current = [incident_crossings(v) for v in range(n)]
+        # Visit most-crossed nodes first; the index breaks ties so the sweep is deterministic.
+        order = sorted(range(n), key=lambda v: (-current[v], v))
+        improved = False
+        for v in order:
+            if current[v] == 0 or not nbr[v]:
+                continue
+            bx = math.fsum(xs[u] for u in nbr[v]) / len(nbr[v])
+            by = math.fsum(ys[u] for u in nbr[v]) / len(nbr[v])
+            base = incident_crossings(v)
+            best = base
+            best_x, best_y = xs[v], ys[v]
+            candidates = [(bx, by)]  # the barycenter itself pulls a node's spokes together
+            for rr in _OPT_REDUCE_RADII:
+                for a in range(_OPT_REDUCE_ANGLES):
+                    ang = 2.0 * math.pi * a / _OPT_REDUCE_ANGLES
+                    candidates.append((bx + math.cos(ang) * rr, by + math.sin(ang) * rr))
+            for qx, qy in candidates:
+                xs[v], ys[v] = qx, qy
+                c = incident_crossings(v)
+                if c < best:  # strict improvement only -> monotone, deterministic
+                    best, best_x, best_y = c, qx, qy
+            xs[v], ys[v] = best_x, best_y
+            if best < base:
+                improved = True
+        passes += 1
+        if not improved:
+            break
+
+    # Restore the overlap-free guarantee after relocation. Stop as soon as the layout is strictly
+    # overlap-free (`_separate_overlaps` keeps a small margin, so it can report movement while the
+    # drawing already has no real overlap); the cap bounds a genuinely tight spot that only cycles.
+    cap = passes + _OPT_REDUCE_PROJECT_CAP
+    while passes < max_passes and passes < cap:
+        moved = _separate_overlaps(xs, ys, epairs, radii, n)
+        passes += 1
+        if not moved or not _has_overlap(xs, ys, epairs, radii, n):
+            break
+    return passes
+
+
+def _has_overlap(xs: list, ys: list, epairs: list, radii: list, n: int) -> bool:
+    """Whether any node-node or edge-over-node overlap remains (strict; matches _count_overlaps)."""
+    for i in range(n):
+        for j in range(i + 1, n):
+            if math.hypot(xs[i] - xs[j], ys[i] - ys[j]) < radii[i] + radii[j] - 1e-6:
+                return True
+    for a, b in epairs:
+        ax, ay, bx, by = xs[a], ys[a], xs[b], ys[b]
+        for kidx in range(n):
+            if kidx == a or kidx == b:
+                continue
+            d, _, _ = _seg_point_dist(xs[kidx], ys[kidx], ax, ay, bx, by)
+            if d < radii[kidx] - 1e-6:
+                return True
+    return False
 
 
 def _optimized_view_data(graph: Graph, max_passes: int) -> dict:

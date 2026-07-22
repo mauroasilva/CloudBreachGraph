@@ -263,18 +263,20 @@ disks overlapping** and **no edge drawn across a node** it isn't connected to (a
 — the natural counterpart of a node overlap). Positions are computed deterministically in Python
 (no in-browser relaxation); you keep drag, zoom and pan.
 
-Each pass runs one of two phases: a force-directed **unfolding** that spreads the nodes into a
-roomy arrangement, then a hard geometric **projection** that separates overlapping disks and
-pushes any node off an edge that crosses it, repeating until both overlap counts are exactly
-zero. A real capture is **non-planar** (a single VPC can contain a non-planar minor), so a
-drawing with zero edge *crossings* cannot exist — this layout instead eliminates the two overlaps
-that actually hurt legibility. A larger `N` only raises the ceiling on passes; the layout stops
-early once it converges, so the result is stable. `--max-passes` takes precedence over `--ringed`
-/ `--optimize-passes` (which don't apply to it), and `--max-passes 0` (the default) keeps the
-force/ringed layout.
+Each pass runs one of three phases: a force-directed **unfolding** that spreads the nodes into a
+roomy arrangement, a hard geometric **projection** that separates overlapping disks and pushes
+any node off an edge that crosses it (until both overlap counts are exactly zero), and a
+best-effort **crossing reduction** that relocates each crossing-heavy node to the nearby slot
+with the fewest incident crossings — followed by a final projection so the overlap guarantee
+still holds. A real capture is **non-planar** (a single VPC can contain a non-planar minor), so a
+drawing with zero edge *crossings* cannot exist; crossings are therefore a *secondary* goal
+(minimised, not zeroed) behind the primary no-overlap guarantee. A larger `N` only raises the
+ceiling on passes; the layout stops early once it converges, so the result is stable.
+`--max-passes` takes precedence over `--ringed` / `--optimize-passes` (which don't apply to it),
+and `--max-passes 0` (the default) keeps the force/ringed layout.
 
 On the shipped 124-node/4-VPC example graph, `--max-passes 10000` reaches **0 node and 0 edge
-overlap in ~400 passes**:
+overlap in ~400 passes** and roughly **halves the edge crossings** (39 → 18):
 
 ```bash
 cloudbreachgraph-to-html docs/examples/example-graph.json --max-passes 10000 -o example.html

@@ -69,9 +69,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         metavar="N",
         help="render the overlap-free layout: run up to N graph-optimisation passes that spread "
-        "the nodes so no two node disks overlap and no edge is drawn across a node. Stops early "
-        "once both overlaps reach zero. 0 (default) keeps the force-directed / ringed layout. "
-        "Takes precedence over --ringed / --optimize-passes.",
+        "the nodes so no two node disks overlap and no edge is drawn across a node, then minimise "
+        "edge crossings as a secondary goal. Stops early once it converges. 0 (default) keeps the "
+        "force-directed / ringed layout. Takes precedence over --ringed / --optimize-passes.",
     )
     return p
 

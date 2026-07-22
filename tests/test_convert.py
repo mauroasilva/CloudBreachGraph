@@ -673,6 +673,41 @@ def test_count_overlaps_detects_a_planted_overlap():
     assert html_export._count_overlaps(nodes, edges) == (1, 1)
 
 
+def test_count_crossings_detects_a_planted_crossing():
+    # A horizontal edge a-b and a vertical edge c-d that pass through the middle -> one crossing.
+    nodes = [
+        {"id": "a", "type": "eni", "x": -10.0, "y": 0.0},
+        {"id": "b", "type": "eni", "x": 10.0, "y": 0.0},
+        {"id": "c", "type": "eni", "x": 0.0, "y": -10.0},
+        {"id": "d", "type": "eni", "x": 0.0, "y": 10.0},
+    ]
+    edges = [{"source": "a", "target": "b"}, {"source": "c", "target": "d"}]
+    assert html_export._count_crossings(nodes, edges) == 1
+    # Edges that merely share an endpoint never count as a crossing.
+    assert html_export._count_crossings(nodes, [edges[0], {"source": "a", "target": "d"}]) == 0
+
+
+def test_optimized_layout_reduces_crossings(monkeypatch):
+    # The crossing-reduction phase must cut crossings versus running the unfold + projection alone,
+    # while both keep the primary zero-overlap guarantee.
+    g = _crossing_graph()
+
+    def run(sweeps):
+        monkeypatch.setattr(html_export, "_OPT_REDUCE_SWEEPS", sweeps)
+        data = html_export._view_data(g)
+        html_export._optimize_layout(data["nodes"], data["edges"], 10000)
+        return (
+            html_export._count_crossings(data["nodes"], data["edges"]),
+            html_export._count_overlaps(data["nodes"], data["edges"]),
+        )
+
+    before_crossings, before_overlaps = run(0)
+    after_crossings, after_overlaps = run(8)
+    assert after_crossings < before_crossings  # phase 3 removed crossings
+    assert before_overlaps == (0, 0)  # ... and neither layout has any overlap
+    assert after_overlaps == (0, 0)
+
+
 def test_convert_max_passes_writes_overlap_free(graph, tmp_path):
     jp = json_export.write_json(graph, tmp_path / "graph.json")
     out = tmp_path / "opt.html"
