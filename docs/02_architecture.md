@@ -215,9 +215,11 @@ Requirements:
   stays responsive up to a point, `write_html` enforces a size guard (`MAX_NODES`,
   `MAX_HTML_BYTES`): over budget it writes nothing and returns `None`, and the CLI **warns
   and falls back to the always-written `.dot`** (which Graphviz lays out offline at any
-  scale). Adding `--optimize-passes N` swaps this in-browser force layout for the
-  deterministic **overlap-free** layout (`write_optimized_html`, described below); `--from-cache`
-  and `--all-accounts` go through the same `_write_outputs`, so they get it too.
+  scale). `--html` accepts the same layout selectors as the converter below: `--optimize-passes N`
+  swaps this in-browser force layout for the deterministic **overlap-free** layout
+  (`write_optimized_html`), and `--ringed` selects the **ringed** layout (`write_ringed_html`, with
+  `--optimize-passes` as its in-ring crossing-reduction budget). `--from-cache` and
+  `--all-accounts` go through the same `_write_outputs`, so they get all three.
 - **Converting existing output → HTML** (`cloudbreachgraph-to-html`, `convert.py`): an
   auxiliary console entry point that re-loads a previously written `graph.json`/`graph.dot`
   and renders the HTML view without re-collecting from AWS. Loading is the inverse of the

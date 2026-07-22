@@ -112,14 +112,21 @@ def build_parser() -> argparse.ArgumentParser:
         "graph is too large to render responsibly in a browser",
     )
     out.add_argument(
+        "--ringed",
+        action="store_true",
+        help="with --html, render the concentric-ringed layout instead of the force one: each VPC "
+        "is the center of a cluster, ringed by its subnets, then its ENIs, then everything else",
+    )
+    out.add_argument(
         "--optimize-passes",
         type=int,
         default=0,
         metavar="N",
-        help="with --html, run up to N graph-optimisation passes to produce a deterministic "
-        "overlap-free layout instead of the in-browser force one: no overlapping nodes, no edge "
-        "drawn across a node, fewer edge crossings, and independent clusters kept apart. Stops "
-        "early once it converges. 0 (default) keeps the force layout.",
+        help="with --html, run up to N graph-optimisation passes (stops early once it converges). "
+        "Without --ringed this renders the deterministic overlap-free layout (no overlapping "
+        "nodes, no edge drawn across a node, fewer edge crossings, independent clusters kept "
+        "apart); with --ringed it reorders nodes within their rings to reduce crossings. 0 "
+        "(default) keeps the base layout (force-directed, or plain ringed).",
     )
     return p
 
@@ -200,12 +207,15 @@ def _write_outputs(collected: dict, out_dir: Path, stem: str, args: argparse.Nam
     print(f"wrote {dot_path}")
 
     if args.html:
-        if args.optimize_passes > 0:
+        html_out = out_dir / f"{stem}.html"
+        if args.ringed:
+            html_path = html_export.write_ringed_html(graph, html_out, passes=args.optimize_passes)
+        elif args.optimize_passes > 0:
             html_path = html_export.write_optimized_html(
-                graph, out_dir / f"{stem}.html", max_passes=args.optimize_passes
+                graph, html_out, max_passes=args.optimize_passes
             )
         else:
-            html_path = html_export.write_html(graph, out_dir / f"{stem}.html")
+            html_path = html_export.write_html(graph, html_out)
         if html_path is None:
             # Too large to render responsibly in a browser: fall back to the .dot, which
             # Graphviz can lay out offline at any scale (docs/02_architecture.md §7).
@@ -255,11 +265,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.optimize_passes < 0:
         print("cloudbreachgraph: --optimize-passes must be >= 0", file=sys.stderr)
         return 2
-    if args.optimize_passes and not args.html:
-        print(
-            "cloudbreachgraph: warning: --optimize-passes only affects --html; ignoring it.",
-            file=sys.stderr,
-        )
+    if not args.html:
+        if args.ringed:
+            print(
+                "cloudbreachgraph: warning: --ringed only affects --html; ignoring it.",
+                file=sys.stderr,
+            )
+        if args.optimize_passes:
+            print(
+                "cloudbreachgraph: warning: --optimize-passes only affects --html; ignoring it.",
+                file=sys.stderr,
+            )
 
     try:
         # Offline: build from cached JSON, no config/credentials needed.

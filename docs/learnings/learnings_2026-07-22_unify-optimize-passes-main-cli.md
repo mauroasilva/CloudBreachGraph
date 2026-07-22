@@ -1,11 +1,11 @@
 # Learnings — 2026-07-22 unify-optimize-passes-main-cli
 
 ## 1. What this change delivered
-- Wired the **overlap-free layout** into the main `cloudbreachgraph` CLI: `cloudbreachgraph
-  --html --optimize-passes N` now writes the deterministic overlap-free `graph.html` (no
-  overlapping nodes, no edge crossing a node, fewer crossings, clusters kept apart) instead of
-  the in-browser force layout. Works on live, `--from-cache`, and `--all-accounts` runs (all go
-  through `cli._write_outputs`).
+- Wired the **overlap-free** and **ringed** layouts into the main `cloudbreachgraph` CLI:
+  `cloudbreachgraph --html --optimize-passes N` writes the deterministic overlap-free `graph.html`
+  and `cloudbreachgraph --html --ringed` writes the ringed layout (with `--optimize-passes` as its
+  in-ring crossing-reduction budget), instead of the in-browser force layout. Works on live,
+  `--from-cache`, and `--all-accounts` runs (all go through `cli._write_outputs`).
 - **Unified `--optimize-passes` and `--max-passes` into one flag** (`--optimize-passes`) on the
   auxiliary `cloudbreachgraph-to-html`. `--max-passes` is **removed**.
 
@@ -17,14 +17,16 @@
     (unchanged; `html_export.write_ringed_html(passes=N)`).
   - `cloudbreachgraph-to-html --optimize-passes N` (no `--ringed`) → overlap-free layout
     (`write_optimized_html(max_passes=N)`).
-  - `cloudbreachgraph --html --optimize-passes N` → overlap-free `graph.html`; `--optimize-passes`
-    without `--html` prints a warning and is ignored.
+  - `cloudbreachgraph --html --optimize-passes N` → overlap-free `graph.html`.
+  - `cloudbreachgraph --html --ringed` → ringed `graph.html` (with `--optimize-passes` as the
+    in-ring reduction budget). The main CLI now mirrors the converter's three-way layout selection
+    (`--ringed` → ringed; else `optimize_passes > 0` → overlap-free; else force).
+  - `--ringed` / `--optimize-passes` without `--html` each print a warning and are ignored.
 - Negative `--optimize-passes` → exit code 2 on both CLIs.
 - **No `--max-passes` anywhere** — don't reintroduce it.
 - Internal `html_export.write_optimized_html(..., max_passes=...)` keyword is **unchanged**; only
-  the CLI surface was renamed. The CLI maps `args.optimize_passes` → `max_passes=`.
-- The main CLI still has **no `--ringed`** (out of scope); `--optimize-passes` there always means
-  the overlap-free layout.
+  the CLI surface was renamed. The CLI maps `args.optimize_passes` → `max_passes=` (overlap-free)
+  or `passes=` (ringed).
 
 ## 3. Decisions & rationale
 - **Kept the name `--optimize-passes`** (dropped `--max-passes`) because it's the general term for
@@ -50,10 +52,10 @@
   because `write_optimized_html` returns `None` over budget just like `write_html`).
 
 ## 6. Known gaps / follow-ups
-- The main `cloudbreachgraph` CLI still exposes only the force / overlap-free layouts, **not**
-  `--ringed`. If someone wants the ringed layout straight from a collection run, that'd be a
-  further wiring change (add `--ringed` to `cli.py` and branch in `_write_outputs`).
-- `--optimize-passes` help text now appears in both CLIs; keep them in sync if the semantics change.
+- The main `cloudbreachgraph` CLI now exposes all three layouts (force / overlap-free / ringed),
+  matching the converter. The two CLIs duplicate the layout-selection branch (`cli._write_outputs`
+  vs `convert.main`) and the `--ringed` / `--optimize-passes` help text — if the selection
+  semantics change, update both.
 
 ## 7. How to verify
 ```bash

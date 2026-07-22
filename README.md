@@ -144,8 +144,10 @@ cloudbreachgraph --from-cache tests/fixtures --output-dir out/
 --render {png,svg}         also rasterize the .dot with Graphviz (needs `dot`)
 --html                     also write an interactive, self-contained HTML view
                              (falls back to .dot when the graph is too large)
---optimize-passes N        with --html, run up to N optimisation passes for a
-                             deterministic overlap-free layout (default 0 = force)
+--ringed                   with --html, render the concentric-ringed layout
+--optimize-passes N        with --html, run up to N optimisation passes: overlap-free
+                             layout, or ringed crossing-reduction with --ringed
+                             (default 0 = base force/ringed layout)
 ```
 
 ## Outputs
@@ -232,7 +234,8 @@ force view, positions are computed deterministically (no in-browser relaxation, 
 button); you can still drag a node, scroll to zoom, and drag the background to pan, plus the
 same **Zoom In / Zoom Out** buttons and **lock scroll-zoom** toggle as the default view. It obeys
 the **same size guard** — if the graph is too large it warns and writes the `.dot` fallback,
-exactly like the default HTML mode.
+exactly like the default HTML mode. `--ringed` also works on the main `cloudbreachgraph` command
+(`cloudbreachgraph --html --ringed`), straight from a collection run.
 
 #### Reducing crossings (`--optimize-passes N`)
 

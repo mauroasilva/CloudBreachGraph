@@ -241,6 +241,16 @@ def test_html_optimize_passes_writes_overlap_free_layout(tmp_path):
     assert "const GRAPH =" in text
 
 
+def test_html_ringed_writes_ringed_layout(tmp_path):
+    # --html --ringed renders the concentric-ringed layout, not the force or overlap-free one.
+    out = tmp_path / "out"
+    rc = cli.main(["--from-cache", str(FIXTURES), "--output-dir", str(out), "--html", "--ringed"])
+    assert rc == 0
+    text = (out / "graph.html").read_text()
+    assert "· ringed" in text  # ringed HUD badge
+    assert "overlap-free" not in text
+
+
 def test_optimize_passes_without_html_warns_and_is_ignored(tmp_path, capsys):
     out = tmp_path / "out"
     rc = cli.main(
@@ -249,6 +259,14 @@ def test_optimize_passes_without_html_warns_and_is_ignored(tmp_path, capsys):
     assert rc == 0
     assert not (out / "graph.html").exists()  # --html not given, so no HTML at all
     assert "only affects --html" in capsys.readouterr().err
+
+
+def test_ringed_without_html_warns_and_is_ignored(tmp_path, capsys):
+    out = tmp_path / "out"
+    rc = cli.main(["--from-cache", str(FIXTURES), "--output-dir", str(out), "--ringed"])
+    assert rc == 0
+    assert not (out / "graph.html").exists()
+    assert "--ringed only affects --html" in capsys.readouterr().err
 
 
 def test_optimize_passes_negative_errors(tmp_path):
