@@ -712,20 +712,64 @@ _EXAMPLE_GRAPH = Path(__file__).resolve().parents[1] / "docs" / "examples" / "ex
 
 
 def test_optimized_layout_removes_all_overlaps_small():
-    # On the crossing fixture the optimiser must leave zero node-node and zero edge-node overlaps.
+    # On the crossing fixture the optimiser must leave zero node-node and zero edge-node overlaps,
+    # and zero label-label / node-label overlaps (labels are separated too).
     g = _crossing_graph()
     data = html_export._optimized_view_data(g, 2000)
     assert html_export._count_overlaps(data["nodes"], data["edges"]) == (0, 0)
+    assert html_export._count_label_overlaps(data["nodes"], data["edges"]) == (0, 0)
 
 
 def test_optimized_layout_reaches_zero_on_example_graph():
-    # The acceptance criteria: the checked-in example graph must reach 0 node and 0 edge overlap
-    # in far fewer than 10000 optimisation passes.
+    # The acceptance criteria: the checked-in example graph must reach 0 node, 0 edge and 0 label
+    # overlap in far fewer than 10000 optimisation passes.
     graph = load_graph(_EXAMPLE_GRAPH)
     data = html_export._view_data(graph)
     used = html_export._optimize_layout(data["nodes"], data["edges"], 10000)
     assert used < 10000
     assert html_export._count_overlaps(data["nodes"], data["edges"]) == (0, 0)
+    assert html_export._count_label_overlaps(data["nodes"], data["edges"]) == (0, 0)
+
+
+def test_optimized_layout_reaches_zero_labels_on_each_split_vpc():
+    # The change request's acceptance test: run the optimiser on every VPC of the example graph's
+    # --split-by-vpc output and confirm each reaches *zero* label overlap (as well as zero node and
+    # edge overlap), while the crossing count is not made worse than the label-free layout.
+    graph = load_graph(_EXAMPLE_GRAPH)
+    subgraphs = html_export.split_by_vpc(graph)
+    assert subgraphs  # the example really does have VPCs to split
+    for sub in subgraphs.values():
+        data = html_export._optimized_view_data(sub, 10000)
+        assert html_export._count_overlaps(data["nodes"], data["edges"]) == (0, 0)
+        assert html_export._count_label_overlaps(data["nodes"], data["edges"]) == (0, 0)
+
+
+def test_count_label_overlaps_detects_planted_overlaps():
+    # a and b coincide, so their (equally wide) label rectangles overlap -> one label-label pair.
+    # c sits inside those label rectangles (the label is drawn just below a node's disk), so c's
+    # disk covers both a's and b's labels -> two node-label incidences.
+    nodes = [
+        {"id": "a", "type": "eni", "label": "aaaaaaaaaa", "x": 0.0, "y": 0.0},
+        {"id": "b", "type": "eni", "label": "bbbbbbbbbb", "x": 0.0, "y": 0.0},
+        {"id": "c", "type": "eni", "label": "c", "x": 0.0, "y": 20.0},  # disk lands on a/b labels
+    ]
+    ll, nl = html_export._count_label_overlaps(nodes, [])
+    assert ll == 1
+    assert nl == 2
+
+    # Move everything far apart -> nothing overlaps.
+    nodes[1]["x"], nodes[2]["x"] = 10000.0, 20000.0
+    assert html_export._count_label_overlaps(nodes, []) == (0, 0)
+
+
+def test_optimized_template_scales_label_fonts_but_ringed_does_not():
+    # The label-overlap guarantee is computed in world space, so the overlap-free page must scale
+    # label fonts with the view (like the node disks) for it to hold on screen at every zoom. The
+    # ringed layout does not separate labels, so it keeps fixed-size labels (the reader can zoom in
+    # to pull two ring labels apart, which scaled fonts would prevent).
+    graph = load_graph(_EXAMPLE_GRAPH)
+    assert "const SCALE_LABELS = true;" in html_export.build_optimized_html(graph, 500)
+    assert "const SCALE_LABELS = false;" in html_export.build_ringed_html(graph, 0)
 
 
 def test_connected_components_splits_disjoint_graphs():

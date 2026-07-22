@@ -29,13 +29,19 @@ A third, **overlap-free** layout (:func:`write_optimized_html` / :func:`build_op
 exposed by ``--optimize-passes N`` on both ``cloudbreachgraph --html`` and
 ``cloudbreachgraph-to-html``) also computes positions in Python, but
 its objective is legibility of the rendering rather than a fixed shape: it runs up to ``N``
-optimisation passes and guarantees that, once it converges, **no two node disks overlap** and
-**no edge is drawn across a node it is not connected to** (an "edge overlap"). Real topologies
-are non-planar (the example graph's largest VPC alone contains a non-planar minor), so zero
-edge *crossings* is impossible — this layout instead removes the two overlaps that actually
-hurt readability and, as a **secondary** objective, minimises edge crossings (a bounded greedy
-local search, ~halving them on the example graph) without giving up the overlap guarantee. It
-shares the same size guard and ``.dot`` fallback as the other two.
+optimisation passes and guarantees that, once it converges, **no two node disks overlap**,
+**no edge is drawn across a node it is not connected to** (an "edge overlap"), and **no node's
+drawn label overlaps another label or another node's disk** (a "label overlap"). A node's label
+is as much a part of the picture as its disk, so the same projection that separates disks also
+separates the rectangles the page paints the labels into — cleared, once the disks are laid out
+and de-tangled, by uniformly inflating the layout (a crossings-preserving transform) until the
+labels have room. Because the labels are separated in world space, the page scales its label
+fonts with the view, so that clearance is what the reader sees at any zoom. Real topologies are
+non-planar (the example graph's largest VPC alone contains a non-planar minor), so zero edge
+*crossings* is impossible — this layout instead removes the overlaps that actually hurt
+readability and, as a **secondary** objective, minimises edge crossings (a bounded greedy local
+search, ~halving them on the example graph) without giving up the overlap guarantees. It shares
+the same size guard and ``.dot`` fallback as the other two.
 
 **Size guard / graceful fallback (``docs/02_architecture.md §7``).** An O(n²) force layout
 in the browser only stays responsive up to a point, and the inlined JSON grows with the
@@ -401,6 +407,49 @@ def _place_min_gap(members: list, cx: float, cy: float, radius: float, target: d
 
 def _node_radius(node: dict) -> float:
     return _NODE_RADII.get(node["type"], _DEFAULT_NODE_RADIUS)
+
+
+# Label geometry. Both draw-templates render a node's label (11px) centred just under its disk
+# and, when present, a smaller detail line (9px) under that — at ``y + r + 12`` / ``y + r + 23``.
+# The layout optimiser models that text as a rectangle centred under the disk so it can pull one
+# node's label off another's label *and* off a neighbouring disk. Widths are estimated from the
+# character count (there is no font engine available and none may be added — stdlib only, see
+# ``docs/04_conventions.md``); the estimate only needs to bracket the drawn glyph advances closely
+# enough for the projection, and it is deterministic, so the emitted HTML stays byte-stable.
+_LABEL_CHAR_W = 0.60  # mean glyph advance as a fraction of the font size (Helvetica-ish, roomy)
+_LABEL_FONT = 11.0  # label line font size (px) — matches the template's 11px label font
+_DETAIL_FONT = 9.0  # detail line font size (px) — matches the template's 9px detail font
+_LABEL_GAP = 3.0  # vertical gap between the disk's bottom edge and the first text line
+_LABEL_LINE_H = 11.0  # vertical extent contributed by the label line
+_DETAIL_LINE_H = 11.0  # extra vertical extent contributed by a detail line, when present
+
+
+def _label_dims(node: dict) -> tuple[float, float]:
+    """Half-width and total height (px) of the text drawn under ``node``.
+
+    The label line is always present (falls back to the id); the detail line is added only when the
+    node carries one. Width is the wider of the two lines' estimated pixel advances; height is the
+    stacked line heights. Used to place a rectangle at ``x ± half_w`` spanning down from
+    ``y + r + _LABEL_GAP`` by the returned height.
+    """
+    text = str(node.get("label") or node.get("id") or "")
+    detail = str(node.get("detail") or "")
+    half_w = len(text) * _LABEL_FONT * _LABEL_CHAR_W / 2.0
+    height = _LABEL_LINE_H
+    if detail:
+        half_w = max(half_w, len(detail) * _DETAIL_FONT * _LABEL_CHAR_W / 2.0)
+        height += _DETAIL_LINE_H
+    return half_w, height
+
+
+def _label_rect(x: float, y: float, r: float, half_w: float, h: float) -> tuple:
+    """The label rectangle ``(x0, y0, x1, y1)`` for a node at ``(x, y)`` with radius ``r``.
+
+    Centred under the disk (``x0/x1 = x ∓ half_w``) and starting ``_LABEL_GAP`` below the disk's
+    bottom edge, spanning ``h`` downward — mirroring where the templates paint the label/detail.
+    """
+    y0 = y + r + _LABEL_GAP
+    return (x - half_w, y0, x + half_w, y0 + h)
 
 
 def _nudge_overlaps(nodes: list, iterations: int = 12, pad: float = 6.0) -> None:
@@ -838,11 +887,15 @@ def write_ringed_html(
 # Overlap-elimination layout (--optimize-passes).
 #
 # A third deterministic, Python-computed layout whose single promise is that the *rendering* is
-# legible: after it converges, **no two node disks overlap** and **no edge is drawn across a
-# node it is not incident to**. We call the latter an *edge overlap* — the natural counterpart
-# of a node overlap in a straight-line node-link drawing. Real AWS topologies are non-planar
-# (the example graph's largest VPC contains a non-planar minor), so a drawing with zero edge
-# *crossings* cannot exist; this optimiser therefore targets the two overlaps that genuinely
+# legible: after it converges, **no two node disks overlap**, **no edge is drawn across a node it
+# is not incident to**, and **no node's drawn label overlaps another label or another node's
+# disk**. The first is a node overlap, the second an *edge overlap* — the natural counterpart of a
+# node overlap in a straight-line node-link drawing — and the last two are *label overlaps* (a
+# label collides with a peer label, or a disk sits on a peer's label). A node's label is as much a
+# part of the picture as its disk, so the same projection that separates disks also separates the
+# rectangles the templates paint the labels into (:func:`_label_rect`). Real AWS topologies are
+# non-planar (the example graph's largest VPC contains a non-planar minor), so a drawing with zero
+# edge *crossings* cannot exist; this optimiser therefore targets the overlaps that genuinely
 # impair readability rather than an unreachable crossing-free ideal.
 #
 # It runs up to ``max_passes`` *optimisation passes*, each counting one against the budget, in
@@ -872,6 +925,25 @@ def write_ringed_html(
 # --------------------------------------------------------------------------- #
 _OPT_SEED = 0x1F2E3D4C  # fixed PRNG seed -> byte-stable output (only jitters coincident nodes)
 _OPT_MARGIN = 4.0  # clearance beyond bare touching that the projection sweep enforces
+_OPT_LABEL_PAD = 4.0  # clearance the projection keeps around label rectangles (label-label / disk)
+_OPT_LABEL_RELAX = 0.5  # under-relaxation on the label pushes: only apply this fraction of each
+# minimum-translation step so the several constraints acting on a node (disk, its two label
+# neighbours, edges) settle instead of ping-ponging between axes — damps the projection's limit
+# cycle so the label pass actually converges to zero from a tight post-crossing-reduction layout.
+
+# Phase-4 label clearing. The crossing-reduced disk layout packs connected nodes only a disk-radius
+# apart — far tighter than a label is wide — so labels can only be separated by making room. Uniform
+# scaling about the layout centroid does exactly that *without changing any crossing* (crossings are
+# scale-invariant), so phase 4 inflates the finished layout, then projects the labels apart. If the
+# initial inflation is not enough for the projection to reach zero, it re-inflates the pristine
+# layout by a larger factor and retries — more room always helps, and in the limit every label
+# separates, so this converges. Kept as a scale so the on-screen result is honoured by the
+# templates, which scale label fonts with the view (see the draw() font sizing): world-space label
+# clearance is then the same clearance the reader sees at any zoom.
+_OPT_LABEL_SCALE0 = 2.5  # first inflation factor tried (about the centroid) — kept modest to stay
+# compact; the example VPCs clear in a handful of projection passes at ~2x, so 2.5 leaves margin.
+_OPT_LABEL_SCALE_STEP = 1.3  # multiply the factor by this and retry when a projection can't clear
+_OPT_LABEL_PROJECT_CAP = 250  # per-attempt projection budget before escalating the scale
 _OPT_FORCE_PASSES = 400  # cap on phase-1 unfolding passes (the rest of the budget is projection)
 _OPT_PROJECT_MIN = 120  # ensure projection always gets at least this many passes when affordable
 
@@ -941,6 +1013,49 @@ def _count_overlaps(nodes: list, edges: list) -> tuple[int, int]:
     return node_node, edge_node
 
 
+def _rects_overlap(a: tuple, b: tuple) -> bool:
+    """Whether axis-aligned rectangles ``(x0, y0, x1, y1)`` intersect (strict; touching is not)."""
+    return a[0] < b[2] - 1e-6 and b[0] < a[2] - 1e-6 and a[1] < b[3] - 1e-6 and b[1] < a[3] - 1e-6
+
+
+def _disk_rect_overlap(x: float, y: float, r: float, rect: tuple) -> bool:
+    """Whether the disk at ``(x, y)`` radius ``r`` intersects rectangle ``rect`` (strict)."""
+    cx = min(max(x, rect[0]), rect[2])
+    cy = min(max(y, rect[1]), rect[3])
+    return math.hypot(x - cx, y - cy) < r - 1e-6
+
+
+def _count_label_overlaps(nodes: list, edges: list) -> tuple[int, int]:
+    """Count ``(label_label, node_label)`` overlaps in a laid-out payload.
+
+    A *label-label* overlap is two nodes' label rectangles intersecting; a *node-label* overlap is a
+    node's disk intersecting a **different** node's label rectangle. Rectangles come from
+    :func:`_label_rect` / :func:`_label_dims`, so the counts match what the projection sweep clears
+    and what the templates paint. ``edges`` is accepted for signature symmetry with
+    :func:`_count_overlaps` and is unused. Strict — bare touching is not an overlap.
+    """
+    boxes: dict[str, tuple] = {}
+    disks: dict[str, tuple] = {}
+    for n in nodes:
+        r = _node_radius(n)
+        hw, h = _label_dims(n)
+        boxes[n["id"]] = _label_rect(n["x"], n["y"], r, hw, h)
+        disks[n["id"]] = (n["x"], n["y"], r)
+    ids = [n["id"] for n in nodes]
+    label_label = 0
+    for i in range(len(ids)):
+        for j in range(i + 1, len(ids)):
+            if _rects_overlap(boxes[ids[i]], boxes[ids[j]]):
+                label_label += 1
+    node_label = 0
+    for i in range(len(ids)):
+        x, y, r = disks[ids[i]]
+        for j in range(len(ids)):
+            if i != j and _disk_rect_overlap(x, y, r, boxes[ids[j]]):
+                node_label += 1
+    return label_label, node_label
+
+
 def _seg_seg_cross(
     ax: float, ay: float, bx: float, by: float, cx: float, cy: float, dx: float, dy: float
 ) -> bool:
@@ -976,14 +1091,29 @@ def _count_crossings(nodes: list, edges: list) -> int:
     return total
 
 
-def _separate_overlaps(xs: list, ys: list, epairs: list, radii: list, n: int) -> bool:
+def _separate_overlaps(
+    xs: list,
+    ys: list,
+    epairs: list,
+    radii: list,
+    lhw: list,
+    lh: list,
+    n: int,
+    include_labels: bool = True,
+) -> bool:
     """One hard geometric projection sweep; returns whether it moved anything.
 
-    (a) separates overlapping node disks, then (b) pushes any node off an edge it is drawn across
-    (to :data:`_OPT_MARGIN` beyond touching). A sweep that returns ``False`` is a certificate that
-    no node-node and no edge-over-node overlap remains.
+    Up to four kinds of violation are relieved, each by moving the offending node(s) a hair past
+    clear: (a) two node disks overlapping; (b) two nodes' label rectangles overlapping; (c) a node's
+    disk sitting on a different node's label rectangle; (d) a node sitting on an edge it is drawn
+    across. A label rectangle is rigidly attached to its node (:func:`_label_rect`), so a rectangle
+    is moved by translating its node — the same ``xs``/``ys`` the disks live in. With
+    ``include_labels=False`` the label rules (b)/(c) are skipped, leaving the original disk+edge
+    projection (used while reducing crossings, where the labels are cleared in a final pass
+    instead). A sweep returning ``False`` certifies that none of the enabled overlaps remain.
     """
     moved = False
+    # (a) node disks.
     for i in range(n):
         for j in range(i + 1, n):
             dx = xs[i] - xs[j]
@@ -1000,6 +1130,65 @@ def _separate_overlaps(xs: list, ys: list, epairs: list, radii: list, n: int) ->
                 xs[j] -= ux * push
                 ys[j] -= uy * push
                 moved = True
+    # (b) label rectangles vs each other. Resolve the axis-aligned overlap along its smaller
+    # penetration axis (the minimum-translation vector), translating both nodes half each. Ties
+    # (equal x or y) break deterministically toward the lower index moving in the positive
+    # direction, so the sweep stays byte-stable.
+    if include_labels:
+        for i in range(n):
+            ax0, ay0, ax1, ay1 = _label_rect(xs[i], ys[i], radii[i], lhw[i], lh[i])
+            for j in range(i + 1, n):
+                bx0, by0, bx1, by1 = _label_rect(xs[j], ys[j], radii[j], lhw[j], lh[j])
+                ox = min(ax1, bx1) - max(ax0, bx0) + _OPT_LABEL_PAD
+                oy = min(ay1, by1) - max(ay0, by0) + _OPT_LABEL_PAD
+                if ox > 0 and oy > 0:
+                    if ox <= oy:
+                        push = ox / 2.0 * _OPT_LABEL_RELAX
+                        s = 1.0 if xs[i] >= xs[j] else -1.0
+                        xs[i] += s * push
+                        xs[j] -= s * push
+                    else:
+                        push = oy / 2.0 * _OPT_LABEL_RELAX
+                        s = 1.0 if ys[i] >= ys[j] else -1.0
+                        ys[i] += s * push
+                        ys[j] -= s * push
+                    moved = True
+    # (c) a node disk vs a *different* node's label rectangle (both ordered directions).
+    if include_labels:
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    continue
+                rx0, ry0, rx1, ry1 = _label_rect(xs[j], ys[j], radii[j], lhw[j], lh[j])
+                cx = min(max(xs[i], rx0), rx1)
+                cy = min(max(ys[i], ry0), ry1)
+                ddx = xs[i] - cx
+                ddy = ys[i] - cy
+                dl = math.hypot(ddx, ddy)
+                need = radii[i] + _OPT_LABEL_PAD
+                if dl < need:
+                    if dl < 1e-9:  # disk centre inside the rect: escape along the *nearest* edge
+                        left, right = xs[i] - rx0, rx1 - xs[i]
+                        top, bottom = ys[i] - ry0, ry1 - ys[i]
+                        m = min(left, right, top, bottom)
+                        ddx, ddy = (
+                            (-1.0, 0.0)
+                            if m == left
+                            else (1.0, 0.0)
+                            if m == right
+                            else (0.0, -1.0)
+                            if m == top
+                            else (0.0, 1.0)
+                        )
+                        dl = 1.0
+                    push = (need - dl) / 2.0 * _OPT_LABEL_RELAX
+                    ux, uy = ddx / dl, ddy / dl
+                    xs[i] += ux * push
+                    ys[i] += uy * push
+                    xs[j] -= ux * push
+                    ys[j] -= uy * push
+                    moved = True
+    # (d) a node sitting on an edge it is not incident to.
     for a, b in epairs:
         ax, ay, bx, by = xs[a], ys[a], xs[b], ys[b]
         for kidx in range(n):
@@ -1069,20 +1258,28 @@ def _connected_components(nodes: list, edges: list) -> list:
 def _pack_components(components: list) -> None:
     """Translate each already-laid-out component into its own cell of a grid so none overlap.
 
-    Each component is shifted so its bounding box (node disks included) sits centered in a
-    square grid cell sized to the largest component plus :data:`_OPT_CLUSTER_GAP`. This keeps
-    independent clusters clearly apart — the reader can tell at a glance which nodes belong
-    together and which components are disconnected. Mirrors the ringed layout's cluster tiling.
-    Deterministic: components keep :func:`_connected_components`' order; ties in size don't matter.
+    Each component is shifted so its bounding box (node disks **and their labels** included) sits
+    centered in a square grid cell sized to the largest component plus :data:`_OPT_CLUSTER_GAP`.
+    This keeps independent clusters clearly apart — the reader can tell at a glance which nodes
+    belong together and which components are disconnected — and, by counting the label rectangles
+    into the box, guarantees one component's labels can't spill onto another's. Mirrors the ringed
+    layout's cluster tiling. Deterministic: components keep :func:`_connected_components`' order;
+    ties in size don't matter.
     """
     if not components:
         return
-    boxes = []  # (w, h, cx, cy) of each component's node-disk bounding box
+    boxes = []  # (w, h, cx, cy) of each component's disk+label bounding box
     for comp_nodes, _ in components:
-        min_x = min(node["x"] - _node_radius(node) for node in comp_nodes)
-        max_x = max(node["x"] + _node_radius(node) for node in comp_nodes)
-        min_y = min(node["y"] - _node_radius(node) for node in comp_nodes)
-        max_y = max(node["y"] + _node_radius(node) for node in comp_nodes)
+        exts = []  # (x0, y0, x1, y1) covering each node's disk and its label rectangle
+        for node in comp_nodes:
+            r = _node_radius(node)
+            hw, h = _label_dims(node)
+            lx0, ly0, lx1, ly1 = _label_rect(node["x"], node["y"], r, hw, h)
+            exts.append((min(node["x"] - r, lx0), node["y"] - r, max(node["x"] + r, lx1), ly1))
+        min_x = min(e[0] for e in exts)
+        min_y = min(e[1] for e in exts)
+        max_x = max(e[2] for e in exts)
+        max_y = max(e[3] for e in exts)
         boxes.append((max_x - min_x, max_y - min_y, (min_x + max_x) / 2, (min_y + max_y) / 2))
 
     cell = max(max(w, h) for w, h, _, _ in boxes) + _OPT_CLUSTER_GAP
@@ -1142,6 +1339,15 @@ def _layout_nodes(nodes: list, edges: list, max_passes: int) -> int:
 
     idx = {node["id"]: i for i, node in enumerate(nodes)}
     radii = [_node_radius(node) for node in nodes]
+    # Label rectangle half-width / height per node. Phases 1-3 lay out and de-tangle the *disks*
+    # only; the label rectangles are cleared afterwards (phase 4), by uniformly inflating this
+    # arrangement — a crossings-preserving transform — until the labels have room, then projecting.
+    # Keeping phases 1-3 label-free is deliberate: spacing the disks for label width up front
+    # tangles the force layout and worsens crossings, whereas inflating a finished layout is free.
+    lhw = [0.0] * n
+    lh = [0.0] * n
+    for i, node in enumerate(nodes):
+        lhw[i], lh[i] = _label_dims(node)
     epairs = [
         (idx[e["source"]], idx[e["target"]])
         for e in edges
@@ -1213,24 +1419,57 @@ def _layout_nodes(nodes: list, edges: list, max_passes: int) -> int:
         alpha = max(alpha * _OPT_COOL, _OPT_ALPHA_FLOOR)
         passes += 1
 
-    # Phase 2: hard geometric projection until the layout is overlap-free or the budget is spent.
-    # Stop as soon as it is *strictly* overlap-free: `_separate_overlaps` keeps a small margin, so
-    # it can keep reporting movement (cycling within that band) long after the real overlaps clear.
+    # Phase 2: hard geometric projection of the **disks/edges** until they are overlap-free or the
+    # budget is spent. Labels are deliberately left for phase 4: crossing reduction (phase 3) works
+    # far better on a disk-only layout, and separating labels here would only be undone there. Stop
+    # as soon as it is *strictly* clear: `_separate_overlaps` keeps a small margin, so it can keep
+    # reporting movement (cycling within that band) long after the real overlaps clear.
     while passes < max_passes:
-        moved = _separate_overlaps(xs, ys, epairs, radii, n)
+        moved = _separate_overlaps(xs, ys, epairs, radii, lhw, lh, n, include_labels=False)
         passes += 1
-        if not moved or not _has_overlap(xs, ys, epairs, radii, n):
+        if not moved or not _has_overlap(xs, ys, epairs, radii, lhw, lh, n, include_labels=False):
             break
 
-    # Phase 3: reduce edge crossings (best effort), then re-project to keep the overlap-free
-    # guarantee. Crossings can't be zeroed (non-planar), so this is a bounded greedy local search.
-    # Phase 2 already produced an overlap-free layout; keep it as a safe fallback so the primary
-    # guarantee survives even if relocation lands somewhere the projection can't fully clear.
+    # Phase 3: reduce edge crossings (best effort) on the disk-only layout, re-projecting disks
+    # after relocation. Crossings can't be zeroed (non-planar), so this is a bounded local search.
+    # Phase 2 already produced a disk-overlap-free layout; keep it as a safe fallback so that
+    # guarantee survives even if relocation lands somewhere the disk projection can't fully clear.
     if passes < max_passes and len(epairs) > 1:
         safe_xs, safe_ys = xs[:], ys[:]
-        passes = _reduce_crossings_free(xs, ys, epairs, radii, n, max_passes, passes)
-        if _has_overlap(xs, ys, epairs, radii, n):
+        passes = _reduce_crossings_free(xs, ys, epairs, radii, lhw, lh, n, max_passes, passes)
+        if _has_overlap(xs, ys, epairs, radii, lhw, lh, n, include_labels=False):
             xs[:], ys[:] = safe_xs, safe_ys
+
+    # Phase 4: clear the *labels* by making room. Inflate the crossing-reduced layout about its
+    # centroid (crossings-invariant) and project the labels apart; if that projection can't reach
+    # zero, re-inflate the pristine layout by a larger factor and try again. Each attempt starts
+    # from the same disk-overlap-free base, so a successful attempt keeps phase 3's crossing count;
+    # the escalation guarantees enough room eventually exists for every label to separate. The best
+    # (fewest remaining label overlaps) arrangement is kept in case the whole budget is exhausted.
+    if passes < max_passes and n > 1:
+        base_xs, base_ys = xs[:], ys[:]
+        cxc = math.fsum(base_xs) / n
+        cyc = math.fsum(base_ys) / n
+        best_xs, best_ys = xs[:], ys[:]
+        best_bad = _count_remaining_label_overlaps(xs, ys, radii, lhw, lh, n)
+        scale = _OPT_LABEL_SCALE0
+        while passes < max_passes and best_bad > 0:
+            for i in range(n):  # fresh inflation of the pristine base -> crossings preserved
+                xs[i] = cxc + (base_xs[i] - cxc) * scale
+                ys[i] = cyc + (base_ys[i] - cyc) * scale
+            attempt_end = passes + _OPT_LABEL_PROJECT_CAP
+            while passes < max_passes and passes < attempt_end:
+                moved = _separate_overlaps(xs, ys, epairs, radii, lhw, lh, n)
+                passes += 1
+                if not moved or not _has_overlap(xs, ys, epairs, radii, lhw, lh, n):
+                    break
+            bad = _count_remaining_label_overlaps(xs, ys, radii, lhw, lh, n)
+            if bad < best_bad:
+                best_bad, best_xs, best_ys = bad, xs[:], ys[:]
+            if bad == 0:
+                break
+            scale *= _OPT_LABEL_SCALE_STEP  # not enough room yet -> spread further and retry
+        xs[:], ys[:] = best_xs, best_ys
 
     for i, node in enumerate(nodes):  # raw floats; _optimize_layout rounds after packing
         node["x"] = xs[i]
@@ -1239,16 +1478,27 @@ def _layout_nodes(nodes: list, edges: list, max_passes: int) -> int:
 
 
 def _reduce_crossings_free(
-    xs: list, ys: list, epairs: list, radii: list, n: int, max_passes: int, passes: int
+    xs: list,
+    ys: list,
+    epairs: list,
+    radii: list,
+    lhw: list,
+    lh: list,
+    n: int,
+    max_passes: int,
+    passes: int,
 ) -> int:
-    """Greedy crossing-reduction on free positions, then a final overlap projection. Returns passes.
+    """Greedy crossing-reduction on free positions, then a final **disk** overlap projection.
 
     Relocates each crossing-incident node to the nearby candidate slot (neighbour barycenter, or a
-    ring of probes around it) with the fewest *incident* crossings — a monotone move, since a
-    node's edges all share it and so never cross one another, an accepted strict improvement can't
-    raise the global crossing count. Bounded to :data:`_OPT_REDUCE_SWEEPS` sweeps. A final
-    :func:`_separate_overlaps` loop restores the zero-overlap property the relocation may perturb.
-    Deterministic: nodes visited most-crossed-first with the index breaking ties.
+    ring of probes around it) with the fewest *incident* crossings — a monotone move, since a node's
+    edges all share it and so never cross one another, so an accepted strict improvement can't raise
+    the global crossing count. Bounded to :data:`_OPT_REDUCE_SWEEPS` sweeps. A final
+    :func:`_separate_overlaps` loop (``include_labels=False``) restores the disk/edge zero-overlap
+    property the relocation may perturb; the *labels* are cleared afterwards, in the caller's final
+    label pass, because doing so here — when relocation has collapsed connected nodes toward their
+    barycenters — would leave a tangle the four-way projection can only cycle in. Deterministic:
+    nodes visited most-crossed-first with the index breaking ties.
     """
     nbr: list = [[] for _ in range(n)]
     inc: list = [[] for _ in range(n)]
@@ -1306,20 +1556,33 @@ def _reduce_crossings_free(
         if not improved:
             break
 
-    # Restore the overlap-free guarantee after relocation. Stop as soon as the layout is strictly
-    # overlap-free (`_separate_overlaps` keeps a small margin, so it can report movement while the
-    # drawing already has no real overlap); the cap bounds a genuinely tight spot that only cycles.
+    # Restore the disk/edge overlap-free guarantee after relocation (labels handled by the caller).
+    # Stop as soon as it is strictly clear; the cap bounds a genuinely tight spot that only cycles.
     cap = passes + _OPT_REDUCE_PROJECT_CAP
     while passes < max_passes and passes < cap:
-        moved = _separate_overlaps(xs, ys, epairs, radii, n)
+        moved = _separate_overlaps(xs, ys, epairs, radii, lhw, lh, n, include_labels=False)
         passes += 1
-        if not moved or not _has_overlap(xs, ys, epairs, radii, n):
+        if not moved or not _has_overlap(xs, ys, epairs, radii, lhw, lh, n, include_labels=False):
             break
     return passes
 
 
-def _has_overlap(xs: list, ys: list, epairs: list, radii: list, n: int) -> bool:
-    """Whether any node-node or edge-over-node overlap remains (strict; matches _count_overlaps)."""
+def _has_overlap(
+    xs: list,
+    ys: list,
+    epairs: list,
+    radii: list,
+    lhw: list,
+    lh: list,
+    n: int,
+    include_labels: bool = True,
+) -> bool:
+    """Whether any overlap the projection targets remains (strict; matches the _count_* helpers).
+
+    Covers node-node and edge-over-node always, plus label-label and disk-over-label when
+    ``include_labels`` is set, so a projection loop that stops on ``not _has_overlap`` stops only
+    once every overlap its matching :func:`_separate_overlaps` mode targets is truly cleared.
+    """
     for i in range(n):
         for j in range(i + 1, n):
             if math.hypot(xs[i] - xs[j], ys[i] - ys[j]) < radii[i] + radii[j] - 1e-6:
@@ -1332,7 +1595,40 @@ def _has_overlap(xs: list, ys: list, epairs: list, radii: list, n: int) -> bool:
             d, _, _ = _seg_point_dist(xs[kidx], ys[kidx], ax, ay, bx, by)
             if d < radii[kidx] - 1e-6:
                 return True
+    if not include_labels:
+        return False
+    rects = [_label_rect(xs[i], ys[i], radii[i], lhw[i], lh[i]) for i in range(n)]
+    for i in range(n):
+        for j in range(i + 1, n):
+            if _rects_overlap(rects[i], rects[j]):
+                return True
+    for i in range(n):
+        for j in range(n):
+            if i != j and _disk_rect_overlap(xs[i], ys[i], radii[i], rects[j]):
+                return True
     return False
+
+
+def _count_remaining_label_overlaps(
+    xs: list, ys: list, radii: list, lhw: list, lh: list, n: int
+) -> int:
+    """Number of label-label plus disk-over-label overlaps in a raw ``xs``/``ys`` arrangement.
+
+    The array-based twin of :func:`_count_label_overlaps` (which works on node dicts), used by the
+    label-clearing pass to pick the arrangement with the fewest remaining label overlaps when the
+    pass runs out of budget before reaching zero.
+    """
+    rects = [_label_rect(xs[i], ys[i], radii[i], lhw[i], lh[i]) for i in range(n)]
+    total = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            if _rects_overlap(rects[i], rects[j]):
+                total += 1
+    for i in range(n):
+        for j in range(n):
+            if i != j and _disk_rect_overlap(xs[i], ys[i], radii[i], rects[j]):
+                total += 1
+    return total
 
 
 def _optimized_view_data(graph: Graph, max_passes: int) -> dict:
@@ -1408,9 +1704,9 @@ RINGED_HELP = (
 OPTIMIZE_PASSES_HELP = (
     "run up to N graph-optimisation passes (stops early once it converges). Without --ringed this "
     "renders the deterministic overlap-free layout (no overlapping nodes, no edge drawn across a "
-    "node, fewer edge crossings, independent clusters kept apart); with --ringed it reorders nodes "
-    "within their rings to reduce crossings. 0 (default) keeps the base layout (force-directed, or "
-    "plain ringed)."
+    "node, no label overlapping another label or node, fewer edge crossings, independent clusters "
+    "kept apart); with --ringed it reorders nodes within their rings to reduce crossings. 0 "
+    "(default) keeps the base layout (force-directed, or plain ringed)."
 )
 
 
@@ -1843,12 +2139,16 @@ def _render_static_layout(data_json: str, variant: str, hint: str) -> str:
     """Fill the shared draw-only template with a graph payload, variant name, and hint line.
 
     Injects via ``str.replace`` (not ``%``/``format``) so the template's CSS/JS braces need no
-    escaping. ``__NODE_COUNT__``/``__EDGE_COUNT__`` are left for the caller to fill.
+    escaping. ``__NODE_COUNT__``/``__EDGE_COUNT__`` are left for the caller to fill. Label fonts
+    scale with the view only for the ``overlap-free`` variant (:data:`__SCALE_LABELS__`), whose
+    layout separates label rectangles in world space; the ringed variant keeps fixed-size labels.
     """
+    scale_labels = "true" if variant == "overlap-free" else "false"
     return (
         _STATIC_TEMPLATE.replace("__GRAPH_DATA__", data_json)
         .replace("__VARIANT__", variant)
         .replace("__HINT__", hint)
+        .replace("__SCALE_LABELS__", scale_labels)
     )
 
 
@@ -1948,6 +2248,12 @@ const edges = GRAPH.edges
   .map((e) => ({ s: index.get(e.source), t: index.get(e.target) }))
   .filter((e) => e.s && e.t);
 const clusters = GRAPH.clusters || [];
+// When true, label fonts scale with the view so a node's label keeps the same size *relative to*
+// the layout at every zoom. The no-overlap layout separates label rectangles in that same world
+// space, so its label-clearance then holds on screen at any zoom; the ringed layout does not
+// separate labels, so it keeps fixed-size labels (the reader can zoom in to pull two ring labels
+// off each other, which scaled fonts would prevent).
+const SCALE_LABELS = __SCALE_LABELS__;
 
 // --- view transform (pan/zoom), fit to the whole layout on first paint ------
 let scale = 1, panX = 0, panY = 0, centered = false;
@@ -1999,7 +2305,11 @@ function draw() {
     ctx.beginPath(); ctx.moveTo(s.x, s.y); ctx.lineTo(t.x, t.y); ctx.stroke();
   }
 
-  const showLabels = scale > 0.55;
+  // Label size: SCALE_LABELS (the no-overlap layout) scales fonts and offsets with the view so the
+  // world-space label clearance holds at every zoom; otherwise (ringed) fonts are fixed and shown
+  // once the view is zoomed in enough to read them.
+  const labelScale = SCALE_LABELS ? scale : 1;
+  const showLabels = SCALE_LABELS ? 11 * scale > 5 : scale > 0.55;
   for (const n of nodes) {
     const p = toScreen(n);
     const r = n.r * scale;
@@ -2011,12 +2321,13 @@ function draw() {
     ctx.strokeStyle = "#37474f"; ctx.stroke(); ctx.setLineDash([]);
     if (showLabels) {
       ctx.fillStyle = getComputedStyle(document.body).color;
-      ctx.font = "11px Helvetica, Arial, sans-serif";
+      ctx.font = (11 * labelScale).toFixed(2) + "px Helvetica, Arial, sans-serif";
       ctx.textAlign = "center";
-      ctx.fillText(n.label || n.id, p.x, p.y + r + 12);
+      ctx.fillText(n.label || n.id, p.x, p.y + r + 12 * labelScale);
       if (n.detail) {
-        ctx.fillStyle = "#78909c"; ctx.font = "9px Helvetica, Arial, sans-serif";
-        ctx.fillText(n.detail, p.x, p.y + r + 23);
+        ctx.fillStyle = "#78909c";
+        ctx.font = (9 * labelScale).toFixed(2) + "px Helvetica, Arial, sans-serif";
+        ctx.fillText(n.detail, p.x, p.y + r + 23 * labelScale);
       }
     }
   }

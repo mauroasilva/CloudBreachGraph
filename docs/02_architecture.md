@@ -382,24 +382,33 @@ Requirements:
   `--optimize-passes N` flag instead selects a third, **overlap-free** layout
   (`html_export.write_optimized_html`/
   `build_optimized_html`, sharing the draw-only template via `_render_static_layout`): it runs up
-  to N deterministic *optimisation passes* — a cooled force-directed unfolding
-  (`_OPT_FORCE_PASSES` cap) followed by hard geometric projection sweeps (`_optimize_layout`) —
-  laying the whole graph out at once, then **rigidly translating** each **connected component**
-  (`_connected_components`) into its own cell of a non-overlapping grid (`_pack_components`,
-  mirroring the ringed cluster tiling) so independent clusters stay visually separated — packing a
-  component as a rigid body preserves its internal crossings/overlaps and there are no
-  cross-component edges, so it keeps exactly the crossing count the joint layout found (better than
-  optimising each component in isolation). It stops the moment the drawing has
-  **zero node-node overlaps** and **zero edge-over-node
-  overlaps** (a non-incident node's disk intersecting an edge segment). Real topologies are
-  non-planar (the example graph's largest VPC alone contains a non-planar minor), so zero edge
-  *crossings* is impossible; this layout targets the two overlaps that hurt legibility instead. A
-  projection sweep that moves nothing certifies both counts are zero (`_count_overlaps` verifies).
-  A third **crossing-reduction** phase (`_reduce_crossings_free`, `_count_crossings`) then greedily
-  relocates each crossing-incident node to the nearby candidate slot with the fewest incident
-  crossings (a monotone move) and re-projects; it is a *secondary* objective (crossings ~halve on
-  the example graph, 39→18) that never sacrifices the overlap guarantee — if the relocation lands
-  somewhere the capped projection can't clear, the layout reverts to the phase-2 result.
+  to N deterministic *optimisation passes* over four phases (`_optimize_layout`/`_layout_nodes`):
+  a cooled force-directed **unfolding** (`_OPT_FORCE_PASSES` cap), hard geometric **projection**
+  sweeps that separate the disks/edges, a best-effort **crossing reduction**, and a final **label
+  pass** — laying the whole graph out at once, then **rigidly translating** each **connected
+  component** (`_connected_components`) into its own cell of a non-overlapping grid
+  (`_pack_components`, mirroring the ringed cluster tiling, now sized to include label extents) so
+  independent clusters stay visually separated — packing a component as a rigid body preserves its
+  internal crossings/overlaps and there are no cross-component edges, so it keeps exactly the
+  crossing count the joint layout found (better than optimising each component in isolation). It
+  stops the moment the drawing has **zero node-node overlaps**, **zero edge-over-node overlaps**
+  (a non-incident node's disk intersecting an edge segment) and **zero label overlaps** (a node's
+  label rectangle intersecting another label or another node's disk — `_count_label_overlaps`
+  verifies these, `_count_overlaps` the first two). A node's label is drawn just under its disk and
+  is usually wider than it, so labels are cleared *after* the disks are laid out and de-tangled, by
+  **uniformly inflating** the layout about its centroid — a transform that changes no edge crossing
+  — until the label rectangles have room, then projecting them apart (`_separate_overlaps` with
+  labels on; the inflation escalates if a projection can't reach zero). Because the labels are
+  separated in *world* space, the page scales its label fonts with the view (`SCALE_LABELS` in the
+  overlap-free variant of the draw-only template), so the clearance holds on screen at every zoom.
+  Real topologies are non-planar (the example graph's largest VPC alone contains a non-planar
+  minor), so zero edge *crossings* is impossible; this layout targets the overlaps that hurt
+  legibility instead. The **crossing-reduction** phase (`_reduce_crossings_free`,
+  `_count_crossings`) greedily relocates each crossing-incident node to the nearby candidate slot
+  with the fewest incident crossings (a monotone move) and re-projects the disks; it is a
+  *secondary* objective (crossings ~halve on the example graph, 39→18) that never sacrifices the
+  overlap guarantees — it runs on the disk-only layout, and the crossings-preserving label
+  inflation that follows keeps its result.
   `--optimize-passes` is unified across both layouts (ringed reduction with `--ringed`, overlap-free
   without) and both CLIs. The three-way choice lives in one place — `html_export.write_layout_html`
   (with the shared `RINGED_HELP`/`OPTIMIZE_PASSES_HELP` flag descriptions) — which both

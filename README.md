@@ -149,7 +149,8 @@ cloudbreachgraph --from-cache tests/fixtures --output-dir out/
                              (falls back to .dot when the graph is too large)
 --ringed                   with --html, render the concentric-ringed layout
 --optimize-passes N        with --html, run up to N optimisation passes: overlap-free
-                             layout, or ringed crossing-reduction with --ringed
+                             layout (no node/edge/label overlap), or ringed
+                             crossing-reduction with --ringed
                              (default 0 = base force/ringed layout)
 ```
 
@@ -181,7 +182,8 @@ cloudbreachgraph --from-cache tests/fixtures --output-dir out/
   ENIs with a public IP get a red "exposed" outline. Add **`--optimize-passes N`** (see below)
   to write the deterministic **overlap-free** layout instead of this in-browser force layout —
   positions are computed in Python so the page opens already settled, with no overlapping
-  nodes, no edge crossing a node, fewer edge crossings, and independent clusters kept apart.
+  nodes, no edge crossing a node, no label overlapping another label or node, fewer edge
+  crossings, and independent clusters kept apart.
   For very large graphs an
   in-browser force layout stops being responsive, so if the graph exceeds the render budget
   the tool **warns and skips the HTML**, pointing you at the always-written `.dot` (which
@@ -371,32 +373,41 @@ cloudbreachgraph-to-html out/graph.json --ringed --optimize-passes 20
 Both the force and ringed layouts trade off overlaps against structure. When the priority is a
 clean, uncluttered picture, pass **`--optimize-passes N`** (without `--ringed`) to render the
 **overlap-free** layout: it runs up to **N graph-optimisation passes** and stops as soon as the
-drawing has **no two node disks overlapping** and **no edge drawn across a node** it isn't
-connected to (an *edge overlap* — the natural counterpart of a node overlap). Positions are
-computed deterministically in Python (no in-browser relaxation); you keep drag, zoom and pan.
-The very same flag works on the main `cloudbreachgraph` command too — `cloudbreachgraph --html
+drawing has **no two node disks overlapping**, **no edge drawn across a node** it isn't connected
+to (an *edge overlap* — the natural counterpart of a node overlap), and **no node's label
+overlapping another label or another node's disk** (a *label overlap*). Positions are computed
+deterministically in Python (no in-browser relaxation); you keep drag, zoom and pan. The very
+same flag works on the main `cloudbreachgraph` command too — `cloudbreachgraph --html
 --optimize-passes N` writes this layout straight from a collection run.
 
-Each pass runs one of three phases: a force-directed **unfolding** that spreads the nodes into a
+Each pass runs one of four phases: a force-directed **unfolding** that spreads the nodes into a
 roomy arrangement, a hard geometric **projection** that separates overlapping disks and pushes
-any node off an edge that crosses it (until both overlap counts are exactly zero), and a
-best-effort **crossing reduction** that relocates each crossing-heavy node to the nearby slot
-with the fewest incident crossings — followed by a final projection so the overlap guarantee
-still holds. Finally, each **connected component** (an independent cluster — e.g. one VPC and
-everything under it) is **translated into its own cell of a non-overlapping grid** with a clear
-gap between them, so it stays obvious which nodes belong together and which clusters are
-disconnected. Moving a component as a rigid body doesn't change its internal crossings or
-overlaps, and there are no edges between components, so the separated drawing keeps exactly the
-crossing count the joint layout achieved. A real capture is **non-planar** (a single VPC can contain a non-planar minor), so a
-drawing with zero edge *crossings* cannot exist; crossings are therefore a *secondary* goal
-(minimised, not zeroed) behind the primary no-overlap guarantee. A larger `N` only raises the
-ceiling on passes; the layout stops early once it converges, so the result is stable. Combined
-with `--ringed`, `--optimize-passes` instead drives the ringed crossing-reduction described
-above; on its own it selects this overlap-free layout, and `--optimize-passes 0` (the default)
-keeps the plain force / ringed layout.
+any node off an edge that crosses it, a best-effort **crossing reduction** that relocates each
+crossing-heavy node to the nearby slot with the fewest incident crossings, and finally a
+**label pass** that clears the labels. A node's label is drawn just under its disk and is often
+wider than the disk itself, so the label pass makes room by **uniformly inflating** the
+finished, de-tangled layout — a transform that cannot change any edge crossing — until the
+labels have space, then separates them. Because the labels are separated in *world* space, the
+page **scales its label fonts with the view** (exactly as it already scales the disks), so the
+same clearance holds on screen at every zoom; on a dense VPC you simply zoom in to read, and the
+labels never sit on top of one another. Finally, each **connected component** (an independent
+cluster — e.g. one VPC and everything under it) is **translated into its own cell of a
+non-overlapping grid** (label extents included) with a clear gap between them, so it stays
+obvious which nodes belong together and which clusters are disconnected. Moving a component as a
+rigid body doesn't change its internal crossings or overlaps, and there are no edges between
+components, so the separated drawing keeps exactly the crossing count the joint layout achieved.
+A real capture is **non-planar** (a single VPC can contain a non-planar minor), so a drawing
+with zero edge *crossings* cannot exist; crossings are therefore a *secondary* goal (minimised,
+not zeroed) behind the primary no-overlap guarantees. A larger `N` only raises the ceiling on
+passes; the layout stops early once it converges, so the result is stable. Combined with
+`--ringed`, `--optimize-passes` instead drives the ringed crossing-reduction described above; on
+its own it selects this overlap-free layout, and `--optimize-passes 0` (the default) keeps the
+plain force / ringed layout.
 
-On the shipped 124-node/4-VPC example graph, `--optimize-passes 10000` reaches **0 node and 0
-edge overlap in ~400 passes** and roughly **halves the edge crossings** (39 → 18):
+On the shipped 124-node/4-VPC example graph, `--optimize-passes 10000` reaches **0 node, 0 edge
+and 0 label overlap** and roughly **halves the edge crossings** (39 → 18); run per-VPC with
+`--split-by-vpc`, every VPC likewise reaches **zero label overlap** while keeping its crossing
+count (e.g. the 57-node VPC stays at 15):
 
 ```bash
 cloudbreachgraph-to-html docs/examples/example-graph.json --optimize-passes 10000 -o example.html
