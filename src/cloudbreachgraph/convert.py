@@ -50,21 +50,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--ringed",
         action="store_true",
-        help="render the ringed layout instead of the force-directed one: each VPC is the "
-        "center of a cluster, ringed by its subnets, then its ENIs, then everything else "
-        "(same size guard / .dot fallback)",
+        help=f"{html_export.RINGED_HELP} (same size guard / .dot fallback)",
     )
     p.add_argument(
         "--optimize-passes",
         type=int,
         default=0,
         metavar="N",
-        help="run up to N graph-optimisation passes (stops early once it converges). Without "
-        "--ringed this renders the deterministic overlap-free layout: it spreads the nodes so no "
-        "two node disks overlap and no edge is drawn across a node, minimises edge crossings, and "
-        "keeps independent clusters apart. With --ringed it instead reorders nodes within their "
-        "rings to reduce crossings. 0 (default) keeps the base layout (force-directed, or plain "
-        "ringed).",
+        help=html_export.OPTIMIZE_PASSES_HELP,
     )
     return p
 
@@ -84,14 +77,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"cloudbreachgraph-to-html: {exc}", file=sys.stderr)
         return 2
 
-    if args.ringed:
-        # Ringed layout: --optimize-passes runs the in-ring crossing-reduction passes.
-        result = html_export.write_ringed_html(graph, out_path, passes=args.optimize_passes)
-    elif args.optimize_passes > 0:
-        # Overlap-free layout: --optimize-passes is the pass budget.
-        result = html_export.write_optimized_html(graph, out_path, max_passes=args.optimize_passes)
-    else:
-        result = html_export.write_html(graph, out_path)
+    result = html_export.write_layout_html(
+        graph, out_path, ringed=args.ringed, optimize_passes=args.optimize_passes
+    )
     if result is not None:
         print(f"wrote {result}")
         return 0

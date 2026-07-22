@@ -1277,6 +1277,50 @@ def write_optimized_html(
 
 
 # --------------------------------------------------------------------------- #
+# Shared HTML layout selection — the single source of truth for how the ``--html`` layout is
+# chosen, so the two CLIs (``cli.py`` and ``convert.py``) can't drift apart. Both dispatch through
+# :func:`write_layout_html` and describe the flags with the :data:`RINGED_HELP` /
+# :data:`OPTIMIZE_PASSES_HELP` fragments below.
+# --------------------------------------------------------------------------- #
+
+# The layout descriptions shared by both CLIs' ``--ringed`` / ``--optimize-passes`` help; each CLI
+# frames them for its own context (e.g. the main CLI prefixes "with --html, ").
+RINGED_HELP = (
+    "render the concentric-ringed layout instead of the force one: each VPC is the center of a "
+    "cluster, ringed by its subnets, then its ENIs, then everything else"
+)
+OPTIMIZE_PASSES_HELP = (
+    "run up to N graph-optimisation passes (stops early once it converges). Without --ringed this "
+    "renders the deterministic overlap-free layout (no overlapping nodes, no edge drawn across a "
+    "node, fewer edge crossings, independent clusters kept apart); with --ringed it reorders nodes "
+    "within their rings to reduce crossings. 0 (default) keeps the base layout (force-directed, or "
+    "plain ringed)."
+)
+
+
+def write_layout_html(
+    graph: Graph,
+    path: str | Path,
+    *,
+    ringed: bool = False,
+    optimize_passes: int = 0,
+) -> Path | None:
+    """Write the ``--html`` layout selected by the CLI flags, returning the path or ``None``.
+
+    Three-way selection shared by both CLIs: ``--ringed`` → the ringed layout (``optimize_passes``
+    is its in-ring crossing-reduction budget); otherwise ``optimize_passes > 0`` → the overlap-free
+    layout; otherwise the in-browser force layout. Returns ``None`` (writing nothing) when the graph
+    is too large for a browser layout, exactly like the underlying writers, so the caller can fall
+    back to the ``.dot``.
+    """
+    if ringed:
+        return write_ringed_html(graph, path, passes=optimize_passes)
+    if optimize_passes > 0:
+        return write_optimized_html(graph, path, max_passes=optimize_passes)
+    return write_html(graph, path)
+
+
+# --------------------------------------------------------------------------- #
 # The page template. Data is injected into __GRAPH_DATA__ (a JSON object literal).
 # Self-contained: inline CSS + JS, no network access, no external assets.
 # --------------------------------------------------------------------------- #

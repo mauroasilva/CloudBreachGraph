@@ -269,10 +269,10 @@ Requirements:
   the example graph, 39→18) that never sacrifices the overlap guarantee — if the relocation lands
   somewhere the capped projection can't clear, the layout reverts to the phase-2 result.
   `--optimize-passes` is unified across both layouts (ringed reduction with `--ringed`, overlap-free
-  without) and both CLIs — the main `cloudbreachgraph --html --optimize-passes N`
-  (`cli.py:_write_outputs`) writes this same overlap-free `graph.html` straight from a collection
-  run, sharing the writer and the `--from-cache` path; `N=0` (default) keeps the force/ringed
-  layout. Same `MAX_NODES`/`MAX_HTML_BYTES` guard and `.dot` fallback.
+  without) and both CLIs. The three-way choice lives in one place — `html_export.write_layout_html`
+  (with the shared `RINGED_HELP`/`OPTIMIZE_PASSES_HELP` flag descriptions) — which both
+  `cli._write_outputs` and `convert.main` call, so they can't drift; `N=0` (default) keeps the
+  force/ringed layout. Same `MAX_NODES`/`MAX_HTML_BYTES` guard and `.dot` fallback.
 - **Anonymising existing output** (`cloudbreachgraph-anonymize`, `anonymize.py`): an auxiliary
   console entry point that rewrites a previously written `graph.json` into a scrubbed copy safe
   to share as a debugging/example graph. It **keeps every node and edge** but replaces all

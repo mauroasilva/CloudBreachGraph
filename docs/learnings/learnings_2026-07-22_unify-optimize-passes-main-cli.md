@@ -53,9 +53,13 @@
 
 ## 6. Known gaps / follow-ups
 - The main `cloudbreachgraph` CLI now exposes all three layouts (force / overlap-free / ringed),
-  matching the converter. The two CLIs duplicate the layout-selection branch (`cli._write_outputs`
-  vs `convert.main`) and the `--ringed` / `--optimize-passes` help text — if the selection
-  semantics change, update both.
+  matching the converter. The selection is **not** duplicated: both CLIs call
+  `html_export.write_layout_html(graph, path, ringed=..., optimize_passes=...)` and build their
+  `--ringed` / `--optimize-passes` help from the shared `html_export.RINGED_HELP` /
+  `OPTIMIZE_PASSES_HELP` fragments (each CLI adds its own framing, e.g. the main CLI's "with
+  --html, " prefix). Add a new layout in `write_layout_html` and both CLIs pick it up. The
+  argparse arg definitions (name/type/`store_true`) and the without-`--html` warnings still live in
+  each parser — only the behaviour and descriptions are shared.
 
 ## 7. How to verify
 ```bash

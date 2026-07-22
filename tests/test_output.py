@@ -305,6 +305,33 @@ def test_write_optimized_html_falls_back_when_too_many_bytes(graph, tmp_path):
     assert not (tmp_path / "opt.html").exists()
 
 
+# HTML export — shared layout selection used by both CLIs
+
+
+def test_write_layout_html_dispatches_to_each_layout(graph, tmp_path):
+    # The shared selector both CLIs call: force by default, ringed with ringed=True, overlap-free
+    # with optimize_passes>0. Each must match building that exact layout directly.
+    force = html_export.write_layout_html(graph, tmp_path / "f.html").read_text()
+    assert force == html_export.build_html(graph)
+
+    ringed = html_export.write_layout_html(
+        graph, tmp_path / "r.html", ringed=True, optimize_passes=3
+    ).read_text()
+    assert ringed == html_export.build_ringed_html(graph, 3)
+
+    optimized = html_export.write_layout_html(
+        graph, tmp_path / "o.html", optimize_passes=500
+    ).read_text()
+    assert optimized == html_export.build_optimized_html(graph, 500)
+
+
+def test_write_layout_html_falls_back_when_too_large(graph, tmp_path, monkeypatch):
+    monkeypatch.setattr(html_export, "MAX_NODES", 0)
+    for kwargs in ({}, {"ringed": True}, {"optimize_passes": 100}):
+        assert html_export.write_layout_html(graph, tmp_path / "x.html", **kwargs) is None
+    assert not (tmp_path / "x.html").exists()
+
+
 def test_render_without_dot_returns_none(graph, tmp_path, monkeypatch):
     dot_path = dot_export.write_dot(graph, tmp_path / "graph.dot")
     monkeypatch.setattr(dot_export.shutil, "which", lambda _: None)
