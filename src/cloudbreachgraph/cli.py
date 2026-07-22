@@ -107,9 +107,19 @@ def build_parser() -> argparse.ArgumentParser:
     out.add_argument(
         "--html",
         action="store_true",
-        help="also write an interactive, self-contained HTML view (graph.html) whose nodes "
-        "self-distribute via a force layout; falls back to the .dot when the graph is too "
-        "large to render responsibly in a browser",
+        help="also write an interactive, self-contained HTML view (graph.html); by default its "
+        "nodes self-distribute via an in-browser force layout. Falls back to the .dot when the "
+        "graph is too large to render responsibly in a browser",
+    )
+    out.add_argument(
+        "--optimize-passes",
+        type=int,
+        default=0,
+        metavar="N",
+        help="with --html, run up to N graph-optimisation passes to produce a deterministic "
+        "overlap-free layout instead of the in-browser force one: no overlapping nodes, no edge "
+        "drawn across a node, fewer edge crossings, and independent clusters kept apart. Stops "
+        "early once it converges. 0 (default) keeps the force layout.",
     )
     return p
 
@@ -190,7 +200,12 @@ def _write_outputs(collected: dict, out_dir: Path, stem: str, args: argparse.Nam
     print(f"wrote {dot_path}")
 
     if args.html:
-        html_path = html_export.write_html(graph, out_dir / f"{stem}.html")
+        if args.optimize_passes > 0:
+            html_path = html_export.write_optimized_html(
+                graph, out_dir / f"{stem}.html", max_passes=args.optimize_passes
+            )
+        else:
+            html_path = html_export.write_html(graph, out_dir / f"{stem}.html")
         if html_path is None:
             # Too large to render responsibly in a browser: fall back to the .dot, which
             # Graphviz can lay out offline at any scale (docs/02_architecture.md §7).
@@ -236,6 +251,15 @@ def _run_all_accounts(cfg: AccountConfig, out_dir: Path, args: argparse.Namespac
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     out_dir = Path(args.output_dir)
+
+    if args.optimize_passes < 0:
+        print("cloudbreachgraph: --optimize-passes must be >= 0", file=sys.stderr)
+        return 2
+    if args.optimize_passes and not args.html:
+        print(
+            "cloudbreachgraph: warning: --optimize-passes only affects --html; ignoring it.",
+            file=sys.stderr,
+        )
 
     try:
         # Offline: build from cached JSON, no config/credentials needed.

@@ -221,6 +221,44 @@ def test_html_falls_back_to_dot_when_too_large(tmp_path, monkeypatch, capsys):
     assert "too large" in err and "graph.dot" in err
 
 
+def test_html_optimize_passes_writes_overlap_free_layout(tmp_path):
+    # --html --optimize-passes N renders the deterministic overlap-free layout, not the force one.
+    out = tmp_path / "out"
+    rc = cli.main(
+        [
+            "--from-cache",
+            str(FIXTURES),
+            "--output-dir",
+            str(out),
+            "--html",
+            "--optimize-passes",
+            "500",
+        ]
+    )
+    assert rc == 0
+    text = (out / "graph.html").read_text()
+    assert "overlap-free" in text  # variant marker, absent from the force layout
+    assert "const GRAPH =" in text
+
+
+def test_optimize_passes_without_html_warns_and_is_ignored(tmp_path, capsys):
+    out = tmp_path / "out"
+    rc = cli.main(
+        ["--from-cache", str(FIXTURES), "--output-dir", str(out), "--optimize-passes", "50"]
+    )
+    assert rc == 0
+    assert not (out / "graph.html").exists()  # --html not given, so no HTML at all
+    assert "only affects --html" in capsys.readouterr().err
+
+
+def test_optimize_passes_negative_errors(tmp_path):
+    out = tmp_path / "out"
+    rc = cli.main(
+        ["--from-cache", str(FIXTURES), "--output-dir", str(out), "--optimize-passes", "-1"]
+    )
+    assert rc == 2
+
+
 def test_all_accounts_writes_one_graph_each(tmp_path, fake_aws):
     cfg = _write_config(tmp_path)
     out = tmp_path / "out"

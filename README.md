@@ -144,6 +144,8 @@ cloudbreachgraph --from-cache tests/fixtures --output-dir out/
 --render {png,svg}         also rasterize the .dot with Graphviz (needs `dot`)
 --html                     also write an interactive, self-contained HTML view
                              (falls back to .dot when the graph is too large)
+--optimize-passes N        with --html, run up to N optimisation passes for a
+                             deterministic overlap-free layout (default 0 = force)
 ```
 
 ## Outputs
@@ -169,7 +171,11 @@ cloudbreachgraph --from-cache tests/fixtures --output-dir out/
   anchors each node to its current position and only relieves local crowding (resolving
   overlaps, easing clusters apart), so a layout you arranged by hand is preserved rather than
   re-solved into a fresh tangle; click again to tidy further. Nodes are colored by type and
-  ENIs with a public IP get a red "exposed" outline. For very large graphs an
+  ENIs with a public IP get a red "exposed" outline. Add **`--optimize-passes N`** (see below)
+  to write the deterministic **overlap-free** layout instead of this in-browser force layout —
+  positions are computed in Python so the page opens already settled, with no overlapping
+  nodes, no edge crossing a node, fewer edge crossings, and independent clusters kept apart.
+  For very large graphs an
   in-browser force layout stops being responsive, so if the graph exceeds the render budget
   the tool **warns and skips the HTML**, pointing you at the always-written `.dot` (which
   Graphviz can lay out offline at any scale). Just open the file in any browser — it works
@@ -189,7 +195,7 @@ cloudbreachgraph-to-html out/graph.json                 # writes out/graph.html
 cloudbreachgraph-to-html out/graph.dot -o topology.html # explicit output path
 cloudbreachgraph-to-html capture.data --format json     # force the input format
 cloudbreachgraph-to-html out/graph.json --ringed        # concentric-ringed layout
-cloudbreachgraph-to-html out/graph.json --max-passes 10000  # overlap-free layout
+cloudbreachgraph-to-html out/graph.json --optimize-passes 10000  # overlap-free layout
 ```
 
 No capture of your own? A shipped, fully **anonymised** example graph (a real-shaped
@@ -232,7 +238,7 @@ exactly like the default HTML mode.
 
 By default a subnet/EC2/LB sits at the *mean* angle of its ENIs, which can push a resource
 into an awkward spot when its ENIs span subnets on opposite sides of the ring (long, crossing
-edges). Add `--optimize-passes N` (ringed layout only) to run up to **N passes** that move each
+edges). Add `--optimize-passes N` (with `--ringed`) to run up to **N passes** that move each
 node toward the mean angle of its neighbours — placing it there **as close as an overlap-free
 minimum gap allows**, so two subnets that share a load balancer are pulled right next to each
 other (not just reordered into distant even slots) and its edges stop crossing the circle — and
@@ -254,14 +260,16 @@ genuinely sit in three different subnets must fan its spokes across the ring.
 cloudbreachgraph-to-html out/graph.json --ringed --optimize-passes 20
 ```
 
-### Overlap-free layout (`--max-passes N`)
+### Overlap-free layout (`--optimize-passes N`)
 
 Both the force and ringed layouts trade off overlaps against structure. When the priority is a
-clean, uncluttered picture, pass **`--max-passes N`** to render the **overlap-free** layout: it
-runs up to **N graph-optimisation passes** and stops as soon as the drawing has **no two node
-disks overlapping** and **no edge drawn across a node** it isn't connected to (an *edge overlap*
-— the natural counterpart of a node overlap). Positions are computed deterministically in Python
-(no in-browser relaxation); you keep drag, zoom and pan.
+clean, uncluttered picture, pass **`--optimize-passes N`** (without `--ringed`) to render the
+**overlap-free** layout: it runs up to **N graph-optimisation passes** and stops as soon as the
+drawing has **no two node disks overlapping** and **no edge drawn across a node** it isn't
+connected to (an *edge overlap* — the natural counterpart of a node overlap). Positions are
+computed deterministically in Python (no in-browser relaxation); you keep drag, zoom and pan.
+The very same flag works on the main `cloudbreachgraph` command too — `cloudbreachgraph --html
+--optimize-passes N` writes this layout straight from a collection run.
 
 Each pass runs one of three phases: a force-directed **unfolding** that spreads the nodes into a
 roomy arrangement, a hard geometric **projection** that separates overlapping disks and pushes
@@ -276,15 +284,18 @@ overlaps, and there are no edges between components, so the separated drawing ke
 crossing count the joint layout achieved. A real capture is **non-planar** (a single VPC can contain a non-planar minor), so a
 drawing with zero edge *crossings* cannot exist; crossings are therefore a *secondary* goal
 (minimised, not zeroed) behind the primary no-overlap guarantee. A larger `N` only raises the
-ceiling on passes; the layout stops early once it converges, so the result is stable.
-`--max-passes` takes precedence over `--ringed` / `--optimize-passes` (which don't apply to it),
-and `--max-passes 0` (the default) keeps the force/ringed layout.
+ceiling on passes; the layout stops early once it converges, so the result is stable. Combined
+with `--ringed`, `--optimize-passes` instead drives the ringed crossing-reduction described
+above; on its own it selects this overlap-free layout, and `--optimize-passes 0` (the default)
+keeps the plain force / ringed layout.
 
-On the shipped 124-node/4-VPC example graph, `--max-passes 10000` reaches **0 node and 0 edge
-overlap in ~400 passes** and roughly **halves the edge crossings** (39 → 18):
+On the shipped 124-node/4-VPC example graph, `--optimize-passes 10000` reaches **0 node and 0
+edge overlap in ~400 passes** and roughly **halves the edge crossings** (39 → 18):
 
 ```bash
-cloudbreachgraph-to-html docs/examples/example-graph.json --max-passes 10000 -o example.html
+cloudbreachgraph-to-html docs/examples/example-graph.json --optimize-passes 10000 -o example.html
+# or straight from a collection run:
+cloudbreachgraph --from-cache tests/fixtures --html --optimize-passes 10000
 ```
 
 ## Anonymising a graph for sharing

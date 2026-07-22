@@ -26,7 +26,8 @@ needs no in-browser relaxation. It shares the same :data:`MAX_NODES` / :data:`MA
 size guard and the same ``None``-means-fall-back-to-``.dot`` contract.
 
 A third, **overlap-free** layout (:func:`write_optimized_html` / :func:`build_optimized_html`,
-exposed by ``cloudbreachgraph-to-html --max-passes N``) also computes positions in Python, but
+exposed by ``--optimize-passes N`` on both ``cloudbreachgraph --html`` and
+``cloudbreachgraph-to-html``) also computes positions in Python, but
 its objective is legibility of the rendering rather than a fixed shape: it runs up to ``N``
 optimisation passes and guarantees that, once it converges, **no two node disks overlap** and
 **no edge is drawn across a node it is not connected to** (an "edge overlap"). Real topologies
@@ -718,7 +719,7 @@ def write_ringed_html(
 
 
 # --------------------------------------------------------------------------- #
-# Overlap-elimination layout (--max-passes).
+# Overlap-elimination layout (--optimize-passes).
 #
 # A third deterministic, Python-computed layout whose single promise is that the *rendering* is
 # legible: after it converges, **no two node disks overlap** and **no edge is drawn across a
@@ -1048,7 +1049,7 @@ def _layout_nodes(nodes: list, edges: list, max_passes: int) -> int:
     vy = [0.0] * n
 
     passes = 0
-    # Give projection a guaranteed share of the budget so a modest --max-passes still converges.
+    # Give projection a guaranteed share of the budget so a modest pass count still converges.
     force_budget = min(max_passes, _OPT_FORCE_PASSES)
     if max_passes - force_budget < _OPT_PROJECT_MIN:
         force_budget = max(0, max_passes - _OPT_PROJECT_MIN)

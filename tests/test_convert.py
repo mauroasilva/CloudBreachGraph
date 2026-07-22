@@ -610,18 +610,8 @@ def test_convert_ringed_optimize_passes(graph, tmp_path):
 
 def test_convert_optimize_passes_negative_errors(graph, tmp_path):
     jp = json_export.write_json(graph, tmp_path / "graph.json")
-    rc = convert.main([str(jp), "--ringed", "--optimize-passes", "-1"])
+    rc = convert.main([str(jp), "--optimize-passes", "-1"])
     assert rc == 2
-
-
-def test_convert_optimize_passes_ignored_without_ringed(graph, tmp_path, capsys):
-    jp = json_export.write_json(graph, tmp_path / "graph.json")
-    out = tmp_path / "force.html"
-    rc = convert.main([str(jp), "--optimize-passes", "5", "-o", str(out)])
-    assert rc == 0
-    # Force-directed page still written, and it ignores the flag (produces the plain force HTML).
-    assert out.read_text() == html_export.build_html(graph)
-    assert "only affects --ringed" in capsys.readouterr().err
 
 
 # --------------------------------------------------------------------------- #
@@ -742,30 +732,20 @@ def test_optimized_layout_reduces_crossings(monkeypatch):
     assert after_overlaps == (0, 0)
 
 
-def test_convert_max_passes_writes_overlap_free(graph, tmp_path):
+def test_convert_optimize_passes_writes_overlap_free(graph, tmp_path):
+    # Without --ringed, --optimize-passes N (>0) renders the overlap-free layout.
     jp = json_export.write_json(graph, tmp_path / "graph.json")
     out = tmp_path / "opt.html"
-    rc = convert.main([str(jp), "--max-passes", "500", "-o", str(out)])
+    rc = convert.main([str(jp), "--optimize-passes", "500", "-o", str(out)])
     assert rc == 0
     assert out.read_text() == html_export.build_optimized_html(graph, 500)
     assert "overlap-free" in out.read_text()
 
 
-def test_convert_max_passes_negative_errors(graph, tmp_path):
+def test_convert_optimize_passes_zero_keeps_force_layout(graph, tmp_path):
+    # --optimize-passes 0 (the default) leaves the plain in-browser force layout.
     jp = json_export.write_json(graph, tmp_path / "graph.json")
-    rc = convert.main([str(jp), "--max-passes", "-1"])
-    assert rc == 2
-
-
-def test_convert_max_passes_overrides_ringed(graph, tmp_path, capsys):
-    jp = json_export.write_json(graph, tmp_path / "graph.json")
-    out = tmp_path / "opt.html"
-    rc = convert.main(
-        [str(jp), "--ringed", "--optimize-passes", "3", "--max-passes", "500", "-o", str(out)]
-    )
+    out = tmp_path / "force.html"
+    rc = convert.main([str(jp), "--optimize-passes", "0", "-o", str(out)])
     assert rc == 0
-    # The overlap-free layout is produced; the ringed knobs are ignored (with a warning).
-    assert out.read_text() == html_export.build_optimized_html(graph, 500)
-    err = capsys.readouterr().err
-    assert "ignoring --ringed" in err
-    assert "ignoring --optimize-passes" in err
+    assert out.read_text() == html_export.build_html(graph)
