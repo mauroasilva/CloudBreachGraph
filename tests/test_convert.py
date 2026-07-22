@@ -840,3 +840,132 @@ def test_convert_optimize_passes_zero_keeps_force_layout(graph, tmp_path):
     rc = convert.main([str(jp), "--optimize-passes", "0", "-o", str(out)])
     assert rc == 0
     assert out.read_text() == html_export.build_html(graph)
+
+
+# --------------------------------------------------------------------------- #
+# Split by VPC (--split-by-vpc)
+# --------------------------------------------------------------------------- #
+def test_split_by_vpc_partitions_nodes_and_edges():
+    from cloudbreachgraph.model.graph import Edge, Graph, Node
+
+    g = Graph(meta={"account": "x"})
+    for vpc in ("vpc-a", "vpc-b"):
+        g.add_node(Node(vpc, "vpc", vpc))
+        g.add_node(Node(f"subnet-{vpc}", "subnet", f"subnet-{vpc}"))
+        g.add_node(Node(f"eni-{vpc}", "eni", f"eni-{vpc}"))
+        g.add_edge(Edge(f"subnet-{vpc}", vpc, "in_vpc"))
+        g.add_edge(Edge(f"eni-{vpc}", f"subnet-{vpc}", "in_subnet"))
+    # A stray node that traces to no VPC must not land in any sub-graph.
+    g.add_node(Node("eni-orphan", "eni", "eni-orphan"))
+
+    subs = html_export.split_by_vpc(g)
+    assert list(subs) == ["vpc-a", "vpc-b"]  # ordered by VPC id
+    for vpc, sub in subs.items():
+        assert {n.id for n in sub.nodes} == {vpc, f"subnet-{vpc}", f"eni-{vpc}"}
+        assert {(e.source, e.target) for e in sub.edges} == {
+            (f"subnet-{vpc}", vpc),
+            (f"eni-{vpc}", f"subnet-{vpc}"),
+        }
+        assert sub.meta == {"account": "x"}  # meta is carried onto every sub-graph
+        assert sub.get_node("eni-orphan") is None  # unassigned nodes are dropped
+
+
+def test_split_by_vpc_empty_when_no_vpcs():
+    from cloudbreachgraph.model.graph import Graph, Node
+
+    g = Graph(meta={})
+    g.add_node(Node("eni-1", "eni", "eni-1"))
+    assert html_export.split_by_vpc(g) == {}
+
+
+_EXAMPLE_GRAPH_4VPC = (
+    Path(__file__).resolve().parents[1] / "docs" / "examples" / "example-graph.json"
+)
+
+
+def test_convert_split_by_vpc_writes_one_html_per_vpc(tmp_path):
+    # Acceptance criteria: the 4-VPC example graph splits into 4 graph-<VPC ID>.html files.
+    g = load_graph(_EXAMPLE_GRAPH_4VPC)
+    jp = json_export.write_json(g, tmp_path / "graph.json")
+    out_dir = tmp_path / "split"
+    rc = convert.main([str(jp), "--split-by-vpc", "-o", str(out_dir)])
+    assert rc == 0
+
+    vpc_ids = sorted(n.id for n in g.nodes if n.type == "vpc")
+    assert len(vpc_ids) == 4
+    for vpc_id in vpc_ids:
+        f = out_dir / f"graph-{vpc_id}.html"
+        assert f.is_file()
+        text = f.read_text()
+        assert text.startswith("<!DOCTYPE html>")
+        assert vpc_id in text  # the VPC's own node is present in its file
+    # Exactly one file per VPC, nothing extra.
+    assert sorted(p.name for p in out_dir.glob("*.html")) == [f"graph-{v}.html" for v in vpc_ids]
+
+
+def test_convert_split_by_vpc_matches_direct_writer(tmp_path):
+    # Each per-VPC file is byte-identical to writing that sub-graph directly.
+    g = load_graph(_EXAMPLE_GRAPH_4VPC)
+    jp = json_export.write_json(g, tmp_path / "graph.json")
+    out_dir = tmp_path / "split"
+    convert.main([str(jp), "--split-by-vpc", "-o", str(out_dir)])
+    for vpc_id, sub in html_export.split_by_vpc(g).items():
+        assert (out_dir / f"graph-{vpc_id}.html").read_text() == html_export.build_html(sub)
+
+
+def test_convert_split_by_vpc_defaults_output_dir_to_input_dir(tmp_path):
+    g = load_graph(_EXAMPLE_GRAPH_4VPC)
+    jp = json_export.write_json(g, tmp_path / "graph.json")
+    rc = convert.main([str(jp), "--split-by-vpc"])  # no -o: write beside the input
+    assert rc == 0
+    vpc_ids = [n.id for n in g.nodes if n.type == "vpc"]
+    for vpc_id in vpc_ids:
+        assert (tmp_path / f"graph-{vpc_id}.html").is_file()
+
+
+def test_convert_split_by_vpc_ringed_layout(tmp_path):
+    # --ringed applies to every per-VPC file.
+    g = load_graph(_EXAMPLE_GRAPH_4VPC)
+    jp = json_export.write_json(g, tmp_path / "graph.json")
+    out_dir = tmp_path / "split"
+    convert.main([str(jp), "--split-by-vpc", "--ringed", "-o", str(out_dir)])
+    for vpc_id, sub in html_export.split_by_vpc(g).items():
+        assert (out_dir / f"graph-{vpc_id}.html").read_text() == html_export.build_ringed_html(sub)
+
+
+def test_convert_split_by_vpc_optimize_passes_layout(tmp_path):
+    # --optimize-passes (without --ringed) applies the overlap-free layout to every per-VPC file.
+    g = load_graph(_EXAMPLE_GRAPH_4VPC)
+    jp = json_export.write_json(g, tmp_path / "graph.json")
+    out_dir = tmp_path / "split"
+    convert.main([str(jp), "--split-by-vpc", "--optimize-passes", "50", "-o", str(out_dir)])
+    for vpc_id, sub in html_export.split_by_vpc(g).items():
+        assert (out_dir / f"graph-{vpc_id}.html").read_text() == html_export.build_optimized_html(
+            sub, 50
+        )
+
+
+def test_convert_split_by_vpc_no_vpcs_returns_2(graph, tmp_path):
+    # A graph with no VPC nodes has nothing to split.
+    from cloudbreachgraph.model.graph import Graph, Node
+
+    g = Graph(meta={})
+    g.add_node(Node("eni-1", "eni", "eni-1"))
+    jp = json_export.write_json(g, tmp_path / "graph.json")
+    rc = convert.main([str(jp), "--split-by-vpc", "-o", str(tmp_path / "out")])
+    assert rc == 2
+
+
+def test_convert_split_by_vpc_falls_back_to_dot_when_too_large(tmp_path, monkeypatch, capsys):
+    # The size guard is per-file: an over-size VPC sub-graph falls back to its own graph-<id>.dot.
+    monkeypatch.setattr(html_export, "MAX_NODES", 0)
+    g = load_graph(_EXAMPLE_GRAPH_4VPC)
+    jp = json_export.write_json(g, tmp_path / "graph.json")
+    out_dir = tmp_path / "split"
+    rc = convert.main([str(jp), "--split-by-vpc", "-o", str(out_dir)])
+    assert rc == 0
+    vpc_ids = [n.id for n in g.nodes if n.type == "vpc"]
+    for vpc_id in vpc_ids:
+        assert not (out_dir / f"graph-{vpc_id}.html").exists()  # HTML skipped
+        assert (out_dir / f"graph-{vpc_id}.dot").is_file()  # per-VPC .dot fallback
+    assert "too large" in capsys.readouterr().err

@@ -404,7 +404,14 @@ Requirements:
   without) and both CLIs. The three-way choice lives in one place — `html_export.write_layout_html`
   (with the shared `RINGED_HELP`/`OPTIMIZE_PASSES_HELP` flag descriptions) — which both
   `cli._write_outputs` and `convert.main` call, so they can't drift; `N=0` (default) keeps the
-  force/ringed layout. Same `MAX_NODES`/`MAX_HTML_BYTES` guard and `.dot` fallback.
+  force/ringed layout. Same `MAX_NODES`/`MAX_HTML_BYTES` guard and `.dot` fallback. Its
+  `--split-by-vpc` flag writes **one HTML per VPC** — `graph-<VPC ID>.html` in the `-o` directory
+  (default: the input's directory) — via `html_export.split_by_vpc`, which partitions the graph on
+  the same `_vpc_group_of` tracing the ringed layout clusters by: each sub-graph holds the nodes
+  that resolve to that VPC plus the edges wholly within it (unassigned nodes and cross-VPC edges are
+  dropped). It reuses `write_layout_html` per sub-graph, so the layout flags (`--ringed`/
+  `--optimize-passes`/`--no-security-groups`) and the size guard / per-file `.dot` fallback all
+  apply to every VPC file.
 - **Anonymising existing output** (`cloudbreachgraph-anonymize`, `anonymize.py`): an auxiliary
   console entry point that rewrites a previously written `graph.json` into a scrubbed copy safe
   to share as a debugging/example graph. It **keeps every node and edge** but replaces all

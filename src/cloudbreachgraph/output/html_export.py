@@ -57,7 +57,7 @@ import math
 import random
 from pathlib import Path
 
-from ..model.graph import Graph
+from ..model.graph import Edge, Graph, Node
 
 # Beyond these, an in-browser force layout stops being "reasonably loadable": the O(n²)
 # simulation stutters and the inlined JSON bloats the page. The caller falls back to `.dot`.
@@ -642,6 +642,40 @@ def _vpc_group_of(graph: Graph) -> dict[str, str]:
             g = _vpc_of_eni(node_eni.get(n.id))
         group[n.id] = g or _UNASSIGNED
     return group
+
+
+def split_by_vpc(graph: Graph) -> dict[str, Graph]:
+    """Split *graph* into one self-contained sub-:class:`Graph` per VPC, keyed by VPC id.
+
+    Every node is assigned to its VPC via :func:`_vpc_group_of` (the same tracing the ringed
+    layout uses to cluster). A VPC's sub-graph holds exactly the nodes that resolve to it plus
+    every edge whose *both* endpoints resolve to that same VPC; nodes that trace to no VPC
+    (:data:`_UNASSIGNED`) and edges spanning two VPCs are dropped, so each sub-graph is a clean,
+    stand-alone picture of one VPC. A shared reachability source that fans into several VPCs is
+    grouped with just one of them (the first, deterministically — see :func:`_vpc_group_of`).
+
+    ``meta`` is copied onto each sub-graph. The result is ordered by VPC id so callers emit files
+    deterministically; it is empty when the graph has no VPC nodes.
+    """
+    group = _vpc_group_of(graph)
+    vpc_ids = sorted(n.id for n in graph.nodes if n.type == "vpc")
+    subgraphs: dict[str, Graph] = {vid: Graph(meta=dict(graph.meta)) for vid in vpc_ids}
+    for n in graph.nodes:
+        sub = subgraphs.get(group.get(n.id, _UNASSIGNED))
+        if sub is not None:
+            sub.add_node(Node(id=n.id, type=n.type, label=n.label, attributes=dict(n.attributes)))
+    for e in graph.edges:
+        g = group.get(e.source, _UNASSIGNED)
+        if g == group.get(e.target, _UNASSIGNED) and g in subgraphs:
+            subgraphs[g].add_edge(
+                Edge(
+                    source=e.source,
+                    target=e.target,
+                    relationship=e.relationship,
+                    attributes=dict(e.attributes),
+                )
+            )
+    return subgraphs
 
 
 def _ringed_view_data(graph: Graph, passes: int = 0) -> dict:
