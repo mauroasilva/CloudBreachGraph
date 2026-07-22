@@ -215,7 +215,11 @@ Requirements:
   stays responsive up to a point, `write_html` enforces a size guard (`MAX_NODES`,
   `MAX_HTML_BYTES`): over budget it writes nothing and returns `None`, and the CLI **warns
   and falls back to the always-written `.dot`** (which Graphviz lays out offline at any
-  scale).
+  scale). `--html` accepts the same layout selectors as the converter below: `--optimize-passes N`
+  swaps this in-browser force layout for the deterministic **overlap-free** layout
+  (`write_optimized_html`), and `--ringed` selects the **ringed** layout (`write_ringed_html`, with
+  `--optimize-passes` as its in-ring crossing-reduction budget). `--from-cache` and
+  `--all-accounts` go through the same `_write_outputs`, so they get all three.
 - **Converting existing output → HTML** (`cloudbreachgraph-to-html`, `convert.py`): an
   auxiliary console entry point that re-loads a previously written `graph.json`/`graph.dot`
   and renders the HTML view without re-collecting from AWS. Loading is the inverse of the
@@ -242,8 +246,9 @@ Requirements:
   (`_reduce_crossings`) relocates each node to the same-ring slot with the fewest incident edge
   crossings — a monotone minimiser (moving one node only changes crossings on its own edges), it
   clears whole spokes the barycenter passes leave crossing. Rings preserved, output
-  deterministic; `N=0` (default) is the exact ENI-aligned layout. The `--max-passes N` flag
-  instead selects a third, **overlap-free** layout (`html_export.write_optimized_html`/
+  deterministic; `N=0` (default) is the exact ENI-aligned layout. Without `--ringed`, the same
+  `--optimize-passes N` flag instead selects a third, **overlap-free** layout
+  (`html_export.write_optimized_html`/
   `build_optimized_html`, sharing the draw-only template via `_render_static_layout`): it runs up
   to N deterministic *optimisation passes* — a cooled force-directed unfolding
   (`_OPT_FORCE_PASSES` cap) followed by hard geometric projection sweeps (`_optimize_layout`) —
@@ -263,7 +268,10 @@ Requirements:
   crossings (a monotone move) and re-projects; it is a *secondary* objective (crossings ~halve on
   the example graph, 39→18) that never sacrifices the overlap guarantee — if the relocation lands
   somewhere the capped projection can't clear, the layout reverts to the phase-2 result.
-  `--max-passes` takes precedence over `--ringed`/`--optimize-passes`; `N=0` (default) keeps the
+  `--optimize-passes` is unified across both layouts (ringed reduction with `--ringed`, overlap-free
+  without) and both CLIs. The three-way choice lives in one place — `html_export.write_layout_html`
+  (with the shared `RINGED_HELP`/`OPTIMIZE_PASSES_HELP` flag descriptions) — which both
+  `cli._write_outputs` and `convert.main` call, so they can't drift; `N=0` (default) keeps the
   force/ringed layout. Same `MAX_NODES`/`MAX_HTML_BYTES` guard and `.dot` fallback.
 - **Anonymising existing output** (`cloudbreachgraph-anonymize`, `anonymize.py`): an auxiliary
   console entry point that rewrites a previously written `graph.json` into a scrubbed copy safe
