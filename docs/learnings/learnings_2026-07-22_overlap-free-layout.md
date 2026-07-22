@@ -15,6 +15,9 @@
   - `_seg_seg_cross(...)` / `_count_crossings(nodes, edges)` — segment-crossing predicate + counter.
   - `_reduce_crossings_free(...)` — the phase-3 greedy crossing-reduction local search + capped
     final projection (see §3).
+  - `_connected_components(...)` / `_pack_components(...)` — split the graph into components and
+    tile them into a non-overlapping grid; `_optimize_layout` is now a wrapper that lays the whole
+    graph out via `_layout_nodes` (the core solver) then rigidly translates each component apart.
   - `_optimized_view_data`, `build_optimized_html`, `write_optimized_html` — payload/page/writer,
     mirroring the ringed trio's signatures and size-guard contract.
   - Refactor: the ringed page template `_RINGED_TEMPLATE` became a **shared** draw-only template
@@ -74,6 +77,20 @@
   - If relocation ever lands in a genuinely tight spot the capped projection can't clear, revert
     to the phase-2 positions (saved as `safe_xs/safe_ys`) so the **overlap guarantee always
     holds** even at the cost of keeping more crossings.
+- **Component separation via whole-graph layout + rigid translation** (follow-up: without it the
+  force phase's gravity pulled all four VPCs toward one center and they mingled — impossible to
+  tell components apart). **First attempt** laid each component out *in isolation* then tiled them;
+  that separated them but the crossing count grew (26 vs 18) because a component optimised alone
+  lands in a worse local optimum than when solved jointly. **Kept instead:** lay the whole graph
+  out once (the good 18-crossing result), then rigidly translate each connected component into a
+  grid cell (`_pack_components`, `_OPT_CLUSTER_GAP` between cells). Rigid translation can't change a
+  component's internal crossings/overlaps and there are no cross-component edges, so separation is
+  free — crossings stay 18. Don't reintroduce per-component optimisation; it's both worse on
+  crossings and (surprisingly) not needed.
+- **Gotcha the isolation attempt exposed (fix kept):** a component's **phase-2** (overlap)
+  projection can oscillate in the `_OPT_MARGIN` band and, lacking the strict-overlap early-stop
+  phase 3 already had, burn the whole pass budget without ever reaching crossing reduction. Phase 2
+  now also breaks as soon as `_has_overlap` is strictly clean, not just on `moved == False`.
 
 ## 4. Deviations from the plan
 - None structurally. `docs/05_roadmap.md` roles untouched (no new resource type). This is a

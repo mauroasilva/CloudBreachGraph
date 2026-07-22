@@ -268,7 +268,12 @@ roomy arrangement, a hard geometric **projection** that separates overlapping di
 any node off an edge that crosses it (until both overlap counts are exactly zero), and a
 best-effort **crossing reduction** that relocates each crossing-heavy node to the nearby slot
 with the fewest incident crossings — followed by a final projection so the overlap guarantee
-still holds. A real capture is **non-planar** (a single VPC can contain a non-planar minor), so a
+still holds. Finally, each **connected component** (an independent cluster — e.g. one VPC and
+everything under it) is **translated into its own cell of a non-overlapping grid** with a clear
+gap between them, so it stays obvious which nodes belong together and which clusters are
+disconnected. Moving a component as a rigid body doesn't change its internal crossings or
+overlaps, and there are no edges between components, so the separated drawing keeps exactly the
+crossing count the joint layout achieved. A real capture is **non-planar** (a single VPC can contain a non-planar minor), so a
 drawing with zero edge *crossings* cannot exist; crossings are therefore a *secondary* goal
 (minimised, not zeroed) behind the primary no-overlap guarantee. A larger `N` only raises the
 ceiling on passes; the layout stops early once it converges, so the result is stable.
