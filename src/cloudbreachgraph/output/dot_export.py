@@ -8,14 +8,16 @@
   layout visually nests reachability inside each VPC. EC2 instances and load balancers are
   clustered too when their ``vpc_id`` is known; anything without a resolvable VPC is drawn
   at the top level.
-* **Edges are labeled by relationship** (``in_subnet``/``in_vpc``/``attached_to`` and the
-  reachability ``*_can_reach`` family), load-balancer attachment edges additionally show their
-  ``match_rule``, and reachability edges show the protocol/port range that reaches the ENI.
-* **Reachability sources** (``internet``/``cidr``/``security_group`` nodes, §5.5) are ordinary
-  top-level nodes linked to the ENIs they can reach; a per-ENI ``internet`` node marks full
-  ``0.0.0.0/0`` / ``::/0`` exposure. The edge's **routability** (§5.6) is colored:
+* **Edges are labeled by relationship** (``in_subnet``/``in_vpc``/``attached_to``/``secured_by``
+  and the reachability ``*_can_reach`` family), load-balancer attachment edges additionally show
+  their ``match_rule``, and reachability edges show the protocol/port range that reaches the ENI.
+* **Reachability sources** (``internet``/``cidr`` nodes, §5.5) link to what they can reach. With
+  security groups **shown** (default) each ENI links to its ``security_group`` nodes
+  (``secured_by``, clustered inside their VPC) and sources link to the SG; **hidden**
+  (``--no-security-groups``) the sources link straight to the ENIs with the routability split.
+  In the hidden view the reachability edge's **routability** (§5.6) is colored:
   ``routable_can_reach`` solid red (a real path exists), ``not_routable_can_reach`` grey dashed
-  (allowed by a rule but no route), plain ``can_reach`` default (undetermined).
+  (allowed but no route), plain ``can_reach`` default (undetermined).
 
 ``render(dot_path, fmt)`` optionally rasterizes the ``.dot`` with the system ``dot`` binary
 (``dot -T<fmt>``) — but only if ``dot`` is on ``PATH``. It returns ``None`` when ``dot`` is
@@ -82,7 +84,8 @@ def _node_vpc(
     if node.type == "eni":
         subnet = subnet_of_eni.get(node.id)
         return vpc_of_subnet.get(subnet) if subnet else None
-    if node.type in ("ec2_instance", "load_balancer"):
+    if node.type in ("ec2_instance", "load_balancer", "security_group"):
+        # Security groups are VPC-scoped; cluster them with their VPC when known (§5.5).
         return node.attributes.get("vpc_id")
     return None
 
@@ -149,6 +152,8 @@ def _edge_extra(edge: Edge) -> str:
     rel = edge.relationship
     if rel in ("in_subnet", "in_vpc"):
         return ', style="dashed"'
+    if rel == "secured_by":  # ENI -> its security group (membership)
+        return ', style="dashed", color="#7E57C2"'
     if rel == "routable_can_reach":  # allowed AND routed -> real reachability
         return ', color="#E53935", penwidth=1.5'
     if rel == "not_routable_can_reach":  # allowed but no route -> muted, dashed

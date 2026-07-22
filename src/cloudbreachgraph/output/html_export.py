@@ -80,13 +80,13 @@ _TYPE_COLORS: dict[str, str] = {
 }
 _DEFAULT_COLOR = "#CFD8DC"
 
-# Node types that are reachability *sources* (§5.5). In the ringed layout they occupy a new,
-# outermost ring beyond the EC2/LB ring; everywhere else they are ordinary nodes.
-_REACH_TYPES = frozenset({"internet", "cidr", "security_group"})
+# Node types that are reachability *IP sources* (§5.5) — the outermost ring. Security groups are
+# their own (inner) ring, handled separately, so they are deliberately not in this set.
+_REACH_TYPES = frozenset({"internet", "cidr"})
 
-# Edge relationships that connect a reachability source to an ENI (§5.5/§5.6): the routability
+# Edge relationships that connect a reachability source to an SG or ENI (§5.5/§5.6): the routability
 # split (routable/not-routable) plus the undetermined fallback. Grouped so the ringed layout treats
-# them all as "source -> ENI" regardless of the routability verdict.
+# them all as "source -> target" regardless of the routability verdict.
 _REACH_RELS = frozenset({"can_reach", "routable_can_reach", "not_routable_can_reach"})
 
 # Drawn node radius per type — kept in step with the page's ``radiusFor`` so the Python-side
@@ -210,11 +210,11 @@ _RING_GAP = 150.0  # radial gap between one ring and the next
 _CLUSTER_MARGIN = 80.0  # empty room around a cluster's outermost ring
 _CLUSTER_PAD = 130.0  # extra gap between adjacent clusters in the grid
 
-# Concentric rings, from the center out: VPC (center), then subnets, then ENIs, then everything
-# else (EC2 instances, load balancers, …), then reachability sources (internet/CIDR/SG). ENIs get
-# their own dedicated ring, and the reachability sources form the new outermost ring so "who can
-# reach the ENIs" reads as the outer boundary of each VPC cluster (docs/02_architecture.md §5.5).
-_RING_COUNT = 5  # ring 0 is the center; rings 1..4 are the concentric outer rings
+# Concentric rings, from the center out: VPC (center), subnets, ENIs, everything else (EC2/LBs),
+# then security groups, then the reachability sources (internet/CIDR). "Who can reach the ENIs"
+# reads outward: ENI -> its security group -> the source ranges allowed in (docs §5.5). With SGs
+# hidden the security-group ring is empty and the source ring nests straight onto the ENIs.
+_RING_COUNT = 6  # ring 0 is the center; rings 1..5 are the concentric outer rings
 
 # Per-pass cooling factor for the --optimize-passes refinement (see _optimize_cluster): each
 # pass moves nodes only `alpha` of the way to their barycenter, and alpha *= this each pass, so
@@ -230,15 +230,17 @@ _RELOC_MAX_NODES = 260
 
 
 def _ring_of(node_type: str) -> int:
-    """Ring index for a node type: VPC (0), subnet (1), ENI (2), EC2/LB (3), reach source (4)."""
+    """Ring index by type: VPC 0, subnet 1, ENI 2, EC2/LB 3, security group 4, source (IP) 5."""
     if node_type == "vpc":
         return 0
     if node_type == "subnet":
         return 1
     if node_type == "eni":
         return 2
-    if node_type in _REACH_TYPES:
+    if node_type == "security_group":
         return 4
+    if node_type in _REACH_TYPES:  # internet / cidr — the outer source ring
+        return 5
     return 3
 
 
@@ -469,7 +471,7 @@ def _reduce_crossings(node_by_id: dict, cedges: list, rings: dict, cx: float, cy
 
     for _ in range(_RELOC_SWEEPS):
         moved = False
-        for r in (1, 2, 3, 4):
+        for r in (1, 2, 3, 4, 5):
             ids = rings.get(r, [])
             if len(ids) < 3:
                 continue
@@ -507,7 +509,9 @@ def _optimize_cluster(bucket: dict, cx: float, cy: float, rs: list, adj: dict, p
     pass moves every node less than a small epsilon (so extra passes never churn the layout).
     """
     ring_of = {m["id"]: r for r in range(_RING_COUNT) for m in bucket[r]}
-    angle = {m["id"]: math.atan2(m["y"] - cy, m["x"] - cx) for r in (1, 2, 3, 4) for m in bucket[r]}
+    angle = {
+        m["id"]: math.atan2(m["y"] - cy, m["x"] - cx) for r in (1, 2, 3, 4, 5) for m in bucket[r]
+    }
 
     # Cooling: each node is moved only a fraction `alpha` of the way to its barycenter, and
     # `alpha` decays every pass. Without it the barycenter iteration on a real graph never
@@ -517,7 +521,7 @@ def _optimize_cluster(bucket: dict, cx: float, cy: float, rs: list, adj: dict, p
     alpha = 1.0
     for _ in range(passes):
         max_move = 0.0
-        for r in (1, 2, 3, 4, 3, 2):  # outward then back inward, so positions propagate both ways
+        for r in (1, 2, 3, 4, 5, 4, 3, 2):  # outward then back inward, propagate both ways
             members = bucket[r]
             if not members:
                 continue
@@ -554,10 +558,10 @@ def _optimize_cluster(bucket: dict, cx: float, cy: float, rs: list, adj: dict, p
                 if nb in ids_set
             }
         )
-        rings = {r: [m["id"] for m in bucket[r]] for r in (1, 2, 3, 4)}
+        rings = {r: [m["id"] for m in bucket[r]] for r in (1, 2, 3, 4, 5)}
         _reduce_crossings(node_by_id, cedges, rings, cx, cy, rs)
 
-    _nudge_overlaps([m for r in (1, 2, 3, 4) for m in bucket[r]])
+    _nudge_overlaps([m for r in (1, 2, 3, 4, 5) for m in bucket[r]])
 
 
 def _adjacency(graph: Graph) -> dict[str, list[str]]:
@@ -573,14 +577,18 @@ def _vpc_group_of(graph: Graph) -> dict[str, str]:
     """Map each node id to the id of the VPC it belongs to (or ``_UNASSIGNED``).
 
     Traces the model's edges: subnet →(in_vpc)→ vpc, eni →(in_subnet)→ subnet,
-    ec2/lb ←(attached_to)← eni, and reach source →(can_reach)→ eni. A node that can't be traced
-    to a VPC lands in ``_UNASSIGNED``. A shared reachability source that reaches ENIs in several
-    VPCs is deterministically grouped with the first (edges are sorted).
+    ec2/lb ←(attached_to)← eni, eni →(secured_by)→ security_group, and reach source
+    →(can_reach)→ security_group/eni. A node that can't be traced to a VPC lands in
+    ``_UNASSIGNED``. A shared source that fans into several VPCs is deterministically grouped with
+    the first (edges are sorted).
     """
+    node_type = {n.id: n.type for n in graph.nodes}
+    sg_vpc = {n.id: n.attributes.get("vpc_id") for n in graph.nodes if n.type == "security_group"}
     eni_subnet: dict[str, str] = {}
     subnet_vpc: dict[str, str] = {}
     node_eni: dict[str, str] = {}  # ec2/lb (attach target) -> the ENI attached to it
-    source_eni: dict[str, str] = {}  # reach source -> an ENI it can reach
+    sg_eni: dict[str, str] = {}  # security_group -> a member ENI (from secured_by)
+    reach_target: dict[str, str] = {}  # reach source -> an SG or ENI it can reach
     for e in graph.edges:
         if e.relationship == "in_subnet":
             eni_subnet.setdefault(e.source, e.target)
@@ -588,8 +596,26 @@ def _vpc_group_of(graph: Graph) -> dict[str, str]:
             subnet_vpc.setdefault(e.source, e.target)
         elif e.relationship == "attached_to":
             node_eni.setdefault(e.target, e.source)
+        elif e.relationship == "secured_by":
+            sg_eni.setdefault(e.target, e.source)
         elif e.relationship in _REACH_RELS:
-            source_eni.setdefault(e.source, e.target)
+            reach_target.setdefault(e.source, e.target)
+
+    def _vpc_of_eni(eni: str | None) -> str | None:
+        return subnet_vpc.get(eni_subnet.get(eni or "", "")) if eni else None
+
+    def _vpc_of_sg(sg: str | None) -> str | None:
+        if not sg:
+            return None
+        return sg_vpc.get(sg) or _vpc_of_eni(sg_eni.get(sg))
+
+    def _vpc_of_source(src: str) -> str | None:
+        target = reach_target.get(src)
+        if target is None:
+            return None
+        return (
+            _vpc_of_sg(target) if node_type.get(target) == "security_group" else _vpc_of_eni(target)
+        )
 
     group: dict[str, str] = {}
     for n in graph.nodes:
@@ -598,13 +624,13 @@ def _vpc_group_of(graph: Graph) -> dict[str, str]:
         elif n.type == "subnet":
             g = subnet_vpc.get(n.id)
         elif n.type == "eni":
-            g = subnet_vpc.get(eni_subnet.get(n.id, ""))
+            g = _vpc_of_eni(n.id)
+        elif n.type == "security_group":
+            g = _vpc_of_sg(n.id)
         elif n.type in _REACH_TYPES:
-            eni = source_eni.get(n.id)
-            g = subnet_vpc.get(eni_subnet.get(eni, "")) if eni else None
+            g = _vpc_of_source(n.id)
         else:
-            eni = node_eni.get(n.id)
-            g = subnet_vpc.get(eni_subnet.get(eni, "")) if eni else None
+            g = _vpc_of_eni(node_eni.get(n.id))
         group[n.id] = g or _UNASSIGNED
     return group
 
@@ -631,19 +657,33 @@ def _ringed_view_data(graph: Graph, passes: int = 0) -> dict:
     #  * enis_of_lb: outer-ring node (ec2/lb) -> the ENIs attached to it (via `attached_to`).
     #  * enis_of_subnet: subnet -> the ENIs it contains (via `in_subnet`).
     #  * subnet_of_eni: ENI -> its subnet, used to group ENIs by subnet on ring 2.
-    #  * enis_of_source: outer-ring reachability source -> the ENIs it can reach (via `can_reach`).
+    #  * enis_of_sg: security_group -> the ENIs it secures (via `secured_by`), for ring 4.
+    #  * reach_edges: (source, target) of every reachability edge; target is an SG or an ENI.
     enis_of_lb: dict[str, list[str]] = {}
     enis_of_subnet: dict[str, list[str]] = {}
-    enis_of_source: dict[str, list[str]] = {}
+    enis_of_sg: dict[str, list[str]] = {}
     subnet_of_eni: dict[str, str] = {}
+    reach_edges: list[tuple[str, str]] = []
     for e in graph.edges:
         if e.relationship == "attached_to":
             enis_of_lb.setdefault(e.target, []).append(e.source)
         elif e.relationship == "in_subnet":
             enis_of_subnet.setdefault(e.target, []).append(e.source)
             subnet_of_eni.setdefault(e.source, e.target)
+        elif e.relationship == "secured_by":
+            enis_of_sg.setdefault(e.target, []).append(e.source)
         elif e.relationship in _REACH_RELS:
-            enis_of_source.setdefault(e.source, []).append(e.target)
+            reach_edges.append((e.source, e.target))
+
+    # enis_of_source: the ENIs an IP source aligns to. A source points at an SG (SGs shown) or at an
+    # ENI directly (SGs hidden); resolve SG targets through enis_of_sg so the alignment always
+    # bottoms out at the ENI ring (the angular anchor).
+    enis_of_source: dict[str, list[str]] = {}
+    for src, tgt in reach_edges:
+        if by_id.get(tgt, {}).get("type") == "security_group":
+            enis_of_source.setdefault(src, []).extend(enis_of_sg.get(tgt, []))
+        else:
+            enis_of_source.setdefault(src, []).append(tgt)
 
     # Bucket nodes into groups, and within a group into rings, preserving the deterministic
     # (type, id) order the Graph already sorted them into.
@@ -683,9 +723,11 @@ def _ringed_view_data(graph: Graph, passes: int = 0) -> dict:
         _place_aligned_to_enis(groups[g][1], cx, cy, rs[0], eni_angle, enis_of_subnet)
         # ring 3: EC2/LBs aligned to the mean angle of the ENIs attached to each.
         _place_aligned_to_enis(groups[g][3], cx, cy, rs[2], eni_angle, enis_of_lb)
-        # ring 4 (outermost): reachability sources aligned to the mean angle of the ENIs they can
-        # reach, so a source sits radially outside the interfaces it exposes (§5.5).
-        _place_aligned_to_enis(groups[g][4], cx, cy, rs[3], eni_angle, enis_of_source)
+        # ring 4: security groups aligned to the mean angle of the ENIs they secure.
+        _place_aligned_to_enis(groups[g][4], cx, cy, rs[3], eni_angle, enis_of_sg)
+        # ring 5 (outermost): IP sources aligned to the mean angle of the ENIs they can reach
+        # (through their SG when shown), so a source sits radially outside what it exposes (§5.5).
+        _place_aligned_to_enis(groups[g][5], cx, cy, rs[4], eni_angle, enis_of_source)
         # Optional: reorder within rings to cut edge crossings and nudge apart overlaps.
         if passes > 0:
             _optimize_cluster(groups[g], cx, cy, rs, adj, passes)
@@ -1745,7 +1787,7 @@ document.getElementById("recompute").addEventListener("click", recompute);
 
 # The one-line hint shown in each Python-computed layout's HUD (injected as __HINT__).
 _RINGED_HINT = (
-    "rings from each center: VPC · subnets · ENIs · EC2/LB · who-can-reach (internet/CIDR/SG) · "
+    "rings from each center: VPC · subnets · ENIs · EC2/LB · security groups · source IPs · "
     "drag a node · scroll to zoom (or lock it and use + / −) · drag to pan"
 )
 _OPTIMIZED_HINT = (

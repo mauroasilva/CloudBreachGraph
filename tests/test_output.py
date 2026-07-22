@@ -29,8 +29,7 @@ _COMMAND_FIXTURES = {
 }
 
 
-@pytest.fixture
-def graph(monkeypatch):
+def _collected(monkeypatch):
     monkeypatch.setattr(
         runner, "run_aws", lambda args, **k: load_fixture(_COMMAND_FIXTURES[tuple(args[:2])])
     )
@@ -38,7 +37,18 @@ def graph(monkeypatch):
         target="prod",
         roles={"network": ResolvedAccount("prod-audit", "111111111111", "us-east-1")},
     )
-    return build_graph(collectors.collect_all(resolved))
+    return collectors.collect_all(resolved)
+
+
+@pytest.fixture
+def graph(monkeypatch):
+    return build_graph(_collected(monkeypatch))
+
+
+@pytest.fixture
+def graph_collapsed(monkeypatch):
+    # The --no-security-groups view: sources connect directly to ENIs, with routability.
+    return build_graph(_collected(monkeypatch), show_security_groups=False)
 
 
 # --------------------------------------------------------------------------- #
@@ -93,38 +103,40 @@ def test_write_dot_wellformed(graph, tmp_path):
     # ENI labels carry Private IP / Public IP sections.
     assert "Private IP: 10.0.1.10" in text
     assert "Public IP: 54.10.20.30" in text
-    # Reachability (§5.5): a per-ENI Internet node for the 0.0.0.0/0 inbound rule, plus a shared
-    # CIDR source node and a referencing-security-group source node. The instance ENI is in a
-    # public subnet with a public IP, so its sources are *routable* (§5.6).
-    assert '"internet:eni-00instance0000001" [label="[internet]' in text
-    assert (
-        '"internet:eni-00instance0000001" -> "eni-00instance0000001" '
-        '[label="routable_can_reach' in text
-    )
-    assert (
-        '"cidr:203.0.113.0/24" -> "eni-00instance0000001" '
-        '[label="routable_can_reach\\ntcp/22"' in text
-    )
-    assert '"sg-source:sg-0aaa0002" -> "eni-00instance0000001"' in text
-    # The ALB ENI has its own per-ENI Internet node, but no public IP -> not routable.
-    assert (
-        '"internet:eni-00alb00000000002" -> "eni-00alb00000000002" '
-        '[label="not_routable_can_reach' in text
-    )
-    # Routable edges are colored red; not-routable ones are grey/dashed.
-    assert 'color="#E53935"' in text  # routable
-    assert 'color="#9E9E9E"' in text  # not routable
-    # An ENI with no security groups (the NAT gateway / NLB) is never a reachability target.
-    assert '-> "eni-00natgw000000004"' not in text
-    assert '-> "eni-00nlb00000000003"' not in text
+    # Reachability with security groups SHOWN (default, §5.5): each ENI links to its SG, and the
+    # SG's inbound sources (a per-SG Internet node, a shared CIDR, and the peer SG) link to the SG.
+    assert '"eni-00instance0000001" -> "sg-0aaa0001" [label="secured_by"' in text
+    assert '"internet:sg-0aaa0001" [label="[internet]' in text
+    assert '"internet:sg-0aaa0001" -> "sg-0aaa0001" [label="can_reach\\ntcp/443"];' in text
+    assert '"cidr:203.0.113.0/24" -> "sg-0aaa0001" [label="can_reach\\ntcp/22"];' in text
+    assert '"sg-0aaa0002" -> "sg-0aaa0001" [label="can_reach' in text  # peer SG -> SG
+    # An ENI with no security groups (the NAT gateway / NLB) has no secured_by / reachability edge.
+    assert '"eni-00natgw000000004" -> "sg' not in text
     # Nodes colored by type (a couple of representative fills).
     assert 'fillcolor="#E8F5E9"' in text  # eni
     assert 'fillcolor="#E3F2FD"' in text  # subnet
-    assert 'fillcolor="#FFEBEE"' in text  # internet source
+    assert 'fillcolor="#FCE4EC"' in text  # security_group
     # Edges labeled by relationship, with match_rule on the LB edge.
     assert 'label="in_subnet"' in text
     assert 'label="in_vpc"' in text
     assert "attached_to\\n(elbv2_description)" in text
+
+
+def test_write_dot_collapsed_shows_routability(graph_collapsed, tmp_path):
+    # With --no-security-groups the sources connect straight to the ENIs and carry the routability
+    # split, colored red (routable) / grey-dashed (not routable) — §5.6.
+    text = dot_export.write_dot(graph_collapsed, tmp_path / "g.dot").read_text()
+    assert (
+        '"internet:eni-00instance0000001" -> "eni-00instance0000001" [label="routable_can_reach'
+        in text
+    )
+    assert (
+        '"internet:eni-00alb00000000002" -> "eni-00alb00000000002" [label="not_routable_can_reach'
+        in text
+    )
+    assert 'color="#E53935"' in text  # routable
+    assert 'color="#9E9E9E"' in text  # not routable
+    assert 'fillcolor="#FCE4EC"' not in text  # no security_group nodes in the collapsed view
 
 
 def test_write_dot_marks_synthetic_dashed(tmp_path):

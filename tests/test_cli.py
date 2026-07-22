@@ -89,6 +89,28 @@ def test_from_cache_produces_wellformed_outputs(tmp_path):
     assert dot_path.read_text().startswith("digraph cloudbreachgraph {")
 
 
+def test_security_groups_shown_by_default(tmp_path):
+    out = tmp_path / "out"
+    assert cli.main(["--from-cache", str(FIXTURES), "--output-dir", str(out)]) == 0
+    data = json.loads((out / "graph.json").read_text())
+    rels = {e["relationship"] for e in data["edges"]}
+    assert any(n["type"] == "security_group" for n in data["nodes"])  # SG nodes present
+    assert "secured_by" in rels  # ENI -> SG membership
+    assert "routable_can_reach" not in rels  # routability is not at SG level
+
+
+def test_no_security_groups_collapses_to_direct_edges(tmp_path):
+    out = tmp_path / "out"
+    rc = cli.main(["--from-cache", str(FIXTURES), "--no-security-groups", "--output-dir", str(out)])
+    assert rc == 0
+    data = json.loads((out / "graph.json").read_text())
+    rels = {e["relationship"] for e in data["edges"]}
+    assert not any(n["type"] == "security_group" for n in data["nodes"])  # SGs hidden
+    assert "secured_by" not in rels
+    # Sources connect straight to ENIs with the routability split (route-tables fixture present).
+    assert {"routable_can_reach", "not_routable_can_reach"} & rels
+
+
 def test_from_cache_makes_no_live_calls(tmp_path, monkeypatch):
     def _boom(*a, **k):
         raise AssertionError("live AWS call made under --from-cache")
