@@ -41,7 +41,8 @@ CloudBreachGraph/
 │       │   └── graph.py          # Node, Edge, Graph  (Phase 2)
 │       ├── mapping/
 │       │   ├── __init__.py
-│       │   └── builder.py        # build_graph(collected) -> Graph, relationship rules  (Phase 2)
+│       │   ├── builder.py        # build_graph(collected) -> Graph, relationship rules  (Phase 2)
+│       │   └── routing.py        # RouteResolver: routability of reachability edges (§5.6)
 │       └── output/
 │           ├── __init__.py
 │           ├── json_export.py    # Graph -> JSON  (Phase 3)
@@ -69,6 +70,7 @@ flags. The AWS CLI auto-paginates by default, returning the full result set.
 | Subnets | `aws ec2 describe-subnets --region <r>` | `.Subnets[]` |
 | VPCs | `aws ec2 describe-vpcs --region <r>` | `.Vpcs[]` |
 | Security Groups | `aws ec2 describe-security-groups --region <r>` | `.SecurityGroups[]` |
+| Route Tables | `aws ec2 describe-route-tables --region <r>` | `.RouteTables[]` |
 | Caller identity (account check) | `aws sts get-caller-identity` | `.Account`, `.Arn` |
 
 Notes for the collection layer (Phase 1):
@@ -116,6 +118,13 @@ Notes for the collection layer (Phase 1):
 `IpPermissions[]` entry has `IpProtocol` (`"-1"` = all traffic), `FromPort`/`ToPort`, and its
 sources: `IpRanges[].CidrIp` (IPv4), `Ipv6Ranges[].CidrIpv6` (IPv6), and `UserIdGroupPairs[].GroupId`
 (a referencing security group). An ENI's `Groups[].GroupId` (see above) says which SGs apply to it.
+
+**Route Table** (`.RouteTables[]`): `RouteTableId`, `VpcId`, `Associations[]` (`SubnetId`, `Main`
+— the VPC's implicit fallback RT), `Routes[]` (`DestinationCidrBlock`/`DestinationIpv6CidrBlock`,
+the next-hop id in one of `GatewayId` (`local`/`igw-`/`vgw-`), `NatGatewayId`, `TransitGatewayId`,
+`VpcPeeringConnectionId`, … — normalized to one `Target` string — and `State`
+(`active`/`blackhole`)). Used to decide whether a reachability source is actually **routed** to an
+ENI (§5.6).
 
 ## 5. Relationship-mapping rules (THE CORE — Phase 2)
 
@@ -193,9 +202,33 @@ Three source kinds (node `type` in parentheses):
 
 An ENI with no security groups, or one whose SGs weren't collected, gets **no** reachability
 edges — never invent one. This pass is **always on** (independent of `--include-orphans`); it is
-the point of the reachability feature. Reachability does **not** gate on a route to the ENI (a
-public IP or route-table analysis) — the SG inbound rule is the recorded source of truth for
-"who is allowed to connect", which is what the map answers.
+the point of the reachability feature.
+
+### 5.6 Routability — is the source actually routed to the ENI?
+
+A security-group rule says a source is **allowed**; §5.6 asks whether a network path actually
+**routes** it there. The reachability edge's *relationship* carries the verdict, computed from the
+ENI's **route table** (`mapping/routing.py`, `RouteResolver`):
+
+* `routable_can_reach`     — allowed **and** a route exists.
+* `not_routable_can_reach` — allowed but **no** route (e.g. a `0.0.0.0/0` rule on an ENI in a
+  private subnet, or on one with no public IP).
+* `can_reach`              — routability **undetermined**: no route tables were collected, or the
+  ENI's subnet resolves to no route table. We keep the plain relationship rather than guess, so an
+  old capture / a run without route-table permissions still produces reachability edges.
+
+The ENI's effective route table is the one **explicitly associated** with its subnet, else the
+VPC's **main** route table. The model is deliberately simple and documented (not a full route
+simulator — NACLs, TGW route propagation, VPN/DX propagation are out of scope):
+
+* **internet** source (`0.0.0.0/0` / `::/0`): routable iff the subnet is *public* (an active
+  default route to an internet gateway `igw-`) **and** the ENI has a public/Elastic IP (so it is
+  addressable from outside).
+* **cidr** source: routable if the CIDR is inside the VPC (a `local` route always covers it), or a
+  route explicitly covers it via a connective gateway (`vgw-`/`tgw-`/`pcx-`), or the ENI is
+  internet-reachable as above; otherwise not routable.
+* **security_group** source: a referencing SG is VPC-local (SG references don't cross accounts, and
+  the local route always covers the VPC), so it is treated as routable.
 
 ## 6. Graph data model (Phase 2 defines, Phase 3 consumes)
 
@@ -213,7 +246,8 @@ Node:
 Edge:
   source: str           # node id
   target: str           # node id
-  relationship: str     # "attached_to" | "in_subnet" | "in_vpc" | "can_reach" (§5.5)
+  relationship: str     # "attached_to" | "in_subnet" | "in_vpc"
+                        #   | "can_reach" / "routable_can_reach" / "not_routable_can_reach" (§5.5/§5.6)
   attributes: dict      # e.g. {"match_rule": "elbv2_description"} or {"ports": "tcp/443"}
 
 Graph:
@@ -239,7 +273,8 @@ Requirements:
   visually. Reachability sources (`internet`/`cidr`/`security_group`, §5.5) are top-level nodes
   linked to the ENIs they reach; a per-ENI `internet` node marks full `0.0.0.0/0` exposure. (This
   replaced the earlier public-IP-only shared `Internet` decoration; a public IP still shows on the
-  ENI's own `Public IP:` label line.)
+  ENI's own `Public IP:` label line.) The reachability edge is colored by **routability** (§5.6):
+  `routable_can_reach` solid red, `not_routable_can_reach` grey dashed, plain `can_reach` default.
 - **Optional render:** if the `dot` binary is on PATH, offer `--render png|svg` that shells
   out to `dot -T<fmt>`. Absence of `dot` must degrade gracefully (still write the `.dot`).
 - **Interactive HTML** (`graph.html`, opt-in via `--html`, *not* produced by default):
@@ -538,6 +573,7 @@ ROLE_COLLECTORS: dict[str, list[Collector]] = {
         collect_subnets,              # aws ec2   describe-subnets              -> .Subnets[]
         collect_vpcs,                 # aws ec2   describe-vpcs                 -> .Vpcs[]
         collect_security_groups,      # aws ec2   describe-security-groups      -> .SecurityGroups[]
+        collect_route_tables,         # aws ec2   describe-route-tables         -> .RouteTables[]
     ],
     # ── future (Phase 4; do NOT implement in v1, see 05_roadmap.md) ───────────────
     # "flow_logs": [
@@ -549,7 +585,7 @@ ROLE_COLLECTORS: dict[str, list[Collector]] = {
 # The output key each role writes into the collected bundle (see §11.7).
 ROLE_RESULT_KEYS: dict[str, list[str]] = {
     "network": ["network_interfaces", "ec2_instances", "load_balancers_v2",
-                "load_balancers_classic", "subnets", "vpcs", "security_groups"],
+                "load_balancers_classic", "subnets", "vpcs", "security_groups", "route_tables"],
     # "flow_logs": ["flow_logs", "log_destinations"],  # future
 }
 ```

@@ -83,6 +83,11 @@ _DEFAULT_COLOR = "#CFD8DC"
 # outermost ring beyond the EC2/LB ring; everywhere else they are ordinary nodes.
 _REACH_TYPES = frozenset({"internet", "cidr", "security_group"})
 
+# Edge relationships that connect a reachability source to an ENI (§5.5/§5.6): the routability
+# split (routable/not-routable) plus the undetermined fallback. Grouped so the ringed layout treats
+# them all as "source -> ENI" regardless of the routability verdict.
+_REACH_RELS = frozenset({"can_reach", "routable_can_reach", "not_routable_can_reach"})
+
 # Drawn node radius per type — kept in step with the page's ``radiusFor`` so the Python-side
 # overlap check uses the same disk sizes the browser draws.
 _NODE_RADII: dict[str, float] = {
@@ -582,7 +587,7 @@ def _vpc_group_of(graph: Graph) -> dict[str, str]:
             subnet_vpc.setdefault(e.source, e.target)
         elif e.relationship == "attached_to":
             node_eni.setdefault(e.target, e.source)
-        elif e.relationship == "can_reach":
+        elif e.relationship in _REACH_RELS:
             source_eni.setdefault(e.source, e.target)
 
     group: dict[str, str] = {}
@@ -636,7 +641,7 @@ def _ringed_view_data(graph: Graph, passes: int = 0) -> dict:
         elif e.relationship == "in_subnet":
             enis_of_subnet.setdefault(e.target, []).append(e.source)
             subnet_of_eni.setdefault(e.source, e.target)
-        elif e.relationship == "can_reach":
+        elif e.relationship in _REACH_RELS:
             enis_of_source.setdefault(e.source, []).append(e.target)
 
     # Bucket nodes into groups, and within a group into rings, preserving the deterministic

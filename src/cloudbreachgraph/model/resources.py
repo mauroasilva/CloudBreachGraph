@@ -247,6 +247,54 @@ class SecurityGroup:
 
 
 @dataclass
+class Route:
+    """One route in a route table (``docs/02_architecture.md §5.6``).
+
+    ``target`` is the collapsed next-hop id (``local``, ``igw-…``, ``nat-…``, ``tgw-…``,
+    ``pcx-…``, …); ``state`` is ``"active"`` or ``"blackhole"``.
+    """
+
+    dest_cidr: str | None
+    dest_ipv6_cidr: str | None
+    target: str | None
+    state: str | None
+
+    @classmethod
+    def from_collected(cls, d: dict[str, Any]) -> Route:
+        return cls(
+            dest_cidr=d.get("DestinationCidrBlock"),
+            dest_ipv6_cidr=d.get("DestinationIpv6CidrBlock"),
+            target=d.get("Target"),
+            state=d.get("State"),
+        )
+
+
+@dataclass
+class RouteTable:
+    """A route table and the subnets it governs (``docs/02_architecture.md §5.6``).
+
+    ``is_main`` marks the VPC's implicit (main) route table — the fallback for any subnet with no
+    explicit association.
+    """
+
+    id: str
+    vpc_id: str | None
+    is_main: bool
+    subnet_ids: list[str] = field(default_factory=list)
+    routes: list[Route] = field(default_factory=list)
+
+    @classmethod
+    def from_collected(cls, d: dict[str, Any]) -> RouteTable:
+        return cls(
+            id=d.get("RouteTableId"),
+            vpc_id=d.get("VpcId"),
+            is_main=bool(d.get("Main")),
+            subnet_ids=list(d.get("SubnetIds", [])),
+            routes=[Route.from_collected(r) for r in d.get("Routes", [])],
+        )
+
+
+@dataclass
 class Subnet:
     """A subnet an ENI lives in (``docs/02_architecture.md §5.1``)."""
 

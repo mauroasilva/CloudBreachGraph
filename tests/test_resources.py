@@ -14,6 +14,7 @@ from cloudbreachgraph.model.resources import (
     Ec2Instance,
     Elbv2LoadBalancer,
     Eni,
+    RouteTable,
     SecurityGroup,
     SgIngressRule,
     Subnet,
@@ -134,3 +135,25 @@ def test_sg_ingress_rule_port_labels():
     assert SgIngressRule("tcp", 8000, 8100).port_label() == "tcp/8000-8100"
     assert SgIngressRule("-1", None, None).port_label() == "all"
     assert SgIngressRule("icmp", None, None).port_label() == "icmp"
+
+
+def test_route_table_from_collected():
+    raw = collectors._normalize_route_table(
+        load_fixture("ec2_describe-route-tables.json")["RouteTables"][0]
+    )
+    rt = RouteTable.from_collected(raw)
+    assert rt.id == "rtb-0public00000001"
+    assert rt.is_main is False
+    assert rt.subnet_ids == ["subnet-011111111111111"]
+    default = next(r for r in rt.routes if r.dest_cidr == "0.0.0.0/0")
+    assert default.target == "igw-0abc00000000001"
+    assert default.state == "active"
+
+
+def test_route_table_main_flag_from_associations():
+    raw = collectors._normalize_route_table(
+        load_fixture("ec2_describe-route-tables.json")["RouteTables"][2]
+    )
+    rt = RouteTable.from_collected(raw)
+    assert rt.is_main is True
+    assert rt.subnet_ids == []  # the main RT has no explicit subnet association

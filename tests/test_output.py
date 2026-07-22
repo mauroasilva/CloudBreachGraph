@@ -25,6 +25,7 @@ _COMMAND_FIXTURES = {
     ("ec2", "describe-subnets"): "ec2_describe-subnets.json",
     ("ec2", "describe-vpcs"): "ec2_describe-vpcs.json",
     ("ec2", "describe-security-groups"): "ec2_describe-security-groups.json",
+    ("ec2", "describe-route-tables"): "ec2_describe-route-tables.json",
 }
 
 
@@ -93,16 +94,29 @@ def test_write_dot_wellformed(graph, tmp_path):
     assert "Private IP: 10.0.1.10" in text
     assert "Public IP: 54.10.20.30" in text
     # Reachability (§5.5): a per-ENI Internet node for the 0.0.0.0/0 inbound rule, plus a shared
-    # CIDR source node and a referencing-security-group source node, each with a can_reach edge.
+    # CIDR source node and a referencing-security-group source node. The instance ENI is in a
+    # public subnet with a public IP, so its sources are *routable* (§5.6).
     assert '"internet:eni-00instance0000001" [label="[internet]' in text
-    assert '"internet:eni-00instance0000001" -> "eni-00instance0000001" [label="can_reach' in text
-    assert '"cidr:203.0.113.0/24" -> "eni-00instance0000001" [label="can_reach\\ntcp/22"];' in text
+    assert (
+        '"internet:eni-00instance0000001" -> "eni-00instance0000001" '
+        '[label="routable_can_reach' in text
+    )
+    assert (
+        '"cidr:203.0.113.0/24" -> "eni-00instance0000001" '
+        '[label="routable_can_reach\\ntcp/22"' in text
+    )
     assert '"sg-source:sg-0aaa0002" -> "eni-00instance0000001"' in text
-    # The ALB ENI is exposed via its own per-ENI Internet node (not a shared one).
-    assert '"internet:eni-00alb00000000002" -> "eni-00alb00000000002"' in text
-    # An ENI with no security groups (the NAT gateway / NLB) has no reachability edge.
-    assert '-> "eni-00natgw000000004" [label="can_reach' not in text
-    assert '-> "eni-00nlb00000000003" [label="can_reach' not in text
+    # The ALB ENI has its own per-ENI Internet node, but no public IP -> not routable.
+    assert (
+        '"internet:eni-00alb00000000002" -> "eni-00alb00000000002" '
+        '[label="not_routable_can_reach' in text
+    )
+    # Routable edges are colored red; not-routable ones are grey/dashed.
+    assert 'color="#E53935"' in text  # routable
+    assert 'color="#9E9E9E"' in text  # not routable
+    # An ENI with no security groups (the NAT gateway / NLB) is never a reachability target.
+    assert '-> "eni-00natgw000000004"' not in text
+    assert '-> "eni-00nlb00000000003"' not in text
     # Nodes colored by type (a couple of representative fills).
     assert 'fillcolor="#E8F5E9"' in text  # eni
     assert 'fillcolor="#E3F2FD"' in text  # subnet

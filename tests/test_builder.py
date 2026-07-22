@@ -27,6 +27,7 @@ _COMMAND_FIXTURES = {
     ("ec2", "describe-subnets"): "ec2_describe-subnets.json",
     ("ec2", "describe-vpcs"): "ec2_describe-vpcs.json",
     ("ec2", "describe-security-groups"): "ec2_describe-security-groups.json",
+    ("ec2", "describe-route-tables"): "ec2_describe-route-tables.json",
 }
 
 
@@ -61,6 +62,7 @@ def _eni(
     description="",
     instance_id=None,
     groups=None,
+    public_ip=None,
 ):
     return {
         "NetworkInterfaceId": eni_id,
@@ -79,8 +81,44 @@ def _eni(
             "DeviceIndex": None,
             "Status": None,
         },
+        "Association": {"PublicIp": public_ip},
         "PrivateIpAddresses": [],
         "Groups": [{"GroupId": g} for g in (groups or [])],
+    }
+
+
+def _subnet(subnet_id, *, vpc_id="vpc-1", cidr="10.0.0.0/16"):
+    return {
+        "SubnetId": subnet_id,
+        "VpcId": vpc_id,
+        "CidrBlock": cidr,
+        "AvailabilityZone": "us-east-1a",
+        "Tags": [],
+    }
+
+
+def _vpc_dict(vpc_id="vpc-1", cidr="10.0.0.0/16"):
+    return {"VpcId": vpc_id, "CidrBlock": cidr, "IsDefault": False, "Tags": []}
+
+
+def _rt(rt_id, *, vpc_id="vpc-1", main=False, subnet_ids=(), routes=()):
+    """A normalized route-table dict. Each ``routes`` entry is ``(dest_cidr, target[, state])``."""
+    norm = []
+    for r in routes:
+        norm.append(
+            {
+                "DestinationCidrBlock": r[0],
+                "DestinationIpv6CidrBlock": None,
+                "Target": r[1],
+                "State": r[2] if len(r) > 2 else "active",
+            }
+        )
+    return {
+        "RouteTableId": rt_id,
+        "VpcId": vpc_id,
+        "Main": main,
+        "SubnetIds": list(subnet_ids),
+        "Routes": norm,
     }
 
 
@@ -320,7 +358,8 @@ def test_missing_subnet_with_no_vpc_hint_gets_placeholder_vpc():
 # §5.5 — reachability from security-group inbound rules
 # --------------------------------------------------------------------------- #
 def _reach_edges(graph, eni_id):
-    return [e for e in graph.edges if e.target == eni_id and e.relationship == "can_reach"]
+    # Matches every reachability relationship (can_reach / routable_ / not_routable_can_reach).
+    return [e for e in graph.edges if e.target == eni_id and e.relationship.endswith("can_reach")]
 
 
 def test_full_internet_exposure_creates_per_eni_internet_node():
@@ -446,6 +485,156 @@ def test_reachability_from_full_fixture_bundle(full_bundle):
     assert graph.get_node("sg-source:sg-0aaa0002") is not None
     # The NAT-gateway ENI has no security groups -> no reachability edges.
     assert _reach_edges(graph, "eni-00natgw000000004") == []
+
+
+# --------------------------------------------------------------------------- #
+# §5.6 — routability (routable_can_reach / not_routable_can_reach)
+# --------------------------------------------------------------------------- #
+def _rel(graph, source, eni_id):
+    return next(e.relationship for e in graph.edges if e.source == source and e.target == eni_id)
+
+
+def _routing_bundle(*, public_subnet, public_ip, source):
+    # One ENI with a 0.0.0.0/0 (or CIDR/SG) inbound rule, in a public or private subnet.
+    subnet_id = "subnet-1"
+    if source == "internet":
+        ingress = [("tcp", 443, 443, ["0.0.0.0/0"])]
+    elif source == "external_cidr":
+        ingress = [("tcp", 443, 443, ["203.0.113.0/24"])]
+    elif source == "internal_cidr":
+        ingress = [("tcp", 443, 443, ["10.0.5.0/24"])]
+    else:  # peer security group
+        ingress = [("-1", None, None, [], [], ["sg-peer"])]
+    default_route = ("0.0.0.0/0", "igw-1") if public_subnet else ("0.0.0.0/0", "nat-1")
+    return _bundle(
+        network_interfaces=[
+            _eni("eni-1", subnet_id=subnet_id, groups=["sg-1"], public_ip=public_ip)
+        ],
+        subnets=[_subnet(subnet_id)],
+        vpcs=[_vpc_dict()],
+        security_groups=[_sg("sg-1", ingress=ingress), _sg("sg-peer", name="peer")],
+        route_tables=[
+            _rt(
+                "rtb-1",
+                subnet_ids=[subnet_id],
+                routes=[("10.0.0.0/16", "local"), default_route],
+            )
+        ],
+    )
+
+
+def test_internet_source_in_public_subnet_with_public_ip_is_routable():
+    g = build_graph(_routing_bundle(public_subnet=True, public_ip="52.1.2.3", source="internet"))
+    assert _rel(g, "internet:eni-1", "eni-1") == "routable_can_reach"
+
+
+def test_internet_source_in_private_subnet_is_not_routable():
+    g = build_graph(_routing_bundle(public_subnet=False, public_ip="52.1.2.3", source="internet"))
+    assert _rel(g, "internet:eni-1", "eni-1") == "not_routable_can_reach"
+
+
+def test_internet_source_without_public_ip_is_not_routable():
+    # Public subnet (igw default route) but the ENI has no public IP -> not addressable.
+    g = build_graph(_routing_bundle(public_subnet=True, public_ip=None, source="internet"))
+    assert _rel(g, "internet:eni-1", "eni-1") == "not_routable_can_reach"
+
+
+def test_external_cidr_needs_internet_path():
+    routable = build_graph(
+        _routing_bundle(public_subnet=True, public_ip="52.1.2.3", source="external_cidr")
+    )
+    assert _rel(routable, "cidr:203.0.113.0/24", "eni-1") == "routable_can_reach"
+    not_routable = build_graph(
+        _routing_bundle(public_subnet=False, public_ip=None, source="external_cidr")
+    )
+    assert _rel(not_routable, "cidr:203.0.113.0/24", "eni-1") == "not_routable_can_reach"
+
+
+def test_intra_vpc_cidr_is_routable_via_local_route():
+    # A source inside the VPC is always reachable (local route), even in a private subnet.
+    g = build_graph(_routing_bundle(public_subnet=False, public_ip=None, source="internal_cidr"))
+    assert _rel(g, "cidr:10.0.5.0/24", "eni-1") == "routable_can_reach"
+
+
+def test_peer_security_group_is_routable():
+    g = build_graph(_routing_bundle(public_subnet=False, public_ip=None, source="sg"))
+    assert _rel(g, "sg-source:sg-peer", "eni-1") == "routable_can_reach"
+
+
+def test_external_cidr_routable_over_transit_gateway():
+    # A corporate range reachable via a transit-gateway route, no internet path needed.
+    bundle = _bundle(
+        network_interfaces=[_eni("eni-1", subnet_id="subnet-1", groups=["sg-1"])],
+        subnets=[_subnet("subnet-1")],
+        vpcs=[_vpc_dict()],
+        security_groups=[_sg("sg-1", ingress=[("tcp", 22, 22, ["192.0.2.0/24"])])],
+        route_tables=[
+            _rt(
+                "rtb-1",
+                subnet_ids=["subnet-1"],
+                routes=[("10.0.0.0/16", "local"), ("192.0.2.0/24", "tgw-1")],
+            )
+        ],
+    )
+    g = build_graph(bundle)
+    assert _rel(g, "cidr:192.0.2.0/24", "eni-1") == "routable_can_reach"
+
+
+def test_main_route_table_is_the_fallback_for_unassociated_subnets():
+    # subnet-1 has no explicit RT association; the VPC main RT (public) applies.
+    bundle = _bundle(
+        network_interfaces=[
+            _eni("eni-1", subnet_id="subnet-1", groups=["sg-1"], public_ip="52.1.2.3")
+        ],
+        subnets=[_subnet("subnet-1")],
+        vpcs=[_vpc_dict()],
+        security_groups=[_sg("sg-1", ingress=[("tcp", 443, 443, ["0.0.0.0/0"])])],
+        route_tables=[
+            _rt("rtb-main", main=True, routes=[("10.0.0.0/16", "local"), ("0.0.0.0/0", "igw-1")])
+        ],
+    )
+    g = build_graph(bundle)
+    assert _rel(g, "internet:eni-1", "eni-1") == "routable_can_reach"
+
+
+def test_no_route_data_leaves_reachability_undetermined():
+    # Without route tables the builder can't decide routability -> plain can_reach.
+    bundle = _bundle(
+        network_interfaces=[_eni("eni-1", groups=["sg-1"], public_ip="52.1.2.3")],
+        security_groups=[_sg("sg-1", ingress=[("tcp", 443, 443, ["0.0.0.0/0"])])],
+    )
+    g = build_graph(bundle)
+    assert _rel(g, "internet:eni-1", "eni-1") == "can_reach"
+
+
+def test_ports_still_aggregate_onto_the_routed_edge():
+    bundle = _bundle(
+        network_interfaces=[
+            _eni("eni-1", subnet_id="subnet-1", groups=["sg-1"], public_ip="52.1.2.3")
+        ],
+        subnets=[_subnet("subnet-1")],
+        vpcs=[_vpc_dict()],
+        security_groups=[
+            _sg("sg-1", ingress=[("tcp", 443, 443, ["0.0.0.0/0"]), ("tcp", 80, 80, ["0.0.0.0/0"])])
+        ],
+        route_tables=[_rt("rtb-1", subnet_ids=["subnet-1"], routes=[("0.0.0.0/0", "igw-1")])],
+    )
+    g = build_graph(bundle)
+    edge = next(e for e in g.edges if e.source == "internet:eni-1")
+    assert edge.relationship == "routable_can_reach"
+    assert edge.attributes["ports"] == "tcp/443, tcp/80"
+
+
+def test_full_fixture_routability_splits_reachability(full_bundle):
+    # eni-00instance is in a public subnet WITH a public IP -> routable; eni-00alb is in the same
+    # public subnet but has NO public IP -> not routable.
+    graph = build_graph(full_bundle)
+    inst = _rel(graph, "internet:eni-00instance0000001", "eni-00instance0000001")
+    alb = _rel(graph, "internet:eni-00alb00000000002", "eni-00alb00000000002")
+    assert inst == "routable_can_reach"
+    assert alb == "not_routable_can_reach"
+    # The bastion CIDR reaches the public instance ENI over the internet path -> routable.
+    assert _rel(graph, "cidr:203.0.113.0/24", "eni-00instance0000001") == "routable_can_reach"
 
 
 # --------------------------------------------------------------------------- #

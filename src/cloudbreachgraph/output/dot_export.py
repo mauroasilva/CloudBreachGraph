@@ -8,12 +8,14 @@
   layout visually nests reachability inside each VPC. EC2 instances and load balancers are
   clustered too when their ``vpc_id`` is known; anything without a resolvable VPC is drawn
   at the top level.
-* **Edges are labeled by relationship** (``in_subnet``/``in_vpc``/``attached_to``/``can_reach``),
-  load-balancer attachment edges additionally show their ``match_rule``, and reachability
-  (``can_reach``) edges show the protocol/port range that reaches the ENI.
+* **Edges are labeled by relationship** (``in_subnet``/``in_vpc``/``attached_to`` and the
+  reachability ``*_can_reach`` family), load-balancer attachment edges additionally show their
+  ``match_rule``, and reachability edges show the protocol/port range that reaches the ENI.
 * **Reachability sources** (``internet``/``cidr``/``security_group`` nodes, §5.5) are ordinary
   top-level nodes linked to the ENIs they can reach; a per-ENI ``internet`` node marks full
-  ``0.0.0.0/0`` / ``::/0`` exposure.
+  ``0.0.0.0/0`` / ``::/0`` exposure. The edge's **routability** (§5.6) is colored:
+  ``routable_can_reach`` solid red (a real path exists), ``not_routable_can_reach`` grey dashed
+  (allowed by a rule but no route), plain ``can_reach`` default (undetermined).
 
 ``render(dot_path, fmt)`` optionally rasterizes the ``.dot`` with the system ``dot`` binary
 (``dot -T<fmt>``) — but only if ``dot`` is on ``PATH``. It returns ``None`` when ``dot`` is
@@ -133,10 +135,25 @@ def _edge_stmt(edge: Edge) -> str:
     if match_rule:
         lines.append(f"({match_rule})")
     ports = edge.attributes.get("ports")
-    if ports:  # reachability (can_reach) edges annotate the protocol/port range that reaches
+    if ports:  # reachability edges annotate the protocol/port range that reaches
         lines.append(str(ports))
-    dashed = ', style="dashed"' if edge.relationship in ("in_subnet", "in_vpc") else ""
-    return f'"{_esc(edge.source)}" -> "{_esc(edge.target)}" [label="{_label(lines)}"{dashed}];'
+    return (
+        f'"{_esc(edge.source)}" -> "{_esc(edge.target)}" '
+        f'[label="{_label(lines)}"{_edge_extra(edge)}];'
+    )
+
+
+def _edge_extra(edge: Edge) -> str:
+    """Extra DOT edge attributes by relationship: containment edges dashed; reachability edges
+    colored by routability so *routable* exposure stands out from a merely *allowed* rule."""
+    rel = edge.relationship
+    if rel in ("in_subnet", "in_vpc"):
+        return ', style="dashed"'
+    if rel == "routable_can_reach":  # allowed AND routed -> real reachability
+        return ', color="#E53935", penwidth=1.5'
+    if rel == "not_routable_can_reach":  # allowed but no route -> muted, dashed
+        return ', style="dashed", color="#9E9E9E"'
+    return ""
 
 
 def _dot_lines(graph: Graph) -> list[str]:

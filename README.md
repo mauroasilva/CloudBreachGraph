@@ -155,7 +155,8 @@ cloudbreachgraph --from-cache tests/fixtures --output-dir out/
   attachment edges also show the `match_rule` that resolved them; reachability edges show the
   `ports` that reach the ENI). ENI labels include their `Private IP` and `Public IP` (when the
   ENI has an Elastic/public IP). **Reachability** source nodes (see below) — `Internet`, source
-  CIDRs, and referencing security groups — link to the ENIs they can connect to.
+  CIDRs, and referencing security groups — link to the ENIs they can connect to, colored by
+  **routability**: routable edges solid red, not-routable ones grey/dashed.
 - `graph.<fmt>` — only with `--render`; requires `dot`. If `dot` is absent the tool warns
   and still writes the `.dot`.
 - `graph.html` — **only with `--html`** (never produced by default). A single,
@@ -199,11 +200,30 @@ Three kinds of source node:
 - **`security_group`** — a referencing security group (id `sg-source:<group-id>`), labelled with
   the peer group's name. This is who-can-reach *from inside* another security group.
 
-An ENI with no security groups gets no reachability edges. Reachability reflects the security-group
-rules as written — it does not additionally check for a route to the ENI, so a `0.0.0.0/0` rule on
-a private-only ENI still surfaces as an `Internet` source (the SG rule is the recorded "who is
-allowed to connect"). These nodes/edges appear in **all** outputs (JSON, DOT, HTML); in the
-[ringed layout](#ringed-layout---ringed) they form a new **outermost ring** around each VPC cluster.
+An ENI with no security groups gets no reachability edges.
+
+### Routable vs. not routable
+
+A security-group rule says a source is **allowed**; CloudBreachGraph also asks whether a network
+path actually **routes** it there, using each ENI's **route table** (`aws ec2
+describe-route-tables`). The reachability edge's type carries the verdict:
+
+- **`routable_can_reach`** — allowed **and** a route exists (in DOT: solid **red**).
+- **`not_routable_can_reach`** — allowed but **no** route, e.g. a `0.0.0.0/0` rule on an ENI in a
+  private subnet or with no public IP (in DOT: **grey dashed**). This is the classic "the security
+  group looks wide open, but the ENI isn't actually reachable" case.
+- **`can_reach`** — routability **undetermined** (no route tables were collected — an old capture
+  or a run without route-table permissions). We keep the plain edge rather than guess.
+
+The verdict uses a deliberately simple, documented model (not a full route simulator): an
+`internet` source is routable only from a **public** subnet (a default route to an internet
+gateway) *and* an ENI with a public IP; an in-VPC CIDR or a peer security group is routable via the
+local route; an external CIDR is routable over a VPN / transit-gateway / peering route or the
+internet path. See [`docs/02_architecture.md §5.6`](docs/02_architecture.md).
+
+These nodes/edges appear in **all** outputs (JSON, DOT, HTML); in the
+[ringed layout](#ringed-layout---ringed) the sources form a new **outermost ring** around each VPC
+cluster.
 
 ## Converting an existing graph to HTML
 
