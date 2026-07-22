@@ -247,9 +247,12 @@ Requirements:
   `build_optimized_html`, sharing the draw-only template via `_render_static_layout`): it runs up
   to N deterministic *optimisation passes* — a cooled force-directed unfolding
   (`_OPT_FORCE_PASSES` cap) followed by hard geometric projection sweeps (`_optimize_layout`) —
-  laying out each **connected component** independently (`_connected_components`) and packing them
-  into a non-overlapping grid (`_pack_components`, mirroring the ringed cluster tiling) so
-  independent clusters stay visually separated, and stops the moment each component's drawing has
+  laying the whole graph out at once, then **rigidly translating** each **connected component**
+  (`_connected_components`) into its own cell of a non-overlapping grid (`_pack_components`,
+  mirroring the ringed cluster tiling) so independent clusters stay visually separated — packing a
+  component as a rigid body preserves its internal crossings/overlaps and there are no
+  cross-component edges, so it keeps exactly the crossing count the joint layout found (better than
+  optimising each component in isolation). It stops the moment the drawing has
   **zero node-node overlaps** and **zero edge-over-node
   overlaps** (a non-incident node's disk intersecting an edge segment). Real topologies are
   non-planar (the example graph's largest VPC alone contains a non-planar minor), so zero edge

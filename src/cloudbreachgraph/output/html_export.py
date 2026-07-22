@@ -982,12 +982,13 @@ def _pack_components(components: list) -> None:
 def _optimize_layout(nodes: list, edges: list, max_passes: int) -> int:
     """Lay out ``nodes`` (in place, setting ``x``/``y``) overlap-free, keeping components apart.
 
-    Splits the graph into connected components, lays each one out independently
-    (:func:`_layout_component` — overlap-free, crossings reduced), then packs the components into a
-    non-overlapping grid (:func:`_pack_components`) so independent clusters stay visually separated.
-    Returns the largest per-component pass count (the "rounds" the hardest cluster needed); each
-    component gets the full ``max_passes`` budget since they optimise independently. Coordinates are
-    rounded to 2 dp once, after packing, for byte-stable output.
+    Lays the whole graph out at once (:func:`_layout_nodes` — overlap-free, crossings reduced),
+    then **rigidly translates** each connected component into its own cell of a non-overlapping grid
+    (:func:`_pack_components`) so independent clusters stay apart. Packing a component as a rigid
+    body leaves its internal crossings and overlaps untouched, and there are no edges between
+    components, so the separated drawing keeps exactly the crossing count the joint layout achieved
+    — solving it jointly finds a better arrangement than optimising each component in isolation
+    would. Returns the passes used; coordinates are rounded to 2 dp once, after packing.
     """
     for node in nodes:  # ensure coordinates on the trivial paths (empty graph / no budget)
         node.setdefault("x", 0.0)
@@ -995,11 +996,8 @@ def _optimize_layout(nodes: list, edges: list, max_passes: int) -> int:
     if not nodes or max_passes <= 0:
         return 0
 
-    components = _connected_components(nodes, edges)
-    passes = 0
-    for comp_nodes, comp_edges in components:
-        passes = max(passes, _layout_component(comp_nodes, comp_edges, max_passes))
-    _pack_components(components)
+    passes = _layout_nodes(nodes, edges, max_passes)
+    _pack_components(_connected_components(nodes, edges))
 
     for node in nodes:
         node["x"] = round(node["x"], 2)
@@ -1007,16 +1005,16 @@ def _optimize_layout(nodes: list, edges: list, max_passes: int) -> int:
     return passes
 
 
-def _layout_component(nodes: list, edges: list, max_passes: int) -> int:
-    """Lay out one connected component (in place, setting raw ``x``/``y``) to remove overlaps.
+def _layout_nodes(nodes: list, edges: list, max_passes: int) -> int:
+    """Lay out a node/edge set (in place, setting raw ``x``/``y``) overlap-free with few crossings.
 
-    ``nodes`` are view-data node dicts (as from :func:`_view_data`) for a single connected
-    component; ``edges`` are that component's ``{"source","target",...}`` dicts. Runs up to
-    ``max_passes`` passes (see this section's header) and returns the number actually used. On
-    convergence every node disk is disjoint from every other and from every non-incident edge, and
-    edge crossings are reduced; if the budget is exhausted first the best arrangement reached is
-    left in place. Coordinates are left **unrounded** so the caller can translate the component
-    (:func:`_pack_components`) before a single final rounding. Deterministic.
+    ``nodes`` are view-data node dicts (as from :func:`_view_data`); ``edges`` are the payload's
+    ``{"source","target",...}`` dicts. Runs up to ``max_passes`` passes (see this section's header)
+    and returns the number actually used. On convergence every node disk is disjoint from every
+    other and from every non-incident edge, and edge crossings are reduced; if the budget is
+    exhausted first the best arrangement reached is left in place. Coordinates are left
+    **unrounded** so the caller can translate components (:func:`_pack_components`) before a single
+    final rounding. Deterministic.
     """
     n = len(nodes)
     for node in nodes:  # ensure every node has coordinates even on the trivial paths below
