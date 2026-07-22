@@ -7,6 +7,8 @@ HTML. The JSON round-trip is asserted lossless; the DOT round-trip is best-effor
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from conftest import load_fixture
 
@@ -620,3 +622,81 @@ def test_convert_optimize_passes_ignored_without_ringed(graph, tmp_path, capsys)
     # Force-directed page still written, and it ignores the flag (produces the plain force HTML).
     assert out.read_text() == html_export.build_html(graph)
     assert "only affects --ringed" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- #
+# Overlap-free layout — node/edge overlap elimination (--max-passes)
+# --------------------------------------------------------------------------- #
+_EXAMPLE_GRAPH = Path(__file__).resolve().parents[1] / "docs" / "examples" / "example-graph.json"
+
+
+def test_optimized_layout_removes_all_overlaps_small():
+    # On the crossing fixture the optimiser must leave zero node-node and zero edge-node overlaps.
+    g = _crossing_graph()
+    data = html_export._optimized_view_data(g, 2000)
+    assert html_export._count_overlaps(data["nodes"], data["edges"]) == (0, 0)
+
+
+def test_optimized_layout_reaches_zero_on_example_graph():
+    # The acceptance criteria: the checked-in example graph must reach 0 node and 0 edge overlap
+    # in far fewer than 10000 optimisation passes.
+    graph = load_graph(_EXAMPLE_GRAPH)
+    data = html_export._view_data(graph)
+    used = html_export._optimize_layout(data["nodes"], data["edges"], 10000)
+    assert used < 10000
+    assert html_export._count_overlaps(data["nodes"], data["edges"]) == (0, 0)
+
+
+def test_optimized_build_is_deterministic(graph):
+    assert html_export.build_optimized_html(graph, 500) == html_export.build_optimized_html(
+        graph, 500
+    )
+
+
+def test_optimized_html_is_self_contained_and_labelled(graph):
+    text = html_export.build_optimized_html(graph, 500)
+    assert "overlap-free" in text  # variant title / HUD badge
+    assert "http://" not in text and "https://" not in text  # no external assets
+
+
+def test_count_overlaps_detects_a_planted_overlap():
+    # Two node disks placed on top of each other, and a third node sitting on the edge between two
+    # others — one node-node overlap and one edge-node overlap.
+    nodes = [
+        {"id": "a", "type": "eni", "x": 0.0, "y": 0.0},
+        {"id": "b", "type": "eni", "x": 1.0, "y": 0.0},  # overlaps a (radius 9 each)
+        {"id": "c", "type": "eni", "x": 100.0, "y": 0.0},
+        {"id": "d", "type": "eni", "x": 200.0, "y": 0.0},
+        {"id": "e", "type": "eni", "x": 150.0, "y": 0.0},  # sits on the c-d segment
+    ]
+    edges = [{"source": "c", "target": "d"}]
+    assert html_export._count_overlaps(nodes, edges) == (1, 1)
+
+
+def test_convert_max_passes_writes_overlap_free(graph, tmp_path):
+    jp = json_export.write_json(graph, tmp_path / "graph.json")
+    out = tmp_path / "opt.html"
+    rc = convert.main([str(jp), "--max-passes", "500", "-o", str(out)])
+    assert rc == 0
+    assert out.read_text() == html_export.build_optimized_html(graph, 500)
+    assert "overlap-free" in out.read_text()
+
+
+def test_convert_max_passes_negative_errors(graph, tmp_path):
+    jp = json_export.write_json(graph, tmp_path / "graph.json")
+    rc = convert.main([str(jp), "--max-passes", "-1"])
+    assert rc == 2
+
+
+def test_convert_max_passes_overrides_ringed(graph, tmp_path, capsys):
+    jp = json_export.write_json(graph, tmp_path / "graph.json")
+    out = tmp_path / "opt.html"
+    rc = convert.main(
+        [str(jp), "--ringed", "--optimize-passes", "3", "--max-passes", "500", "-o", str(out)]
+    )
+    assert rc == 0
+    # The overlap-free layout is produced; the ringed knobs are ignored (with a warning).
+    assert out.read_text() == html_export.build_optimized_html(graph, 500)
+    err = capsys.readouterr().err
+    assert "ignoring --ringed" in err
+    assert "ignoring --optimize-passes" in err

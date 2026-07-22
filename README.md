@@ -189,6 +189,7 @@ cloudbreachgraph-to-html out/graph.json                 # writes out/graph.html
 cloudbreachgraph-to-html out/graph.dot -o topology.html # explicit output path
 cloudbreachgraph-to-html capture.data --format json     # force the input format
 cloudbreachgraph-to-html out/graph.json --ringed        # concentric-ringed layout
+cloudbreachgraph-to-html out/graph.json --max-passes 10000  # overlap-free layout
 ```
 
 No capture of your own? A shipped, fully **anonymised** example graph (a real-shaped
@@ -251,6 +252,32 @@ genuinely sit in three different subnets must fan its spokes across the ring.
 
 ```bash
 cloudbreachgraph-to-html out/graph.json --ringed --optimize-passes 20
+```
+
+### Overlap-free layout (`--max-passes N`)
+
+Both the force and ringed layouts trade off overlaps against structure. When the priority is a
+clean, uncluttered picture, pass **`--max-passes N`** to render the **overlap-free** layout: it
+runs up to **N graph-optimisation passes** and stops as soon as the drawing has **no two node
+disks overlapping** and **no edge drawn across a node** it isn't connected to (an *edge overlap*
+— the natural counterpart of a node overlap). Positions are computed deterministically in Python
+(no in-browser relaxation); you keep drag, zoom and pan.
+
+Each pass runs one of two phases: a force-directed **unfolding** that spreads the nodes into a
+roomy arrangement, then a hard geometric **projection** that separates overlapping disks and
+pushes any node off an edge that crosses it, repeating until both overlap counts are exactly
+zero. A real capture is **non-planar** (a single VPC can contain a non-planar minor), so a
+drawing with zero edge *crossings* cannot exist — this layout instead eliminates the two overlaps
+that actually hurt legibility. A larger `N` only raises the ceiling on passes; the layout stops
+early once it converges, so the result is stable. `--max-passes` takes precedence over `--ringed`
+/ `--optimize-passes` (which don't apply to it), and `--max-passes 0` (the default) keeps the
+force/ringed layout.
+
+On the shipped 124-node/4-VPC example graph, `--max-passes 10000` reaches **0 node and 0 edge
+overlap in ~400 passes**:
+
+```bash
+cloudbreachgraph-to-html docs/examples/example-graph.json --max-passes 10000 -o example.html
 ```
 
 ## Anonymising a graph for sharing
