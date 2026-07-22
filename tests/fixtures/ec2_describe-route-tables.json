@@ -1,0 +1,46 @@
+{
+  "RouteTables": [
+    {
+      "RouteTableId": "rtb-0public00000001",
+      "VpcId": "vpc-0aaaaaaaaaaaaaaaa",
+      "Associations": [
+        {
+          "Main": false,
+          "RouteTableAssociationId": "rtbassoc-0public1",
+          "SubnetId": "subnet-011111111111111",
+          "AssociationState": {"State": "associated"}
+        }
+      ],
+      "Routes": [
+        {"DestinationCidrBlock": "10.0.0.0/16", "GatewayId": "local", "State": "active"},
+        {"DestinationCidrBlock": "0.0.0.0/0", "GatewayId": "igw-0abc00000000001", "State": "active"}
+      ]
+    },
+    {
+      "RouteTableId": "rtb-0private0000002",
+      "VpcId": "vpc-0aaaaaaaaaaaaaaaa",
+      "Associations": [
+        {
+          "Main": false,
+          "RouteTableAssociationId": "rtbassoc-0private1",
+          "SubnetId": "subnet-022222222222222",
+          "AssociationState": {"State": "associated"}
+        }
+      ],
+      "Routes": [
+        {"DestinationCidrBlock": "10.0.0.0/16", "GatewayId": "local", "State": "active"},
+        {"DestinationCidrBlock": "0.0.0.0/0", "NatGatewayId": "nat-0abc00000000005", "State": "active"}
+      ]
+    },
+    {
+      "RouteTableId": "rtb-0main0000000003",
+      "VpcId": "vpc-0aaaaaaaaaaaaaaaa",
+      "Associations": [
+        {"Main": true, "RouteTableAssociationId": "rtbassoc-0main1", "AssociationState": {"State": "associated"}}
+      ],
+      "Routes": [
+        {"DestinationCidrBlock": "10.0.0.0/16", "GatewayId": "local", "State": "active"}
+      ]
+    }
+  ]
+}

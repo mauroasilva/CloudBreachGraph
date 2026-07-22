@@ -14,6 +14,9 @@ from cloudbreachgraph.model.resources import (
     Ec2Instance,
     Elbv2LoadBalancer,
     Eni,
+    RouteTable,
+    SecurityGroup,
+    SgIngressRule,
     Subnet,
     Vpc,
 )
@@ -106,3 +109,51 @@ def test_subnet_and_vpc_from_collected():
     assert vpc.id == "vpc-0defdefdefdefdefd"
     assert vpc.is_default is True
     assert vpc.name is None  # no Name tag
+
+
+def test_security_group_from_collected_parses_ingress():
+    raw = collectors._normalize_security_group(
+        load_fixture("ec2_describe-security-groups.json")["SecurityGroups"][0]
+    )
+    sg = SecurityGroup.from_collected(raw)
+    assert sg.id == "sg-0aaa0001"
+    assert sg.name == "web"
+    assert sg.vpc_id == "vpc-0aaaaaaaaaaaaaaaa"
+    assert len(sg.ingress) == 3
+
+    https = sg.ingress[0]
+    assert https.cidrs == ["0.0.0.0/0"]
+    assert https.port_label() == "tcp/443"
+
+    peer = sg.ingress[2]  # the -1 (all traffic) peer-SG rule
+    assert peer.referenced_group_ids == ["sg-0aaa0002"]
+    assert peer.port_label() == "all"
+
+
+def test_sg_ingress_rule_port_labels():
+    assert SgIngressRule("tcp", 443, 443).port_label() == "tcp/443"
+    assert SgIngressRule("tcp", 8000, 8100).port_label() == "tcp/8000-8100"
+    assert SgIngressRule("-1", None, None).port_label() == "all"
+    assert SgIngressRule("icmp", None, None).port_label() == "icmp"
+
+
+def test_route_table_from_collected():
+    raw = collectors._normalize_route_table(
+        load_fixture("ec2_describe-route-tables.json")["RouteTables"][0]
+    )
+    rt = RouteTable.from_collected(raw)
+    assert rt.id == "rtb-0public00000001"
+    assert rt.is_main is False
+    assert rt.subnet_ids == ["subnet-011111111111111"]
+    default = next(r for r in rt.routes if r.dest_cidr == "0.0.0.0/0")
+    assert default.target == "igw-0abc00000000001"
+    assert default.state == "active"
+
+
+def test_route_table_main_flag_from_associations():
+    raw = collectors._normalize_route_table(
+        load_fixture("ec2_describe-route-tables.json")["RouteTables"][2]
+    )
+    rt = RouteTable.from_collected(raw)
+    assert rt.is_main is True
+    assert rt.subnet_ids == []  # the main RT has no explicit subnet association

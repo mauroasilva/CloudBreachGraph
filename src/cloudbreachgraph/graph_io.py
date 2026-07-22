@@ -12,9 +12,10 @@ re-collecting from AWS. Used by the ``cloudbreachgraph-to-html`` auxiliary CLI
   (not arbitrary Graphviz). DOT is a lossy rendering, so it recovers what the ``.dot``
   actually encodes: node id, type, name, the public-IP/synthetic flags and the one display
   attribute per type (interface type, LB type, CIDR, instance state), plus every edge and
-  its ``match_rule``. The DOT-only ``Internet`` decoration is folded back into ``public_ips``
-  on the ENI it exposed (the inverse of what ``dot_export`` does), so the reconstructed graph
-  matches the model rather than the rendering.
+  its ``match_rule``. Reachability sources (``internet``/``cidr``/``security_group``, §5.5) and
+  their ``can_reach`` edges round-trip as ordinary nodes/edges. A **legacy** shared ``Internet``
+  decoration (older ``.dot`` output, before per-ENI internet nodes existed) is still folded back
+  into ``public_ips`` on the ENI it exposed, so old captures keep matching the model.
 
 Deterministic by construction: :class:`Graph` sorts nodes/edges, so a reloaded graph
 serializes byte-for-byte identically to the original.

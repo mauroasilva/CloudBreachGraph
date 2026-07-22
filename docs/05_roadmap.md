@@ -65,7 +65,20 @@ from `log_archive`, in one run.
 ## Other candidate roles (not yet designed)
 - `dns` — Route 53 / Resolver, often centralized in a networking account.
 - `cloudtrail` — organization trail in a management/audit account.
-- `security_groups` / `route_tables` — deeper networking, likely part of `network`.
+
+**Shipped since v1** (both part of the `network` role, not separate roles — the resources live in
+the same account as the ENIs they govern):
+- **Security groups** — `collect_security_groups` feeds the ENI *reachability* mapping (source
+  `internet`/`cidr`/`security_group` nodes + `*_can_reach` edges, `02_architecture.md §5.5`). See
+  `learnings_2026-07-22_eni-reachability-mapping.md`.
+- **Route tables** — `collect_route_tables` + `mapping/routing.py` add *routability*: each
+  reachability edge is split into `routable_can_reach` / `not_routable_can_reach` (or plain
+  `can_reach` when undetermined), so the map distinguishes an ENI merely *allowed* by a `0.0.0.0/0`
+  rule from one *actually routable* (`02_architecture.md §5.6`). See
+  `learnings_2026-07-22_routable-reachability.md`.
+
+Deeper routing (NACLs, TGW/VPN route propagation, cross-VPC peering path validation) remains future
+work — the current model is a documented approximation, not a full route simulator.
 
 Each follows the same recipe. When any of these is picked up, add a short section here and, per
 the build process, do it in its **own** phase with its **own** `learnings_phaseX.md`.

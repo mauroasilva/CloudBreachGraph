@@ -186,6 +186,115 @@ class ClassicLoadBalancer:
 
 
 @dataclass
+class SgIngressRule:
+    """One inbound rule of a security group (``docs/02_architecture.md §5.5``).
+
+    ``protocol`` is ``"-1"`` for *all traffic*; otherwise ports run ``from_port``..``to_port``
+    (both ``None`` when the protocol carries no ports). The rule's *sources* are the things it
+    lets connect: IPv4 CIDRs, IPv6 CIDRs, and referencing security groups.
+    """
+
+    protocol: str | None
+    from_port: int | None
+    to_port: int | None
+    cidrs: list[str] = field(default_factory=list)
+    ipv6_cidrs: list[str] = field(default_factory=list)
+    referenced_group_ids: list[str] = field(default_factory=list)
+
+    @classmethod
+    def from_collected(cls, d: dict[str, Any]) -> SgIngressRule:
+        return cls(
+            protocol=d.get("IpProtocol"),
+            from_port=d.get("FromPort"),
+            to_port=d.get("ToPort"),
+            cidrs=[r.get("CidrIp") for r in d.get("IpRanges", []) if r.get("CidrIp")],
+            ipv6_cidrs=[r.get("CidrIpv6") for r in d.get("Ipv6Ranges", []) if r.get("CidrIpv6")],
+            referenced_group_ids=[
+                g.get("GroupId") for g in d.get("UserIdGroupPairs", []) if g.get("GroupId")
+            ],
+        )
+
+    def port_label(self) -> str:
+        """A short, stable label for this rule's protocol/port range (e.g. ``"tcp/443"``)."""
+        if self.protocol in ("-1", -1, None):
+            return "all"
+        if self.from_port is None and self.to_port is None:
+            return str(self.protocol)
+        if self.from_port == self.to_port:
+            return f"{self.protocol}/{self.from_port}"
+        return f"{self.protocol}/{self.from_port}-{self.to_port}"
+
+
+@dataclass
+class SecurityGroup:
+    """A security group whose inbound rules decide which sources can reach an ENI (§5.5)."""
+
+    id: str
+    name: str | None
+    vpc_id: str | None
+    description: str | None
+    ingress: list[SgIngressRule] = field(default_factory=list)
+
+    @classmethod
+    def from_collected(cls, d: dict[str, Any]) -> SecurityGroup:
+        return cls(
+            id=d.get("GroupId"),
+            name=d.get("GroupName"),
+            vpc_id=d.get("VpcId"),
+            description=d.get("Description"),
+            ingress=[SgIngressRule.from_collected(p) for p in d.get("IpPermissions", [])],
+        )
+
+
+@dataclass
+class Route:
+    """One route in a route table (``docs/02_architecture.md §5.6``).
+
+    ``target`` is the collapsed next-hop id (``local``, ``igw-…``, ``nat-…``, ``tgw-…``,
+    ``pcx-…``, …); ``state`` is ``"active"`` or ``"blackhole"``.
+    """
+
+    dest_cidr: str | None
+    dest_ipv6_cidr: str | None
+    target: str | None
+    state: str | None
+
+    @classmethod
+    def from_collected(cls, d: dict[str, Any]) -> Route:
+        return cls(
+            dest_cidr=d.get("DestinationCidrBlock"),
+            dest_ipv6_cidr=d.get("DestinationIpv6CidrBlock"),
+            target=d.get("Target"),
+            state=d.get("State"),
+        )
+
+
+@dataclass
+class RouteTable:
+    """A route table and the subnets it governs (``docs/02_architecture.md §5.6``).
+
+    ``is_main`` marks the VPC's implicit (main) route table — the fallback for any subnet with no
+    explicit association.
+    """
+
+    id: str
+    vpc_id: str | None
+    is_main: bool
+    subnet_ids: list[str] = field(default_factory=list)
+    routes: list[Route] = field(default_factory=list)
+
+    @classmethod
+    def from_collected(cls, d: dict[str, Any]) -> RouteTable:
+        return cls(
+            id=d.get("RouteTableId"),
+            vpc_id=d.get("VpcId"),
+            is_main=bool(d.get("Main")),
+            subnet_ids=list(d.get("SubnetIds", [])),
+            routes=[Route.from_collected(r) for r in d.get("Routes", [])],
+        )
+
+
+@dataclass
 class Subnet:
     """A subnet an ENI lives in (``docs/02_architecture.md §5.1``)."""
 

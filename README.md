@@ -156,9 +156,11 @@ cloudbreachgraph --from-cache tests/fixtures --output-dir out/
   deterministic (stable ordering, no timestamps) so diffs are meaningful.
 - `graph.dot` — Graphviz DOT: nodes colored/shaped by type, subnets and ENIs grouped
   inside their VPC via `subgraph cluster_*`, edges labeled by relationship (load-balancer
-  attachment edges also show the `match_rule` that resolved them). ENI labels include
-  their `Private IP` and `Public IP` (when the ENI has an Elastic/public IP); any ENI with
-  a public IP is also linked to a generic `Internet` node to highlight internet exposure.
+  attachment edges also show the `match_rule` that resolved them; reachability edges show the
+  `ports` that reach the ENI). ENI labels include their `Private IP` and `Public IP` (when the
+  ENI has an Elastic/public IP). **Reachability** source nodes (see below) — `Internet`, source
+  CIDRs, and referencing security groups — link to the ENIs they can connect to, colored by
+  **routability**: routable edges solid red, not-routable ones grey/dashed.
 - `graph.<fmt>` — only with `--render`; requires `dot`. If `dot` is absent the tool warns
   and still writes the `.dot`.
 - `graph.html` — **only with `--html`** (never produced by default). A single,
@@ -185,6 +187,51 @@ cloudbreachgraph --from-cache tests/fixtures --output-dir out/
 
 With `--all-accounts` the files are named per account: `graph.<alias>.json` / `.dot`
 (and `.html` with `--html`).
+
+## ENI reachability (who can connect)
+
+Beyond mapping what each ENI *is*, CloudBreachGraph maps **how each ENI is reachable**. It reads
+every ENI's security-group **inbound** rules (pulled with `aws ec2 describe-security-groups`) and,
+for each distinct source a rule allows, adds a **source node** with a `can_reach` edge to the ENI.
+The edge is labelled with the protocol/port ranges that reach it (e.g. `tcp/443`, `all`). Because
+an ALB / Classic-ELB ENI carries its load balancer's security groups, **load-balancer** exposure
+is captured through this same path automatically.
+
+Three kinds of source node:
+
+- **`Internet`** — a rule open to the whole internet (`0.0.0.0/0` or `::/0`). These are created
+  **one per exposed ENI** (id `internet:<eni-id>`), never a single shared node — a shared node
+  would collect a spoke from every internet-facing ENI and clutter the picture with long crossing
+  edges.
+- **`cidr`** — any other source range (id `cidr:<cidr>`). Shared, so one range reaching several
+  ENIs is a single node with a spoke to each.
+- **`security_group`** — a referencing security group (id `sg-source:<group-id>`), labelled with
+  the peer group's name. This is who-can-reach *from inside* another security group.
+
+An ENI with no security groups gets no reachability edges.
+
+### Routable vs. not routable
+
+A security-group rule says a source is **allowed**; CloudBreachGraph also asks whether a network
+path actually **routes** it there, using each ENI's **route table** (`aws ec2
+describe-route-tables`). The reachability edge's type carries the verdict:
+
+- **`routable_can_reach`** — allowed **and** a route exists (in DOT: solid **red**).
+- **`not_routable_can_reach`** — allowed but **no** route, e.g. a `0.0.0.0/0` rule on an ENI in a
+  private subnet or with no public IP (in DOT: **grey dashed**). This is the classic "the security
+  group looks wide open, but the ENI isn't actually reachable" case.
+- **`can_reach`** — routability **undetermined** (no route tables were collected — an old capture
+  or a run without route-table permissions). We keep the plain edge rather than guess.
+
+The verdict uses a deliberately simple, documented model (not a full route simulator): an
+`internet` source is routable only from a **public** subnet (a default route to an internet
+gateway) *and* an ENI with a public IP; an in-VPC CIDR or a peer security group is routable via the
+local route; an external CIDR is routable over a VPN / transit-gateway / peering route or the
+internet path. See [`docs/02_architecture.md §5.6`](docs/02_architecture.md).
+
+These nodes/edges appear in **all** outputs (JSON, DOT, HTML); in the
+[ringed layout](#ringed-layout---ringed) the sources form a new **outermost ring** around each VPC
+cluster.
 
 ## Converting an existing graph to HTML
 
@@ -221,12 +268,14 @@ cloudbreachgraph-to-html docs/examples/example-graph.json --ringed -o example.ht
 Pass `--ringed` to render a **concentric-ringed** view instead of the force-directed one:
 each **VPC** sits at the center of its own cluster, ringed by its **subnets**, then its
 **ENIs** on their own dedicated ring, then **everything else** under that VPC (EC2 instances,
-load balancers) on the outer ring. The ENI ring is the **angular anchor**: each **subnet** is
-placed at the **mean angle of the ENIs it contains** (and ENIs are grouped by subnet on their
-ring), and each outer-ring node at the **mean angle of the ENIs attached to it** — so a subnet
-keeps its interfaces clustered right next to it, and an EC2 instance or load balancer lines up
-radially with its interface(s) (a single ENI puts it on exactly that spoke; several average
-out). Multiple VPCs are tiled in a grid so their rings don't overlap; any resource
+load balancers), then a final **outermost ring** of its **reachability sources** (the `Internet`
+/ CIDR / security-group nodes described above). The ENI ring is the **angular anchor**: each
+**subnet** is placed at the **mean angle of the ENIs it contains** (and ENIs are grouped by subnet
+on their ring), each EC2/LB node at the **mean angle of the ENIs attached to it**, and each
+reachability source at the **mean angle of the ENIs it can reach** — so a subnet keeps its
+interfaces clustered right next to it, an EC2 instance or load balancer lines up radially with its
+interface(s), and a source sits just outside the interfaces it exposes (a single ENI puts it on
+exactly that spoke; several average out). Multiple VPCs are tiled in a grid so their rings don't overlap; any resource
 that resolves to no VPC (an orphan) collects into a final ring-cluster with an empty center.
 The ring structure is conveyed by node position alone (no guide circles are drawn); a
 per-cluster VPC label sits above each cluster. Unlike the

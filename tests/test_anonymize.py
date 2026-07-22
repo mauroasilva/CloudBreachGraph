@@ -27,6 +27,8 @@ _COMMAND_FIXTURES = {
     ("elb", "describe-load-balancers"): "elb_describe-load-balancers.json",
     ("ec2", "describe-subnets"): "ec2_describe-subnets.json",
     ("ec2", "describe-vpcs"): "ec2_describe-vpcs.json",
+    ("ec2", "describe-security-groups"): "ec2_describe-security-groups.json",
+    ("ec2", "describe-route-tables"): "ec2_describe-route-tables.json",
 }
 
 
@@ -191,22 +193,29 @@ def test_ip_is_consistent_across_references():
 def test_cidr_keeps_prefix_length_and_class(graph_dict):
     import ipaddress
 
-    orig_prefixes = sorted(
-        ipaddress.ip_network(n["attributes"]["cidr"], strict=False).prefixlen
-        for n in graph_dict["nodes"]
-        if n["attributes"].get("cidr")
-    )
+    def is_rfc1918(net):
+        # The anonymiser's notion of "private" is RFC1918 (10/8, 172.16/12, 192.168/16) — it maps
+        # anything else, including the 203.0.113.0/24 doc range, to a public replacement.
+        return any(
+            net.subnet_of(ipaddress.ip_network(b))
+            for b in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+        )
+
     anon = anonymize_graph(graph_dict, seed=4)
-    new_prefixes = []
-    for n in anon["nodes"]:
-        new_cidr = n["attributes"].get("cidr")
-        if not new_cidr:
+    # Anonymisation preserves order, so pair each node with its scrubbed counterpart and check the
+    # cidr attribute (subnet/vpc ranges plus §5.5 reachability CIDR sources) keeps its prefix
+    # length and RFC1918 class — a private range stays private, a public source stays public.
+    for orig, new in zip(graph_dict["nodes"], anon["nodes"], strict=True):
+        old_cidr = orig["attributes"].get("cidr")
+        new_cidr = new["attributes"].get("cidr")
+        assert bool(old_cidr) == bool(new_cidr)
+        if not old_cidr:
             continue
+        old_net = ipaddress.ip_network(old_cidr, strict=False)
         net = ipaddress.ip_network(new_cidr, strict=False)
         assert new_cidr == str(net)  # host bits zeroed -> canonical network form
-        assert net.network_address.is_private  # a private CIDR stays private
-        new_prefixes.append(net.prefixlen)
-    assert sorted(new_prefixes) == orig_prefixes  # prefix lengths preserved
+        assert net.prefixlen == old_net.prefixlen  # prefix length preserved
+        assert is_rfc1918(net) == is_rfc1918(old_net)  # private/public class preserved
 
 
 def test_private_stays_private_public_stays_public(graph_dict):

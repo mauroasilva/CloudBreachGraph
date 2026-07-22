@@ -26,6 +26,8 @@ _COMMAND_FIXTURES = {
     ("elb", "describe-load-balancers"): "elb_describe-load-balancers.json",
     ("ec2", "describe-subnets"): "ec2_describe-subnets.json",
     ("ec2", "describe-vpcs"): "ec2_describe-vpcs.json",
+    ("ec2", "describe-security-groups"): "ec2_describe-security-groups.json",
+    ("ec2", "describe-route-tables"): "ec2_describe-route-tables.json",
 }
 
 _CONFIG = """

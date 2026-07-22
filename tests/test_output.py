@@ -24,6 +24,8 @@ _COMMAND_FIXTURES = {
     ("elb", "describe-load-balancers"): "elb_describe-load-balancers.json",
     ("ec2", "describe-subnets"): "ec2_describe-subnets.json",
     ("ec2", "describe-vpcs"): "ec2_describe-vpcs.json",
+    ("ec2", "describe-security-groups"): "ec2_describe-security-groups.json",
+    ("ec2", "describe-route-tables"): "ec2_describe-route-tables.json",
 }
 
 
@@ -85,20 +87,40 @@ def test_write_dot_wellformed(graph, tmp_path):
     assert "i-0abc0000000000001 [web-server-1]" in text  # named instance
     assert "subnet-011111111111111 [public-1a]" in text  # named subnet
     assert "vpc-0aaaaaaaaaaaaaaaa [primary-vpc]" in text  # named vpc
-    # An ENI has no Name tag -> id only, no bracketed name.
+    # An ENI has no Name tag -> its own node line is id only, no bracketed name.
     assert "eni-00instance0000001\\ninterface" in text
-    assert "eni-00instance0000001 [" not in text
+    assert '"eni-00instance0000001" [label="[eni]\\neni-00instance0000001' in text
     # ENI labels carry Private IP / Public IP sections.
     assert "Private IP: 10.0.1.10" in text
     assert "Public IP: 54.10.20.30" in text
-    # ENIs with a public IP are connected to a generic "Internet" node.
-    assert '"Internet" [label="Internet"' in text
-    assert '"eni-00instance0000001" -> "Internet" [label="public_ip"];' in text
-    # ENIs without a public IP are not connected to it.
-    assert '"eni-00nlb00000000003" -> "Internet"' not in text
+    # Reachability (§5.5): a per-ENI Internet node for the 0.0.0.0/0 inbound rule, plus a shared
+    # CIDR source node and a referencing-security-group source node. The instance ENI is in a
+    # public subnet with a public IP, so its sources are *routable* (§5.6).
+    assert '"internet:eni-00instance0000001" [label="[internet]' in text
+    assert (
+        '"internet:eni-00instance0000001" -> "eni-00instance0000001" '
+        '[label="routable_can_reach' in text
+    )
+    assert (
+        '"cidr:203.0.113.0/24" -> "eni-00instance0000001" '
+        '[label="routable_can_reach\\ntcp/22"' in text
+    )
+    assert '"sg-source:sg-0aaa0002" -> "eni-00instance0000001"' in text
+    # The ALB ENI has its own per-ENI Internet node, but no public IP -> not routable.
+    assert (
+        '"internet:eni-00alb00000000002" -> "eni-00alb00000000002" '
+        '[label="not_routable_can_reach' in text
+    )
+    # Routable edges are colored red; not-routable ones are grey/dashed.
+    assert 'color="#E53935"' in text  # routable
+    assert 'color="#9E9E9E"' in text  # not routable
+    # An ENI with no security groups (the NAT gateway / NLB) is never a reachability target.
+    assert '-> "eni-00natgw000000004"' not in text
+    assert '-> "eni-00nlb00000000003"' not in text
     # Nodes colored by type (a couple of representative fills).
     assert 'fillcolor="#E8F5E9"' in text  # eni
     assert 'fillcolor="#E3F2FD"' in text  # subnet
+    assert 'fillcolor="#FFEBEE"' in text  # internet source
     # Edges labeled by relationship, with match_rule on the LB edge.
     assert 'label="in_subnet"' in text
     assert 'label="in_vpc"' in text

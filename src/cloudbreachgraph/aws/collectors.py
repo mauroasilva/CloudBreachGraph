@@ -106,6 +106,86 @@ def _normalize_vpc(raw: dict) -> dict:
     }
 
 
+def _normalize_ip_permission(raw: dict) -> dict:
+    """Keep the fields a reachability rule depends on from one ``IpPermissions[]`` entry.
+
+    ``IpProtocol`` is ``"-1"`` for *all traffic* (then ``FromPort``/``ToPort`` are absent);
+    otherwise the port range is ``FromPort``..``ToPort``. Sources are IPv4 CIDRs
+    (``IpRanges[].CidrIp``), IPv6 CIDRs (``Ipv6Ranges[].CidrIpv6``) and referencing security
+    groups (``UserIdGroupPairs[].GroupId``). See ``docs/02_architecture.md §5.5``.
+    """
+    return {
+        "IpProtocol": raw.get("IpProtocol"),
+        "FromPort": raw.get("FromPort"),
+        "ToPort": raw.get("ToPort"),
+        "IpRanges": [{"CidrIp": r.get("CidrIp")} for r in raw.get("IpRanges", [])],
+        "Ipv6Ranges": [{"CidrIpv6": r.get("CidrIpv6")} for r in raw.get("Ipv6Ranges", [])],
+        "UserIdGroupPairs": [
+            {"GroupId": g.get("GroupId")} for g in raw.get("UserIdGroupPairs", [])
+        ],
+    }
+
+
+def _route_target(raw: dict) -> str | None:
+    """The single target id of a route, whichever gateway/peering/eni field carries it.
+
+    A route's next hop is spelled in one of several mutually-exclusive keys (``GatewayId`` for
+    ``local`` / ``igw-`` / ``vgw-``, ``NatGatewayId``, ``TransitGatewayId``,
+    ``VpcPeeringConnectionId``, ``NetworkInterfaceId``, …). We collapse them to one ``target``
+    string so the routing analysis (``mapping/routing.py``) can classify the next hop by prefix.
+    """
+    for key in (
+        "GatewayId",
+        "NatGatewayId",
+        "TransitGatewayId",
+        "VpcPeeringConnectionId",
+        "EgressOnlyInternetGatewayId",
+        "NetworkInterfaceId",
+        "InstanceId",
+        "CarrierGatewayId",
+        "LocalGatewayId",
+    ):
+        if raw.get(key):
+            return raw[key]
+    return None
+
+
+def _normalize_route(raw: dict) -> dict:
+    return {
+        "DestinationCidrBlock": raw.get("DestinationCidrBlock"),
+        "DestinationIpv6CidrBlock": raw.get("DestinationIpv6CidrBlock"),
+        "Target": _route_target(raw),
+        "State": raw.get("State"),
+    }
+
+
+def _normalize_route_table(raw: dict) -> dict:
+    """Keep a route table's VPC, its subnet associations (+ whether it's the VPC main RT), and
+    its routes' destination/target/state (``docs/02_architecture.md §5.6``)."""
+    associations = raw.get("Associations", [])
+    return {
+        "RouteTableId": raw.get("RouteTableId"),
+        "VpcId": raw.get("VpcId"),
+        "Main": any(a.get("Main") for a in associations),
+        "SubnetIds": [a.get("SubnetId") for a in associations if a.get("SubnetId")],
+        "Routes": [_normalize_route(r) for r in raw.get("Routes", [])],
+    }
+
+
+def _normalize_security_group(raw: dict) -> dict:
+    """Keep a security group's identity and its **ingress** rules (``IpPermissions``).
+
+    Only inbound rules matter for "who can reach this ENI"; egress (``IpPermissionsEgress``)
+    is intentionally dropped (``docs/02_architecture.md §5.5``)."""
+    return {
+        "GroupId": raw.get("GroupId"),
+        "GroupName": raw.get("GroupName"),
+        "VpcId": raw.get("VpcId"),
+        "Description": raw.get("Description"),
+        "IpPermissions": [_normalize_ip_permission(p) for p in raw.get("IpPermissions", [])],
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Collectors — one AWS command each (network role)
 # --------------------------------------------------------------------------- #
@@ -153,6 +233,26 @@ def collect_vpcs(profile: str | None, region: str | None) -> list[dict]:
     return [_normalize_vpc(x) for x in data.get("Vpcs", [])]
 
 
+def collect_security_groups(profile: str | None, region: str | None) -> list[dict]:
+    """``aws ec2 describe-security-groups`` -> normalized ``.SecurityGroups[]``.
+
+    Provides the inbound rules the builder turns into ENI reachability nodes/edges
+    (``docs/02_architecture.md §5.5``). Accounts with only the default SG still return it,
+    and an empty response is handled gracefully via the ``.get`` default."""
+    data = runner.run_aws(["ec2", "describe-security-groups"], profile=profile, region=region)
+    return [_normalize_security_group(x) for x in data.get("SecurityGroups", [])]
+
+
+def collect_route_tables(profile: str | None, region: str | None) -> list[dict]:
+    """``aws ec2 describe-route-tables`` -> normalized ``.RouteTables[]``.
+
+    Feeds the routability check that splits each ENI reachability edge into
+    ``routable_can_reach`` / ``not_routable_can_reach`` (``docs/02_architecture.md §5.6``).
+    An empty response is handled gracefully via the ``.get`` default."""
+    data = runner.run_aws(["ec2", "describe-route-tables"], profile=profile, region=region)
+    return [_normalize_route_table(x) for x in data.get("RouteTables", [])]
+
+
 # --------------------------------------------------------------------------- #
 # Role registry (§11.6) — the seam future roles extend
 # --------------------------------------------------------------------------- #
@@ -164,6 +264,8 @@ ROLE_COLLECTORS: dict[str, list[Collector]] = {
         collect_load_balancers_classic,
         collect_subnets,
         collect_vpcs,
+        collect_security_groups,
+        collect_route_tables,
     ],
     # ── future (see docs/05_roadmap.md); do NOT implement in v1 ──────────────
     # "flow_logs": [
@@ -182,6 +284,8 @@ ROLE_RESULT_KEYS: dict[str, list[str]] = {
         "load_balancers_classic",
         "subnets",
         "vpcs",
+        "security_groups",
+        "route_tables",
     ],
     # "flow_logs": ["flow_logs", "log_destinations"],  # future
 }
