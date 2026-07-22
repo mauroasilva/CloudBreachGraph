@@ -73,6 +73,9 @@ _TYPE_COLORS: dict[str, str] = {
     "eni": "#A5D6A7",
     "ec2_instance": "#FFCC80",
     "load_balancer": "#CE93D8",
+    # NAT gateways / VPC endpoints share the load balancer's role class (§5.4), distinct fills.
+    "nat_gateway": "#80CBC4",
+    "vpc_endpoint": "#9FA8DA",
     # Reachability sources (docs/02_architecture.md §5.5) — who can reach an ENI.
     "internet": "#EF9A9A",
     "cidr": "#FFE082",
@@ -94,6 +97,8 @@ _REACH_RELS = frozenset({"can_reach", "routable_can_reach", "not_routable_can_re
 _NODE_RADII: dict[str, float] = {
     "vpc": 16.0,
     "load_balancer": 13.0,
+    "nat_gateway": 13.0,  # same role class / ring as the load balancer (§5.4)
+    "vpc_endpoint": 13.0,
     "ec2_instance": 11.0,
     "subnet": 11.0,
 }
@@ -134,6 +139,10 @@ def _detail_line(node_type: str, attrs: dict) -> str:
         return " · ".join(bits)
     if node_type == "load_balancer" and attrs.get("lb_type"):
         return str(attrs["lb_type"])
+    if node_type == "nat_gateway" and attrs.get("state"):
+        return str(attrs["state"])
+    if node_type == "vpc_endpoint" and attrs.get("service_name"):
+        return str(attrs["service_name"])
     if node_type in ("subnet", "vpc") and attrs.get("cidr"):
         return str(attrs["cidr"])
     if node_type == "ec2_instance" and attrs.get("state"):
@@ -1490,7 +1499,7 @@ resize();
 // Node radius by type (LBs/VPCs read as slightly larger anchors).
 function radiusFor(t) {
   if (t === "vpc") return 16;
-  if (t === "load_balancer") return 13;
+  if (t === "load_balancer" || t === "nat_gateway" || t === "vpc_endpoint") return 13;
   if (t === "ec2_instance" || t === "subnet") return 11;
   return 9;
 }
@@ -1893,7 +1902,7 @@ window.addEventListener("resize", resize);
 
 function radiusFor(t) {
   if (t === "vpc") return 16;
-  if (t === "load_balancer") return 13;
+  if (t === "load_balancer" || t === "nat_gateway" || t === "vpc_endpoint") return 13;
   if (t === "ec2_instance" || t === "subnet") return 11;
   return 9;
 }

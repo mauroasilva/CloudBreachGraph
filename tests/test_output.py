@@ -26,6 +26,8 @@ _COMMAND_FIXTURES = {
     ("ec2", "describe-vpcs"): "ec2_describe-vpcs.json",
     ("ec2", "describe-security-groups"): "ec2_describe-security-groups.json",
     ("ec2", "describe-route-tables"): "ec2_describe-route-tables.json",
+    ("ec2", "describe-nat-gateways"): "ec2_describe-nat-gateways.json",
+    ("ec2", "describe-vpc-endpoints"): "ec2_describe-vpc-endpoints.json",
 }
 
 
@@ -120,6 +122,21 @@ def test_write_dot_wellformed(graph, tmp_path):
     assert 'label="in_subnet"' in text
     assert 'label="in_vpc"' in text
     assert "attached_to\\n(elbv2_description)" in text
+
+
+def test_write_dot_renders_nat_gateway_and_vpc_endpoint(graph, tmp_path):
+    # The NAT gateway and VPC endpoint owners render as their own typed, colored nodes, and the
+    # owned ENIs attach to them (giving every ENI an owner).
+    text = dot_export.write_dot(graph, tmp_path / "graph.dot").read_text()
+    assert '"nat-0abc00000000005" [label="[nat_gateway]' in text
+    assert "prod-natgw" in text
+    assert 'fillcolor="#E0F2F1"' in text  # nat_gateway teal
+    assert '"vpce-0abc00000000006" [label="[vpc_endpoint]' in text
+    assert 'fillcolor="#E8EAF6"' in text  # vpc_endpoint indigo
+    assert '"eni-00natgw000000004" -> "nat-0abc00000000005" [label="attached_to' in text
+    assert "(nat_gateway_address)" in text
+    assert '"eni-00vpce00000000006" -> "vpce-0abc00000000006" [label="attached_to' in text
+    assert "(vpc_endpoint_interface)" in text
 
 
 def test_write_dot_collapsed_shows_routability(graph_collapsed, tmp_path):

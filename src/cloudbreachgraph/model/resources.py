@@ -1,4 +1,4 @@
-"""Domain models for the five AWS resource types CloudBreachGraph maps.
+"""Domain models for the AWS resource types CloudBreachGraph maps.
 
 Each dataclass has a ``from_collected(dict)`` classmethod that consumes the **normalized
 dicts** produced by Phase 1's collectors (see ``docs/learnings/learnings_phase1.md §2b``).
@@ -183,6 +183,76 @@ class ClassicLoadBalancer:
     def lb_type(self) -> str:
         """Classic ELBs have a fixed type used for the graph node attribute."""
         return "classic"
+
+
+@dataclass
+class NatGateway:
+    """A NAT gateway — an ENI owner in the same role class as a load balancer (§5.4).
+
+    A NAT gateway owns one ENI **per address** it holds; the authoritative ENI ownership comes
+    from ``NatGatewayAddresses[].NetworkInterfaceId`` (no fragile ``Description`` parsing). It
+    renders to a ``nat_gateway`` graph node the fronting ENI attaches to.
+    """
+
+    id: str
+    vpc_id: str | None
+    subnet_id: str | None
+    state: str | None
+    connectivity: str | None
+    name: str | None
+    eni_ids: list[str] = field(default_factory=list)
+    public_ips: list[str] = field(default_factory=list)
+
+    @classmethod
+    def from_collected(cls, d: dict[str, Any]) -> NatGateway:
+        addresses = d.get("NatGatewayAddresses", [])
+        eni_ids = [a.get("NetworkInterfaceId") for a in addresses if a.get("NetworkInterfaceId")]
+        public_ips: list[str] = []
+        for a in addresses:
+            ip = a.get("PublicIp")
+            if ip and ip not in public_ips:
+                public_ips.append(ip)
+        return cls(
+            id=d.get("NatGatewayId"),
+            vpc_id=d.get("VpcId"),
+            subnet_id=d.get("SubnetId"),
+            state=d.get("State"),
+            connectivity=d.get("ConnectivityType"),
+            name=_name_tag(d.get("Tags")),
+            eni_ids=eni_ids,
+            public_ips=public_ips,
+        )
+
+
+@dataclass
+class VpcEndpoint:
+    """A VPC endpoint — another ENI owner in the load-balancer role class (§5.4).
+
+    An **Interface** (or **GatewayLoadBalancer**) endpoint owns one ENI per subnet it is
+    provisioned in; ownership comes straight from ``NetworkInterfaceIds[]``. A **Gateway**
+    endpoint (S3/DynamoDB) owns no ENI — it is a route-table target — so it simply contributes
+    no attribution. Renders to a ``vpc_endpoint`` graph node.
+    """
+
+    id: str
+    vpc_id: str | None
+    endpoint_type: str | None
+    service_name: str | None
+    state: str | None
+    name: str | None
+    eni_ids: list[str] = field(default_factory=list)
+
+    @classmethod
+    def from_collected(cls, d: dict[str, Any]) -> VpcEndpoint:
+        return cls(
+            id=d.get("VpcEndpointId"),
+            vpc_id=d.get("VpcId"),
+            endpoint_type=d.get("VpcEndpointType"),
+            service_name=d.get("ServiceName"),
+            state=d.get("State"),
+            name=_name_tag(d.get("Tags")),
+            eni_ids=[e for e in d.get("NetworkInterfaceIds", []) if e],
+        )
 
 
 @dataclass

@@ -1,0 +1,20 @@
+{
+  "NatGateways": [
+    {
+      "NatGatewayId": "nat-0abc00000000005",
+      "VpcId": "vpc-0aaaaaaaaaaaaaaaa",
+      "SubnetId": "subnet-022222222222222",
+      "State": "available",
+      "ConnectivityType": "public",
+      "NatGatewayAddresses": [
+        {
+          "NetworkInterfaceId": "eni-00natgw000000004",
+          "PrivateIp": "10.0.2.40",
+          "PublicIp": "34.201.10.20",
+          "AllocationId": "eipalloc-0abc00000000001"
+        }
+      ],
+      "Tags": [{"Key": "Name", "Value": "prod-natgw"}]
+    }
+  ]
+}

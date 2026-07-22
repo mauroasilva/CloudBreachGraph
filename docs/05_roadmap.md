@@ -66,7 +66,7 @@ from `log_archive`, in one run.
 - `dns` — Route 53 / Resolver, often centralized in a networking account.
 - `cloudtrail` — organization trail in a management/audit account.
 
-**Shipped since v1** (both part of the `network` role, not separate roles — the resources live in
+**Shipped since v1** (all part of the `network` role, not separate roles — the resources live in
 the same account as the ENIs they govern):
 - **Security groups** — `collect_security_groups` feeds the ENI *reachability* mapping (source
   `internet`/`cidr`/`security_group` nodes + `*_can_reach` edges, `02_architecture.md §5.5`). See
@@ -76,6 +76,20 @@ the same account as the ENIs they govern):
   `can_reach` when undetermined), so the map distinguishes an ENI merely *allowed* by a `0.0.0.0/0`
   rule from one *actually routable* (`02_architecture.md §5.6`). See
   `learnings_2026-07-22_routable-reachability.md`.
+- **NAT gateways & VPC endpoints (ENI owners)** — `collect_nat_gateways` / `collect_vpc_endpoints`
+  give previously-ownerless service ENIs a real owner node (`nat_gateway` / `vpc_endpoint`),
+  attributed from each resource's authoritative ENI list (`NatGatewayAddresses[].NetworkInterfaceId`
+  / `NetworkInterfaceIds[]`), not description parsing (`02_architecture.md §5.4`). They share the
+  load balancer's role class / layout ring. See `learnings_2026-07-22_eni-ownership-nat-gateways.md`.
+
+### Remaining ENI owners (follow-up)
+Some service-managed ENIs still resolve to no owner because they lack a clean authoritative
+`describe-*` ENI list and are only identifiable by `Description`/`RequesterId`: **RDS** /
+**ElastiCache** databases, **Lambda** VPC ENIs, **EFS** mount targets, **Transit Gateway**
+attachments. Each follows the §5.4 recipe once a reliable ENI-ownership signal is found (a
+`describe-*` that lists the ENIs, or a stable description pattern) — add a collector + registry
+entry + attribution branch, mapping to a new owner node type. Prefer authoritative ENI-id lists
+over description parsing wherever the API offers one.
 
 Deeper routing (NACLs, TGW/VPN route propagation, cross-VPC peering path validation) remains future
 work — the current model is a documented approximation, not a full route simulator.

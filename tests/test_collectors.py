@@ -21,6 +21,8 @@ _COMMAND_FIXTURES = {
     ("ec2", "describe-vpcs"): "ec2_describe-vpcs.json",
     ("ec2", "describe-security-groups"): "ec2_describe-security-groups.json",
     ("ec2", "describe-route-tables"): "ec2_describe-route-tables.json",
+    ("ec2", "describe-nat-gateways"): "ec2_describe-nat-gateways.json",
+    ("ec2", "describe-vpc-endpoints"): "ec2_describe-vpc-endpoints.json",
 }
 
 
@@ -45,6 +47,7 @@ def test_collect_network_interfaces_normalizes(fake_aws):
         "eni-00alb00000000002",
         "eni-00nlb00000000003",
         "eni-00natgw000000004",
+        "eni-00vpce00000000006",
     ]
 
     instance_eni = enis[0]
@@ -148,6 +151,30 @@ def test_collect_route_tables_normalizes(fake_aws):
     assert priv_default["Target"] == "nat-0abc00000000005"
 
 
+def test_collect_nat_gateways_normalizes(fake_aws):
+    nats = collectors.collect_nat_gateways("prod-audit", "us-east-1")
+    assert len(nats) == 1
+    nat = nats[0]
+    assert nat["NatGatewayId"] == "nat-0abc00000000005"
+    assert nat["VpcId"] == "vpc-0aaaaaaaaaaaaaaaa"
+    assert nat["SubnetId"] == "subnet-022222222222222"
+    # The address block carries the authoritative ENI id (the ownership signal) + the public IP.
+    addr = nat["NatGatewayAddresses"][0]
+    assert addr["NetworkInterfaceId"] == "eni-00natgw000000004"
+    assert addr["PublicIp"] == "34.201.10.20"
+
+
+def test_collect_vpc_endpoints_normalizes(fake_aws):
+    endpoints = collectors.collect_vpc_endpoints("prod-audit", "us-east-1")
+    assert len(endpoints) == 1
+    vpce = endpoints[0]
+    assert vpce["VpcEndpointId"] == "vpce-0abc00000000006"
+    assert vpce["VpcEndpointType"] == "Interface"
+    # The interface endpoint's ENIs are its authoritative ownership signal.
+    assert vpce["NetworkInterfaceIds"] == ["eni-00vpce00000000006"]
+    assert vpce["ServiceName"].endswith("secretsmanager")
+
+
 def test_role_registry_is_consistent():
     # Each role's collectors and result keys line up 1:1.
     for role, funcs in collectors.ROLE_COLLECTORS.items():
@@ -161,6 +188,8 @@ def test_role_registry_is_consistent():
         "vpcs",
         "security_groups",
         "route_tables",
+        "nat_gateways",
+        "vpc_endpoints",
     ]
 
 
@@ -185,13 +214,15 @@ def test_collect_all_bundle_shape_and_provenance(fake_aws):
         "vpcs",
         "security_groups",
         "route_tables",
+        "nat_gateways",
+        "vpc_endpoints",
     }
     assert bundle["meta"] == {
         "target": "prod",
         "region": "us-east-1",
         "accounts": {"network": "111111111111"},
     }
-    assert len(bundle["network_interfaces"]) == 4
+    assert len(bundle["network_interfaces"]) == 5
     assert len(bundle["ec2_instances"]) == 2
 
     # Every network collector ran with the network role's resolved profile/region.

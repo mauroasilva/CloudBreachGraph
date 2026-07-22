@@ -172,6 +172,49 @@ def _normalize_route_table(raw: dict) -> dict:
     }
 
 
+def _normalize_nat_gateway(raw: dict) -> dict:
+    """Keep a NAT gateway's identity, placement, and the ENIs it owns.
+
+    ``NatGatewayAddresses[].NetworkInterfaceId`` is the authoritative ENI-ownership signal the
+    builder attributes on (``docs/02_architecture.md §5.4``); ``PublicIp`` is surfaced so the
+    map shows the gateway's internet-facing address."""
+    addresses = raw.get("NatGatewayAddresses", [])
+    return {
+        "NatGatewayId": raw.get("NatGatewayId"),
+        "VpcId": raw.get("VpcId"),
+        "SubnetId": raw.get("SubnetId"),
+        "State": raw.get("State"),
+        "ConnectivityType": raw.get("ConnectivityType"),
+        "NatGatewayAddresses": [
+            {
+                "NetworkInterfaceId": a.get("NetworkInterfaceId"),
+                "PublicIp": a.get("PublicIp"),
+                "PrivateIp": a.get("PrivateIp"),
+            }
+            for a in addresses
+        ],
+        "Tags": raw.get("Tags", []),
+    }
+
+
+def _normalize_vpc_endpoint(raw: dict) -> dict:
+    """Keep a VPC endpoint's identity, type, service, and the ENIs it owns.
+
+    ``NetworkInterfaceIds[]`` lists the ENIs an **Interface**/**GatewayLoadBalancer** endpoint
+    owns (empty for a **Gateway** endpoint, which owns no ENI) — the builder attributes ENIs on
+    it (``docs/02_architecture.md §5.4``)."""
+    return {
+        "VpcEndpointId": raw.get("VpcEndpointId"),
+        "VpcEndpointType": raw.get("VpcEndpointType"),
+        "VpcId": raw.get("VpcId"),
+        "ServiceName": raw.get("ServiceName"),
+        "State": raw.get("State"),
+        "NetworkInterfaceIds": list(raw.get("NetworkInterfaceIds", [])),
+        "SubnetIds": list(raw.get("SubnetIds", [])),
+        "Tags": raw.get("Tags", []),
+    }
+
+
 def _normalize_security_group(raw: dict) -> dict:
     """Keep a security group's identity and its **ingress** rules (``IpPermissions``).
 
@@ -243,6 +286,26 @@ def collect_security_groups(profile: str | None, region: str | None) -> list[dic
     return [_normalize_security_group(x) for x in data.get("SecurityGroups", [])]
 
 
+def collect_nat_gateways(profile: str | None, region: str | None) -> list[dict]:
+    """``aws ec2 describe-nat-gateways`` -> normalized ``.NatGateways[]``.
+
+    Supplies the ENI -> NAT-gateway ownership the builder uses to attribute otherwise-ownerless
+    NAT-gateway ENIs (``docs/02_architecture.md §5.4``). Accounts with no NAT gateways return an
+    empty list — handled gracefully via the ``.get`` default."""
+    data = runner.run_aws(["ec2", "describe-nat-gateways"], profile=profile, region=region)
+    return [_normalize_nat_gateway(x) for x in data.get("NatGateways", [])]
+
+
+def collect_vpc_endpoints(profile: str | None, region: str | None) -> list[dict]:
+    """``aws ec2 describe-vpc-endpoints`` -> normalized ``.VpcEndpoints[]``.
+
+    Supplies the ENI -> VPC-endpoint ownership the builder uses to attribute interface-endpoint
+    ENIs (``docs/02_architecture.md §5.4``). Accounts with no endpoints return an empty list —
+    handled gracefully via the ``.get`` default."""
+    data = runner.run_aws(["ec2", "describe-vpc-endpoints"], profile=profile, region=region)
+    return [_normalize_vpc_endpoint(x) for x in data.get("VpcEndpoints", [])]
+
+
 def collect_route_tables(profile: str | None, region: str | None) -> list[dict]:
     """``aws ec2 describe-route-tables`` -> normalized ``.RouteTables[]``.
 
@@ -266,6 +329,8 @@ ROLE_COLLECTORS: dict[str, list[Collector]] = {
         collect_vpcs,
         collect_security_groups,
         collect_route_tables,
+        collect_nat_gateways,
+        collect_vpc_endpoints,
     ],
     # ── future (see docs/05_roadmap.md); do NOT implement in v1 ──────────────
     # "flow_logs": [
@@ -286,6 +351,8 @@ ROLE_RESULT_KEYS: dict[str, list[str]] = {
         "vpcs",
         "security_groups",
         "route_tables",
+        "nat_gateways",
+        "vpc_endpoints",
     ],
     # "flow_logs": ["flow_logs", "log_destinations"],  # future
 }
@@ -314,7 +381,8 @@ def collect_all(
                    "accounts": {role: account_id | None, ...}},
           "network_interfaces": [...], "ec2_instances": [...],
           "load_balancers_v2": [...], "load_balancers_classic": [...],
-          "subnets": [...], "vpcs": [...],
+          "subnets": [...], "vpcs": [...], "security_groups": [...],
+          "route_tables": [...], "nat_gateways": [...], "vpc_endpoints": [...],
         }
     """
     roles = tuple(roles)

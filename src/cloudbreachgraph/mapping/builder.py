@@ -4,8 +4,9 @@ The traversal follows the order requested in ``docs/01_overview.md`` and the rul
 ``docs/02_architecture.md §5``:
 
 1. Enumerate every **ENI** (the anchor nodes).
-2. Attribute each ENI to its **EC2 instance** *or* **load balancer** (never both), using the
-   priority order in §5.4 and recording which rule fired in the edge's ``match_rule``.
+2. Attribute each ENI to its **owner** — an **EC2 instance**, **NAT gateway**, **VPC endpoint**
+   or **load balancer** (never more than one), using the priority order in §5.4 and recording
+   which rule fired in the edge's ``match_rule``.
 3. Map each ENI to its **subnet** (``in_subnet``).
 4. Connect each subnet to its **VPC** (``in_vpc``).
 5. Read each ENI's **security-group inbound rules** and map who can reach it (§5.5). With SGs
@@ -28,10 +29,12 @@ from ..model.resources import (
     Ec2Instance,
     Elbv2LoadBalancer,
     Eni,
+    NatGateway,
     RouteTable,
     SecurityGroup,
     Subnet,
     Vpc,
+    VpcEndpoint,
 )
 from .routing import RouteResolver
 
@@ -130,6 +133,35 @@ def _lb_node(lb: _LoadBalancerLike) -> Node:
     )
 
 
+def _nat_gateway_node(nat: NatGateway) -> Node:
+    return Node(
+        id=nat.id,
+        type="nat_gateway",
+        label=nat.name or nat.id,
+        attributes={
+            "state": nat.state,
+            "connectivity": nat.connectivity,
+            "vpc_id": nat.vpc_id,
+            "subnet_id": nat.subnet_id,
+            "public_ips": nat.public_ips,
+        },
+    )
+
+
+def _vpc_endpoint_node(vpce: VpcEndpoint) -> Node:
+    return Node(
+        id=vpce.id,
+        type="vpc_endpoint",
+        label=vpce.name or vpce.id,
+        attributes={
+            "endpoint_type": vpce.endpoint_type,
+            "service_name": vpce.service_name,
+            "state": vpce.state,
+            "vpc_id": vpce.vpc_id,
+        },
+    )
+
+
 def _subnet_node(subnet: Subnet) -> Node:
     return Node(
         id=subnet.id,
@@ -205,13 +237,33 @@ def build_graph(
     route_tables = [RouteTable.from_collected(x) for x in collected.get("route_tables", [])]
     route_resolver = RouteResolver(route_tables, subnets, vpcs)
 
+    # ENI -> its owning resource (NAT gateway / VPC endpoint), keyed by the authoritative ENI-id
+    # list each resource publishes — no Description parsing (§5.4). One node object per owner is
+    # built once and shared across every ENI it owns. `setdefault` keeps the first owner if two
+    # ever claimed the same ENI (they don't in practice), so an ENI still attaches at most once.
+    nat_gateways = [NatGateway.from_collected(x) for x in collected.get("nat_gateways", [])]
+    vpc_endpoints = [VpcEndpoint.from_collected(x) for x in collected.get("vpc_endpoints", [])]
+    eni_owner: dict[str, tuple[Node, str]] = {}
+    for nat in nat_gateways:
+        if not nat.id:
+            continue
+        node = _nat_gateway_node(nat)
+        for eni_id in nat.eni_ids:
+            eni_owner.setdefault(eni_id, (node, "nat_gateway_address"))
+    for vpce in vpc_endpoints:
+        if not vpce.id:
+            continue
+        node = _vpc_endpoint_node(vpce)
+        for eni_id in vpce.eni_ids:
+            eni_owner.setdefault(eni_id, (node, "vpc_endpoint_interface"))
+
     # 1. Anchor: every ENI is a node.
     for eni in enis:
         graph.add_node(_eni_node(eni))
 
-    # 2. Attribution: each ENI -> at most one instance or load balancer.
+    # 2. Attribution: each ENI -> at most one owner (instance, NAT gateway, VPC endpoint, or LB).
     for eni in enis:
-        _attribute_eni(graph, eni, instances, elbv2_by_token, classic_by_name)
+        _attribute_eni(graph, eni, instances, eni_owner, elbv2_by_token, classic_by_name)
 
     # 3. ENI -> subnet (always). Remember which VPC each subnet lives in for step 4.
     subnet_vpc_hint: dict[str, str | None] = {}
@@ -263,6 +315,15 @@ def build_graph(
         for lb in (*elbv2, *classic):
             if lb.node_id:
                 graph.add_node(_lb_node(lb))
+        # NAT gateways / VPC endpoints that own an ENI are already in the graph (re-adding merges
+        # idempotently); this surfaces any that don't — chiefly Gateway endpoints (S3/DynamoDB),
+        # which own no ENI and are otherwise invisible.
+        for nat in nat_gateways:
+            if nat.id:
+                graph.add_node(_nat_gateway_node(nat))
+        for vpce in vpc_endpoints:
+            if vpce.id:
+                graph.add_node(_vpc_endpoint_node(vpce))
 
     return graph
 
@@ -271,11 +332,12 @@ def _attribute_eni(
     graph: Graph,
     eni: Eni,
     instances: dict[str, Ec2Instance],
+    eni_owner: dict[str, tuple[Node, str]],
     elbv2_by_token: dict[str, Elbv2LoadBalancer],
     classic_by_name: dict[str, ClassicLoadBalancer],
 ) -> None:
     """Resolve at most one ``attached_to`` edge for an ENI (``docs/02_architecture.md §5``)."""
-    # 5.3 — instance attachment wins outright; when present, never attribute to an LB.
+    # 5.3 — instance attachment wins outright; when present, never attribute to any other owner.
     instance_id = eni.attachment_instance_id
     if instance_id:
         inst = instances.get(instance_id)
@@ -293,7 +355,17 @@ def _attribute_eni(
         graph.add_edge(Edge(source=eni.id, target=instance_id, relationship="attached_to"))
         return
 
-    # 5.4 — service-managed ENI: try to resolve a load balancer, in priority order.
+    # 5.4 — service-managed ENI. First check the authoritative owner map (NAT gateway / VPC
+    # endpoint), which keys on the ENI id the resource itself publishes — the strongest signal
+    # after an instance attachment, and what gives previously-ownerless ENIs an owner.
+    owner = eni_owner.get(eni.id)
+    if owner is not None:
+        node, match_rule = owner
+        graph.add_node(node)
+        graph.add_edge(Edge(eni.id, node.id, "attached_to", {"match_rule": match_rule}))
+        return
+
+    # 5.4 (cont.) — otherwise fall back to load-balancer resolution, in priority order.
     token, classic_name = _parse_elb_description(eni.description)
 
     # 5.4.1 — ELBv2 (ALB/NLB/GWLB) via Description prefix matched to an ARN suffix.
@@ -331,8 +403,9 @@ def _attribute_eni(
         graph.add_edge(Edge(eni.id, key, "attached_to", {"match_rule": "interface_type_fallback"}))
         return
 
-    # Otherwise: no compute/LB attachment (NAT gateway, VPC endpoint, RDS, Lambda, ...).
-    # The ENI node is already tagged with its InterfaceType — do not invent an attachment.
+    # Otherwise: no resolvable owner (e.g. RDS, Lambda, ElastiCache — ENI owners without an
+    # authoritative describe-* ENI list yet). The ENI node is already tagged with its
+    # InterfaceType — do not invent an attachment.
 
 
 def _sg_node(sg_id: str, security_groups: dict[str, SecurityGroup]) -> Node:

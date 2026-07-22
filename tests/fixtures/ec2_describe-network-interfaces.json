@@ -91,6 +91,25 @@
         {"PrivateIpAddress": "10.0.2.40", "Primary": true}
       ],
       "Groups": []
+    },
+    {
+      "NetworkInterfaceId": "eni-00vpce00000000006",
+      "SubnetId": "subnet-022222222222222",
+      "VpcId": "vpc-0aaaaaaaaaaaaaaaa",
+      "AvailabilityZone": "us-east-1b",
+      "InterfaceType": "vpc_endpoint",
+      "Description": "VPC Endpoint Interface vpce-0abc00000000006",
+      "Status": "in-use",
+      "RequesterId": "amazon-aws",
+      "RequesterManaged": true,
+      "Attachment": {
+        "InstanceOwnerId": "amazon-aws",
+        "Status": "attached"
+      },
+      "PrivateIpAddresses": [
+        {"PrivateIpAddress": "10.0.2.50", "Primary": true}
+      ],
+      "Groups": []
     }
   ]
 }

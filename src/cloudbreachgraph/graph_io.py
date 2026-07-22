@@ -97,6 +97,8 @@ _NAMED_RE = re.compile(r"^(.+) \[(.+)\]$")
 _BARE_ATTR: dict[str, str] = {
     "eni": "interface_type",
     "load_balancer": "lb_type",
+    "nat_gateway": "state",
+    "vpc_endpoint": "service_name",
     "subnet": "cidr",
     "vpc": "cidr",
     "ec2_instance": "state",
