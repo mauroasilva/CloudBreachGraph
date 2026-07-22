@@ -273,6 +273,7 @@ cloudbreachgraph-to-html capture.data --format json     # force the input format
 cloudbreachgraph-to-html out/graph.json --ringed        # concentric-ringed layout
 cloudbreachgraph-to-html out/graph.json --optimize-passes 10000  # overlap-free layout
 cloudbreachgraph-to-html out/graph.json --no-security-groups  # collapse the SG layer
+cloudbreachgraph-to-html out/graph.json --split-by-vpc -o out/  # one HTML per VPC
 ```
 
 `--no-security-groups` collapses the security-group layer of the loaded graph, bringing the source
@@ -295,6 +296,24 @@ cloudbreachgraph-to-html docs/examples/example-graph.json --ringed -o example.ht
   per-type detail (interface/LB type, CIDR, instance state), and every edge are recovered.
 - The same size guard applies: if the graph is too large for a browser force layout, it warns
   and writes a `.dot` fallback instead (skipping it if the input already is that `.dot`).
+
+#### Splitting per VPC (`--split-by-vpc`)
+
+Large multi-VPC accounts are easier to read one VPC at a time. Pass `--split-by-vpc` to write
+**one HTML per VPC** — `graph-<VPC ID>.html` — instead of a single combined page:
+
+```bash
+cloudbreachgraph-to-html out/graph.json --split-by-vpc -o out/
+# → out/graph-vpc-0a31....html, out/graph-vpc-6a60....html, one per VPC
+```
+
+Each file is a stand-alone view of just that VPC: the nodes that resolve to it (its subnets,
+ENIs, EC2/LB, security groups and reachability sources — traced through the same edges the
+ringed layout clusters by) plus the edges wholly within it. Resources that trace to no VPC, and
+edges spanning two VPCs, are omitted. Files land in the `-o` **directory** (default: the input
+file's directory). The other layout flags compose with it — `--ringed`, `--optimize-passes`
+and `--no-security-groups` all apply to **every** per-VPC file — and each file is subject to the
+same size guard and per-file `.dot` fallback (`graph-<VPC ID>.dot`).
 
 ### Ringed layout (`--ringed`)
 
