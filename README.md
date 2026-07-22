@@ -263,12 +263,15 @@ disks overlapping** and **no edge drawn across a node** it isn't connected to (a
 — the natural counterpart of a node overlap). Positions are computed deterministically in Python
 (no in-browser relaxation); you keep drag, zoom and pan.
 
-Each pass runs one of three phases: a force-directed **unfolding** that spreads the nodes into a
-roomy arrangement, a hard geometric **projection** that separates overlapping disks and pushes
-any node off an edge that crosses it (until both overlap counts are exactly zero), and a
-best-effort **crossing reduction** that relocates each crossing-heavy node to the nearby slot
-with the fewest incident crossings — followed by a final projection so the overlap guarantee
-still holds. A real capture is **non-planar** (a single VPC can contain a non-planar minor), so a
+Each **connected component** (an independent cluster — e.g. one VPC and everything under it) is
+laid out on its own and the components are then **packed into a non-overlapping grid** with a
+clear gap between them, so it stays obvious which nodes belong together and which clusters are
+disconnected. Within a component, each pass runs one of three phases: a force-directed
+**unfolding** that spreads the nodes into a roomy arrangement, a hard geometric **projection**
+that separates overlapping disks and pushes any node off an edge that crosses it (until both
+overlap counts are exactly zero), and a best-effort **crossing reduction** that relocates each
+crossing-heavy node to the nearby slot with the fewest incident crossings — followed by a final
+projection so the overlap guarantee still holds. A real capture is **non-planar** (a single VPC can contain a non-planar minor), so a
 drawing with zero edge *crossings* cannot exist; crossings are therefore a *secondary* goal
 (minimised, not zeroed) behind the primary no-overlap guarantee. A larger `N` only raises the
 ceiling on passes; the layout stops early once it converges, so the result is stable.

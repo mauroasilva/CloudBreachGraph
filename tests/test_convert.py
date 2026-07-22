@@ -647,6 +647,40 @@ def test_optimized_layout_reaches_zero_on_example_graph():
     assert html_export._count_overlaps(data["nodes"], data["edges"]) == (0, 0)
 
 
+def test_connected_components_splits_disjoint_graphs():
+    nodes = [{"id": x, "type": "eni"} for x in ("a", "b", "c", "d")]
+    edges = [{"source": "a", "target": "b"}, {"source": "c", "target": "d"}]
+    comps = html_export._connected_components(nodes, edges)
+    got = sorted(sorted(n["id"] for n in cn) for cn, _ in comps)
+    assert got == [["a", "b"], ["c", "d"]]
+
+
+def test_optimized_layout_keeps_components_apart():
+    # The example graph's independent VPCs must not overlap: each connected component's bounding
+    # box stays clear of every other's, so the reader can tell which clusters are separate.
+    graph = load_graph(_EXAMPLE_GRAPH)
+    data = html_export._view_data(graph)
+    html_export._optimize_layout(data["nodes"], data["edges"], 10000)
+    comps = html_export._connected_components(data["nodes"], data["edges"])
+    assert len(comps) > 1  # the example really is disconnected
+
+    def bbox(comp_nodes):
+        r = html_export._node_radius
+        return (
+            min(n["x"] - r(n) for n in comp_nodes),
+            min(n["y"] - r(n) for n in comp_nodes),
+            max(n["x"] + r(n) for n in comp_nodes),
+            max(n["y"] + r(n) for n in comp_nodes),
+        )
+
+    boxes = [bbox(cn) for cn, _ in comps]
+    for i in range(len(boxes)):
+        for j in range(i + 1, len(boxes)):
+            a, b = boxes[i], boxes[j]
+            disjoint = a[2] < b[0] or b[2] < a[0] or a[3] < b[1] or b[3] < a[1]
+            assert disjoint, f"components {i} and {j} overlap"
+
+
 def test_optimized_build_is_deterministic(graph):
     assert html_export.build_optimized_html(graph, 500) == html_export.build_optimized_html(
         graph, 500

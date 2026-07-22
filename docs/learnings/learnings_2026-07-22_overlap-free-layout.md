@@ -15,6 +15,9 @@
   - `_seg_seg_cross(...)` / `_count_crossings(nodes, edges)` — segment-crossing predicate + counter.
   - `_reduce_crossings_free(...)` — the phase-3 greedy crossing-reduction local search + capped
     final projection (see §3).
+  - `_connected_components(...)` / `_pack_components(...)` — split the graph into components and
+    tile them into a non-overlapping grid; `_optimize_layout` is now a wrapper that lays out each
+    component via `_layout_component` (the old single-graph body) then packs them.
   - `_optimized_view_data`, `build_optimized_html`, `write_optimized_html` — payload/page/writer,
     mirroring the ringed trio's signatures and size-guard contract.
   - Refactor: the ringed page template `_RINGED_TEMPLATE` became a **shared** draw-only template
@@ -74,6 +77,15 @@
   - If relocation ever lands in a genuinely tight spot the capped projection can't clear, revert
     to the phase-2 positions (saved as `safe_xs/safe_ys`) so the **overlap guarantee always
     holds** even at the cost of keeping more crossings.
+- **Per-component layout + packing** (follow-up: without it the force phase's gravity pulled all
+  four VPCs toward one center and they mingled — impossible to tell components apart). Each
+  connected component is laid out in isolation and then tiled into a grid with `_OPT_CLUSTER_GAP`
+  between cells. Bonus: it's *faster* (per-component O(n_i²) beats global O(n²)) — the example
+  dropped to ~0.7s. **Gotcha this exposed:** in isolation the big component's **phase-2** (overlap)
+  projection oscillated in the `_OPT_MARGIN` band and, lacking the strict-overlap early-stop that
+  phase 3 already had, burned the whole 10000-pass budget (20s, and it never reached phase 3 so
+  crossings stayed high). Fix: phase 2 now also breaks as soon as `_has_overlap` is strictly
+  clean, not just on `moved == False`.
 
 ## 4. Deviations from the plan
 - None structurally. `docs/05_roadmap.md` roles untouched (no new resource type). This is a

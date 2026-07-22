@@ -247,7 +247,10 @@ Requirements:
   `build_optimized_html`, sharing the draw-only template via `_render_static_layout`): it runs up
   to N deterministic *optimisation passes* — a cooled force-directed unfolding
   (`_OPT_FORCE_PASSES` cap) followed by hard geometric projection sweeps (`_optimize_layout`) —
-  and stops the moment the drawing has **zero node-node overlaps** and **zero edge-over-node
+  laying out each **connected component** independently (`_connected_components`) and packing them
+  into a non-overlapping grid (`_pack_components`, mirroring the ringed cluster tiling) so
+  independent clusters stay visually separated, and stops the moment each component's drawing has
+  **zero node-node overlaps** and **zero edge-over-node
   overlaps** (a non-incident node's disk intersecting an edge segment). Real topologies are
   non-planar (the example graph's largest VPC alone contains a non-planar minor), so zero edge
   *crossings* is impossible; this layout targets the two overlaps that hurt legibility instead. A
