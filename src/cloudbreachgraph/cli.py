@@ -93,6 +93,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="also emit collected resources that no ENI references (subnets, VPCs, EC2, LBs)",
     )
+    col.add_argument(
+        "--security-groups",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="show security groups as nodes between each ENI and its reachability sources "
+        "(default: on). --no-security-groups hides them and connects the source IPs directly "
+        "to the ENIs, with the routable/not-routable split",
+    )
 
     # Output.
     out = p.add_argument_group("output")
@@ -195,7 +203,11 @@ def _collect_live(resolved: ResolvedTarget, args: argparse.Namespace) -> dict:
 # Writing
 # --------------------------------------------------------------------------- #
 def _write_outputs(collected: dict, out_dir: Path, stem: str, args: argparse.Namespace) -> None:
-    graph = build_graph(collected, include_orphans=args.include_orphans)
+    graph = build_graph(
+        collected,
+        include_orphans=args.include_orphans,
+        show_security_groups=args.security_groups,
+    )
     json_path = json_export.write_json(graph, out_dir / f"{stem}.json")
     dot_path = dot_export.write_dot(graph, out_dir / f"{stem}.dot")
     print(f"wrote {json_path}")

@@ -63,6 +63,7 @@ def _eni(
     instance_id=None,
     groups=None,
     public_ip=None,
+    private_ip=None,
 ):
     return {
         "NetworkInterfaceId": eni_id,
@@ -82,7 +83,7 @@ def _eni(
             "Status": None,
         },
         "Association": {"PublicIp": public_ip},
-        "PrivateIpAddresses": [],
+        "PrivateIpAddresses": [{"PrivateIpAddress": private_ip}] if private_ip else [],
         "Groups": [{"GroupId": g} for g in (groups or [])],
     }
 
@@ -355,115 +356,208 @@ def test_missing_subnet_with_no_vpc_hint_gets_placeholder_vpc():
 
 
 # --------------------------------------------------------------------------- #
-# §5.5 — reachability from security-group inbound rules
+# §5.5 — reachability, security groups SHOWN (the default)
 # --------------------------------------------------------------------------- #
+def _collapsed(bundle, **kw):
+    """build_graph with security groups hidden (the --no-security-groups view)."""
+    return build_graph(bundle, show_security_groups=False, **kw)
+
+
 def _reach_edges(graph, eni_id):
     # Matches every reachability relationship (can_reach / routable_ / not_routable_can_reach).
     return [e for e in graph.edges if e.target == eni_id and e.relationship.endswith("can_reach")]
 
 
-def test_full_internet_exposure_creates_per_eni_internet_node():
+def _secured_by(graph, eni_id):
+    return [e.target for e in graph.edges if e.source == eni_id and e.relationship == "secured_by"]
+
+
+def test_shown_eni_links_to_its_security_group():
     bundle = _bundle(
         network_interfaces=[_eni("eni-web", groups=["sg-web"])],
         security_groups=[_sg("sg-web", name="web", ingress=[("tcp", 443, 443, ["0.0.0.0/0"])])],
     )
+    graph = build_graph(bundle)  # default: SGs shown
+    sg = graph.get_node("sg-web")
+    assert sg is not None and sg.type == "security_group" and sg.label == "web"
+    assert _secured_by(graph, "eni-web") == ["sg-web"]
+
+
+def test_shown_sources_connect_to_the_sg_not_the_eni():
+    bundle = _bundle(
+        network_interfaces=[_eni("eni-web", groups=["sg-web"])],
+        security_groups=[
+            _sg(
+                "sg-web",
+                ingress=[("tcp", 443, 443, ["0.0.0.0/0"]), ("tcp", 22, 22, ["203.0.113.0/24"])],
+            )
+        ],
+    )
     graph = build_graph(bundle)
-    node = graph.get_node("internet:eni-web")
-    assert node is not None
-    assert node.type == "internet"
-    assert node.label == "Internet"
-    edges = _reach_edges(graph, "eni-web")
-    assert len(edges) == 1
-    assert edges[0].source == "internet:eni-web"
-    assert edges[0].attributes["ports"] == "tcp/443"
+    # A per-SG Internet node and a shared CIDR node, both pointing at the SG (not the ENI).
+    inet = graph.get_node("internet:sg-web")
+    assert inet is not None and inet.type == "internet"
+    edge = next(e for e in graph.edges if e.source == "internet:sg-web")
+    assert edge.target == "sg-web" and edge.relationship == "can_reach"
+    assert edge.attributes["ports"] == "tcp/443"
+    assert next(e for e in graph.edges if e.source == "cidr:203.0.113.0/24").target == "sg-web"
+    # No direct source -> ENI edges in the shown view.
+    assert _reach_edges(graph, "eni-web") == []
 
 
-def test_internet_nodes_are_not_shared_between_enis():
-    # Two ENIs both open to 0.0.0.0/0 get their OWN Internet node (per the change request, to
-    # avoid a single high-fan-in node and the crossings it causes).
+def test_shown_internet_nodes_are_per_sg_not_shared():
+    # Two ENIs sharing an SG share ONE per-SG Internet node (the SG collapses the fan-out).
     bundle = _bundle(
         network_interfaces=[_eni("eni-a", groups=["sg-x"]), _eni("eni-b", groups=["sg-x"])],
         security_groups=[_sg("sg-x", ingress=[("tcp", 80, 80, ["0.0.0.0/0"])])],
     )
     graph = build_graph(bundle)
-    assert graph.get_node("internet:eni-a") is not None
-    assert graph.get_node("internet:eni-b") is not None
-    assert graph.get_node("internet") is None  # no shared node
-    assert not [e for e in graph.edges if e.relationship == "can_reach" and e.source == "internet"]
+    assert graph.get_node("internet:sg-x") is not None
+    assert graph.get_node("internet") is None  # no single shared Internet node
+    assert {e.source for e in graph.edges if e.relationship == "secured_by"} == {"eni-a", "eni-b"}
 
 
-def test_ipv6_full_range_also_maps_to_internet():
+def test_shown_peer_reference_is_an_sg_to_sg_edge():
     bundle = _bundle(
-        network_interfaces=[_eni("eni-6", groups=["sg-6"])],
-        security_groups=[_sg("sg-6", ingress=[("tcp", 443, 443, [], ["::/0"])])],
-    )
-    graph = build_graph(bundle)
-    assert graph.get_node("internet:eni-6") is not None
-
-
-def test_specific_cidr_creates_shared_cidr_node():
-    # A specific source CIDR that reaches two ENIs is a single shared node with a spoke to each.
-    bundle = _bundle(
-        network_interfaces=[_eni("eni-a", groups=["sg-a"]), _eni("eni-b", groups=["sg-a"])],
-        security_groups=[_sg("sg-a", ingress=[("tcp", 22, 22, ["203.0.113.0/24"])])],
-    )
-    graph = build_graph(bundle)
-    node = graph.get_node("cidr:203.0.113.0/24")
-    assert node is not None and node.type == "cidr"
-    assert node.attributes["cidr"] == "203.0.113.0/24"
-    targets = {e.target for e in graph.edges if e.source == "cidr:203.0.113.0/24"}
-    assert targets == {"eni-a", "eni-b"}
-
-
-def test_referencing_security_group_becomes_source_node():
-    bundle = _bundle(
-        network_interfaces=[_eni("eni-app", groups=["sg-app"])],
+        network_interfaces=[_eni("eni-app", groups=["sg-app"]), _eni("eni-lb", groups=["sg-lb"])],
         security_groups=[
             _sg("sg-app", ingress=[("-1", None, None, [], [], ["sg-lb"])]),
             _sg("sg-lb", name="alb-sg"),
         ],
     )
     graph = build_graph(bundle)
-    node = graph.get_node("sg-source:sg-lb")
-    assert node is not None and node.type == "security_group"
-    assert node.label == "alb-sg"  # labelled with the peer SG's name
-    assert node.attributes["group_id"] == "sg-lb"
-    edge = _reach_edges(graph, "eni-app")[0]
-    assert edge.source == "sg-source:sg-lb"
-    assert edge.attributes["ports"] == "all"  # -1 protocol => all traffic
+    # sg-lb is both a member SG (of eni-lb) and a *source* of sg-app -> one SG node, SG->SG edge.
+    peer = graph.get_node("sg-lb")
+    assert peer is not None and peer.label == "alb-sg"
+    assert any(
+        e.source == "sg-lb" and e.target == "sg-app" and e.relationship == "can_reach"
+        for e in graph.edges
+    )
 
 
-def test_multiple_ports_from_same_source_aggregate_onto_one_edge():
+def test_shown_view_has_no_routability_split():
+    # Routability is per-ENI, so an SG-level edge is plain can_reach even with route data present.
     bundle = _bundle(
-        network_interfaces=[_eni("eni-m", groups=["sg-m"])],
-        security_groups=[
-            _sg(
-                "sg-m",
-                ingress=[
-                    ("tcp", 443, 443, ["0.0.0.0/0"]),
-                    ("tcp", 80, 80, ["0.0.0.0/0"]),
-                ],
-            )
+        network_interfaces=[
+            _eni("eni-1", subnet_id="subnet-1", groups=["sg-1"], public_ip="52.1.2.3")
         ],
+        subnets=[_subnet("subnet-1")],
+        vpcs=[_vpc_dict()],
+        security_groups=[_sg("sg-1", ingress=[("tcp", 443, 443, ["0.0.0.0/0"])])],
+        route_tables=[_rt("rtb-1", subnet_ids=["subnet-1"], routes=[("0.0.0.0/0", "igw-1")])],
     )
     graph = build_graph(bundle)
-    edges = _reach_edges(graph, "eni-m")
-    assert len(edges) == 1  # one deduped edge, both ports aggregated (sorted)
-    assert edges[0].attributes["ports"] == "tcp/443, tcp/80"
+    rels = {e.relationship for e in graph.edges if e.relationship.endswith("can_reach")}
+    assert rels == {"can_reach"}
+
+
+def test_shown_reachability_from_full_fixture(full_bundle):
+    graph = build_graph(full_bundle)
+    assert graph.get_node("sg-0aaa0001") is not None
+    assert graph.get_node("sg-0aaa0002") is not None
+    assert graph.get_node("internet:sg-0aaa0001") is not None
+    assert graph.get_node("cidr:203.0.113.0/24") is not None
+    # membership + the peer SG->SG edge.
+    assert "sg-0aaa0001" in _secured_by(graph, "eni-00instance0000001")
+    assert any(e.source == "sg-0aaa0002" and e.target == "sg-0aaa0001" for e in graph.edges)
 
 
 def test_eni_without_security_groups_has_no_reachability():
-    bundle = _bundle(network_interfaces=[_eni("eni-none")])  # no groups
-    graph = build_graph(bundle)
-    assert _reach_edges(graph, "eni-none") == []
+    bundle = _bundle(network_interfaces=[_eni("eni-none")])  # no groups, either mode
+    assert build_graph(bundle).get_node("sg-none") is None
+    assert _reach_edges(_collapsed(bundle), "eni-none") == []
+    assert _secured_by(build_graph(bundle), "eni-none") == []
 
 
 def test_missing_security_group_is_skipped_not_synthesized():
-    # An ENI references an SG we didn't collect -> no reachability guessed, no phantom node.
+    # An ENI references an SG we didn't collect -> a bare SG node (shown) but no invented sources.
     bundle = _bundle(network_interfaces=[_eni("eni-x", groups=["sg-uncollected"])])
-    graph = build_graph(bundle)
-    assert _reach_edges(graph, "eni-x") == []
-    assert graph.get_node("sg-source:sg-uncollected") is None
+    shown = build_graph(bundle)
+    assert shown.get_node("sg-uncollected") is not None  # membership still shown
+    assert not [
+        e for e in shown.edges if e.target == "sg-uncollected" and e.relationship == "can_reach"
+    ]
+    # Hidden: nothing to bring forward.
+    assert _reach_edges(_collapsed(bundle), "eni-x") == []
+
+
+# --------------------------------------------------------------------------- #
+# §5.5 — reachability, security groups HIDDEN (--no-security-groups)
+# --------------------------------------------------------------------------- #
+def test_hidden_full_internet_exposure_creates_per_eni_internet_node():
+    bundle = _bundle(
+        network_interfaces=[_eni("eni-web", groups=["sg-web"])],
+        security_groups=[_sg("sg-web", name="web", ingress=[("tcp", 443, 443, ["0.0.0.0/0"])])],
+    )
+    graph = _collapsed(bundle)
+    node = graph.get_node("internet:eni-web")
+    assert node is not None and node.type == "internet" and node.label == "Internet"
+    assert graph.get_node("sg-web") is None  # no SG node in the hidden view
+    edges = _reach_edges(graph, "eni-web")
+    assert len(edges) == 1 and edges[0].source == "internet:eni-web"
+    assert edges[0].attributes["ports"] == "tcp/443"
+
+
+def test_hidden_internet_nodes_are_not_shared_between_enis():
+    bundle = _bundle(
+        network_interfaces=[_eni("eni-a", groups=["sg-x"]), _eni("eni-b", groups=["sg-x"])],
+        security_groups=[_sg("sg-x", ingress=[("tcp", 80, 80, ["0.0.0.0/0"])])],
+    )
+    graph = _collapsed(bundle)
+    assert graph.get_node("internet:eni-a") is not None
+    assert graph.get_node("internet:eni-b") is not None
+    assert graph.get_node("internet") is None
+
+
+def test_hidden_ipv6_full_range_also_maps_to_internet():
+    bundle = _bundle(
+        network_interfaces=[_eni("eni-6", groups=["sg-6"])],
+        security_groups=[_sg("sg-6", ingress=[("tcp", 443, 443, [], ["::/0"])])],
+    )
+    assert _collapsed(bundle).get_node("internet:eni-6") is not None
+
+
+def test_hidden_specific_cidr_creates_shared_cidr_node():
+    bundle = _bundle(
+        network_interfaces=[_eni("eni-a", groups=["sg-a"]), _eni("eni-b", groups=["sg-a"])],
+        security_groups=[_sg("sg-a", ingress=[("tcp", 22, 22, ["203.0.113.0/24"])])],
+    )
+    graph = _collapsed(bundle)
+    node = graph.get_node("cidr:203.0.113.0/24")
+    assert node is not None and node.type == "cidr"
+    targets = {e.target for e in graph.edges if e.source == "cidr:203.0.113.0/24"}
+    assert targets == {"eni-a", "eni-b"}
+
+
+def test_hidden_peer_reference_expands_to_member_private_ips():
+    # The point of the flag: a peer-SG rule is expanded to the private IPs *behind* that SG.
+    bundle = _bundle(
+        network_interfaces=[
+            _eni("eni-app", groups=["sg-app"], private_ip="10.0.0.5"),
+            _eni("eni-lb", groups=["sg-lb"], private_ip="10.0.0.9"),
+        ],
+        security_groups=[
+            _sg("sg-app", ingress=[("-1", None, None, [], [], ["sg-lb"])]),
+            _sg("sg-lb", name="alb-sg"),
+        ],
+    )
+    graph = _collapsed(bundle)
+    node = graph.get_node("cidr:10.0.0.9/32")  # eni-lb's private IP, brought forward
+    assert node is not None and node.type == "cidr"
+    edge = next(e for e in _reach_edges(graph, "eni-app"))
+    assert edge.source == "cidr:10.0.0.9/32" and edge.attributes["ports"] == "all"
+    assert not [n for n in graph.nodes if n.type == "security_group"]  # no SG nodes
+
+
+def test_hidden_multiple_ports_from_same_source_aggregate_onto_one_edge():
+    bundle = _bundle(
+        network_interfaces=[_eni("eni-m", groups=["sg-m"])],
+        security_groups=[
+            _sg("sg-m", ingress=[("tcp", 443, 443, ["0.0.0.0/0"]), ("tcp", 80, 80, ["0.0.0.0/0"])])
+        ],
+    )
+    edges = _reach_edges(_collapsed(bundle), "eni-m")
+    assert len(edges) == 1 and edges[0].attributes["ports"] == "tcp/443, tcp/80"
 
 
 def test_reachability_is_included_regardless_of_orphans_flag():
@@ -471,18 +565,16 @@ def test_reachability_is_included_regardless_of_orphans_flag():
         network_interfaces=[_eni("eni-web", groups=["sg-web"])],
         security_groups=[_sg("sg-web", ingress=[("tcp", 443, 443, ["0.0.0.0/0"])])],
     )
-    assert build_graph(bundle).get_node("internet:eni-web") is not None
-    assert build_graph(bundle, include_orphans=True).get_node("internet:eni-web") is not None
+    assert build_graph(bundle).get_node("sg-web") is not None
+    assert build_graph(bundle, include_orphans=True).get_node("sg-web") is not None
 
 
-def test_reachability_from_full_fixture_bundle(full_bundle):
-    # End-to-end over the recorded fixtures: the instance ENI's SG opens 443 to the world, a
-    # bastion CIDR to 22, and a peer SG; the ALB ENI's SG opens 80/443 to the world.
-    graph = build_graph(full_bundle)
+def test_hidden_reachability_from_full_fixture_bundle(full_bundle):
+    graph = _collapsed(full_bundle)
     assert graph.get_node("internet:eni-00instance0000001") is not None
     assert graph.get_node("internet:eni-00alb00000000002") is not None
     assert graph.get_node("cidr:203.0.113.0/24") is not None
-    assert graph.get_node("sg-source:sg-0aaa0002") is not None
+    assert not [n for n in graph.nodes if n.type == "security_group"]
     # The NAT-gateway ENI has no security groups -> no reachability edges.
     assert _reach_edges(graph, "eni-00natgw000000004") == []
 
@@ -524,27 +616,27 @@ def _routing_bundle(*, public_subnet, public_ip, source):
 
 
 def test_internet_source_in_public_subnet_with_public_ip_is_routable():
-    g = build_graph(_routing_bundle(public_subnet=True, public_ip="52.1.2.3", source="internet"))
+    g = _collapsed(_routing_bundle(public_subnet=True, public_ip="52.1.2.3", source="internet"))
     assert _rel(g, "internet:eni-1", "eni-1") == "routable_can_reach"
 
 
 def test_internet_source_in_private_subnet_is_not_routable():
-    g = build_graph(_routing_bundle(public_subnet=False, public_ip="52.1.2.3", source="internet"))
+    g = _collapsed(_routing_bundle(public_subnet=False, public_ip="52.1.2.3", source="internet"))
     assert _rel(g, "internet:eni-1", "eni-1") == "not_routable_can_reach"
 
 
 def test_internet_source_without_public_ip_is_not_routable():
     # Public subnet (igw default route) but the ENI has no public IP -> not addressable.
-    g = build_graph(_routing_bundle(public_subnet=True, public_ip=None, source="internet"))
+    g = _collapsed(_routing_bundle(public_subnet=True, public_ip=None, source="internet"))
     assert _rel(g, "internet:eni-1", "eni-1") == "not_routable_can_reach"
 
 
 def test_external_cidr_needs_internet_path():
-    routable = build_graph(
+    routable = _collapsed(
         _routing_bundle(public_subnet=True, public_ip="52.1.2.3", source="external_cidr")
     )
     assert _rel(routable, "cidr:203.0.113.0/24", "eni-1") == "routable_can_reach"
-    not_routable = build_graph(
+    not_routable = _collapsed(
         _routing_bundle(public_subnet=False, public_ip=None, source="external_cidr")
     )
     assert _rel(not_routable, "cidr:203.0.113.0/24", "eni-1") == "not_routable_can_reach"
@@ -552,13 +644,27 @@ def test_external_cidr_needs_internet_path():
 
 def test_intra_vpc_cidr_is_routable_via_local_route():
     # A source inside the VPC is always reachable (local route), even in a private subnet.
-    g = build_graph(_routing_bundle(public_subnet=False, public_ip=None, source="internal_cidr"))
+    g = _collapsed(_routing_bundle(public_subnet=False, public_ip=None, source="internal_cidr"))
     assert _rel(g, "cidr:10.0.5.0/24", "eni-1") == "routable_can_reach"
 
 
-def test_peer_security_group_is_routable():
-    g = build_graph(_routing_bundle(public_subnet=False, public_ip=None, source="sg"))
-    assert _rel(g, "sg-source:sg-peer", "eni-1") == "routable_can_reach"
+def test_peer_security_group_member_ip_is_routable():
+    # Hidden view: a peer-SG rule expands to the peer's member private IPs (in-VPC -> routable).
+    bundle = _bundle(
+        network_interfaces=[
+            _eni("eni-1", subnet_id="subnet-1", groups=["sg-1"], public_ip=None),
+            _eni("eni-peer", subnet_id="subnet-1", groups=["sg-peer"], private_ip="10.0.9.9"),
+        ],
+        subnets=[_subnet("subnet-1")],
+        vpcs=[_vpc_dict()],
+        security_groups=[
+            _sg("sg-1", ingress=[("-1", None, None, [], [], ["sg-peer"])]),
+            _sg("sg-peer", name="peer"),
+        ],
+        route_tables=[_rt("rtb-1", subnet_ids=["subnet-1"], routes=[("10.0.0.0/16", "local")])],
+    )
+    g = _collapsed(bundle)
+    assert _rel(g, "cidr:10.0.9.9/32", "eni-1") == "routable_can_reach"
 
 
 def test_external_cidr_routable_over_transit_gateway():
@@ -576,7 +682,7 @@ def test_external_cidr_routable_over_transit_gateway():
             )
         ],
     )
-    g = build_graph(bundle)
+    g = _collapsed(bundle)
     assert _rel(g, "cidr:192.0.2.0/24", "eni-1") == "routable_can_reach"
 
 
@@ -593,7 +699,7 @@ def test_main_route_table_is_the_fallback_for_unassociated_subnets():
             _rt("rtb-main", main=True, routes=[("10.0.0.0/16", "local"), ("0.0.0.0/0", "igw-1")])
         ],
     )
-    g = build_graph(bundle)
+    g = _collapsed(bundle)
     assert _rel(g, "internet:eni-1", "eni-1") == "routable_can_reach"
 
 
@@ -603,7 +709,7 @@ def test_no_route_data_leaves_reachability_undetermined():
         network_interfaces=[_eni("eni-1", groups=["sg-1"], public_ip="52.1.2.3")],
         security_groups=[_sg("sg-1", ingress=[("tcp", 443, 443, ["0.0.0.0/0"])])],
     )
-    g = build_graph(bundle)
+    g = _collapsed(bundle)
     assert _rel(g, "internet:eni-1", "eni-1") == "can_reach"
 
 
@@ -619,7 +725,7 @@ def test_ports_still_aggregate_onto_the_routed_edge():
         ],
         route_tables=[_rt("rtb-1", subnet_ids=["subnet-1"], routes=[("0.0.0.0/0", "igw-1")])],
     )
-    g = build_graph(bundle)
+    g = _collapsed(bundle)
     edge = next(e for e in g.edges if e.source == "internet:eni-1")
     assert edge.relationship == "routable_can_reach"
     assert edge.attributes["ports"] == "tcp/443, tcp/80"
@@ -628,7 +734,7 @@ def test_ports_still_aggregate_onto_the_routed_edge():
 def test_full_fixture_routability_splits_reachability(full_bundle):
     # eni-00instance is in a public subnet WITH a public IP -> routable; eni-00alb is in the same
     # public subnet but has NO public IP -> not routable.
-    graph = build_graph(full_bundle)
+    graph = _collapsed(full_bundle)
     inst = _rel(graph, "internet:eni-00instance0000001", "eni-00instance0000001")
     alb = _rel(graph, "internet:eni-00alb00000000002", "eni-00alb00000000002")
     assert inst == "routable_can_reach"

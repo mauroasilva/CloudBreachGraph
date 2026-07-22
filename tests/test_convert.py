@@ -37,8 +37,7 @@ _COMMAND_FIXTURES = {
 }
 
 
-@pytest.fixture
-def graph(monkeypatch):
+def _collected(monkeypatch):
     monkeypatch.setattr(
         runner, "run_aws", lambda args, **k: load_fixture(_COMMAND_FIXTURES[tuple(args[:2])])
     )
@@ -46,7 +45,17 @@ def graph(monkeypatch):
         target="prod",
         roles={"network": ResolvedAccount("prod-audit", "111111111111", "us-east-1")},
     )
-    return build_graph(collectors.collect_all(resolved))
+    return collectors.collect_all(resolved)
+
+
+@pytest.fixture
+def graph(monkeypatch):
+    return build_graph(_collected(monkeypatch))
+
+
+@pytest.fixture
+def graph_collapsed_fixture(monkeypatch):
+    return build_graph(_collected(monkeypatch), show_security_groups=False)
 
 
 # --------------------------------------------------------------------------- #
@@ -177,6 +186,57 @@ def test_convert_json_matches_direct_pipeline(graph, tmp_path):
     assert (tmp_path / "converted.html").read_text() == direct
 
 
+# --------------------------------------------------------------------------- #
+# --no-security-groups: collapse the SG layer of a loaded (shown) graph
+# --------------------------------------------------------------------------- #
+def test_collapse_security_groups_transform(graph):
+    from cloudbreachgraph.mapping.collapse import collapse_security_groups
+
+    assert any(n.type == "security_group" for n in graph.nodes)  # the fixture is SG-shown
+    collapsed = collapse_security_groups(graph)
+    # No SG nodes and no secured_by / SG-targeted edges remain.
+    assert not any(n.type == "security_group" for n in collapsed.nodes)
+    assert not any(e.relationship == "secured_by" for e in collapsed.edges)
+    # The IP sources are brought forward to the ENIs: internet is now per-ENI, cidr survives.
+    assert collapsed.get_node("internet:eni-00instance0000001") is not None
+    assert collapsed.get_node("cidr:203.0.113.0/24") is not None
+    # The peer SG (sg-0aaa0002, on the ALB ENI 10.0.1.20) is expanded to that member's /32.
+    assert collapsed.get_node("cidr:10.0.1.20/32") is not None
+    reach = {(e.source, e.target) for e in collapsed.edges if e.relationship == "can_reach"}
+    assert ("internet:eni-00instance0000001", "eni-00instance0000001") in reach
+
+
+def test_collapse_is_a_noop_when_no_security_groups(graph_collapsed_fixture):
+    from cloudbreachgraph.mapping.collapse import collapse_security_groups
+
+    # A graph that already has no SG nodes is returned unchanged.
+    again = collapse_security_groups(graph_collapsed_fixture)
+    assert again.to_dict() == graph_collapsed_fixture.to_dict()
+
+
+def test_collapse_leaves_foreign_sg_graphs_untouched():
+    # A graph with security_group nodes but NO secured_by membership (e.g. an older capture) has
+    # no SG *layer* to collapse; it must be returned verbatim, not stripped of reachability.
+    from cloudbreachgraph.mapping.collapse import collapse_security_groups
+    from cloudbreachgraph.model.graph import Edge, Graph, Node
+
+    g = Graph(meta={})
+    g.add_node(Node("eni-1", "eni", "eni-1"))
+    g.add_node(Node("sg-x", "security_group", "sg-x"))
+    g.add_edge(Edge("sg-x", "eni-1", "can_reach", {"ports": "tcp/443"}))  # SG -> ENI directly
+    assert collapse_security_groups(g).to_dict() == g.to_dict()
+
+
+def test_convert_no_security_groups_flag(graph, tmp_path):
+    jp = json_export.write_json(graph, tmp_path / "graph.json")
+    out = tmp_path / "collapsed.html"
+    rc = convert.main([str(jp), "--no-security-groups", "-o", str(out)])
+    assert rc == 0
+    text = out.read_text()
+    assert '"type": "security_group"' not in text  # SG layer collapsed out of the rendered data
+    assert "eni-00instance0000001" in text
+
+
 def test_convert_dot_to_html(graph, tmp_path):
     dp = dot_export.write_dot(graph, tmp_path / "graph.dot")
     rc = convert.main([str(dp), "-o", str(tmp_path / "out.html")])
@@ -228,13 +288,13 @@ def test_ringed_view_data_groups_by_vpc_and_ring(graph):
     cluster = data["clusters"][0]
     assert cluster["label"] == vpc.label
     rings = cluster["rings"]
-    # subnets, ENIs, EC2/LB, then the reachability-source ring (internet/CIDR/SG) — §5.5.
-    assert len(rings) == 4
-    assert 0 < rings[0] < rings[1] < rings[2] < rings[3]  # each successive ring is further out
+    # subnets, ENIs, EC2/LB, security groups, then the IP-source ring (internet/CIDR) — §5.5.
+    assert len(rings) == 5
+    assert 0 < rings[0] < rings[1] < rings[2] < rings[3] < rings[4]  # each ring further out
 
     pos = {n["id"]: n for n in data["nodes"]}
-    reach_types = {"internet", "cidr", "security_group"}
-    # VPC at the center; subnets ring 1; ENIs ring 2; EC2/LB ring 3; reach sources ring 4.
+    source_types = {"internet", "cidr"}
+    # VPC center; subnets r1; ENIs r2; EC2/LB r3; security groups r4; IP sources r5.
     assert (pos[vpc.id]["x"], pos[vpc.id]["y"]) == (cluster["cx"], cluster["cy"])
     for n in graph.nodes:
         d = round(
@@ -247,8 +307,10 @@ def test_ringed_view_data_groups_by_vpc_and_ring(graph):
             assert d == round(rings[0], 1)
         elif n.type == "eni":
             assert d == round(rings[1], 1)
-        elif n.type in reach_types:
+        elif n.type == "security_group":
             assert d == round(rings[3], 1)
+        elif n.type in source_types:
+            assert d == round(rings[4], 1)
         else:
             assert d == round(rings[2], 1)
 
@@ -400,20 +462,25 @@ def test_ringed_unassigned_nodes_form_their_own_cluster():
     assert data["clusters"][-1]["label"] == "unassigned"
 
 
-def test_ringed_reachability_sources_form_the_outer_ring(graph):
-    # The §5.5 reachability sources (internet/CIDR/SG) sit on ring 4 — strictly outside the
-    # EC2/LB ring — of the VPC cluster whose ENIs they can reach.
+def test_ringed_security_groups_and_sources_form_outer_rings(graph):
+    # §5.5: security groups sit on ring 4 (just outside EC2/LB), IP sources on the outermost ring 5.
     data = html_export._ringed_view_data(graph)
     cluster = data["clusters"][0]
     cx, cy, rings = cluster["cx"], cluster["cy"], cluster["rings"]
-    assert len(rings) == 4
+    assert len(rings) == 5
     pos = {n["id"]: n for n in data["nodes"]}
-    reach_ids = [n.id for n in graph.nodes if n.type in {"internet", "cidr", "security_group"}]
-    assert reach_ids  # the fixture produces reachability sources
-    for nid in reach_ids:
-        d = ((pos[nid]["x"] - cx) ** 2 + (pos[nid]["y"] - cy) ** 2) ** 0.5
-        assert round(d, 1) == round(rings[3], 1)  # on the outermost ring
-    assert rings[3] > rings[2]  # outside the EC2/LB ring
+
+    def dist(nid):
+        return round(((pos[nid]["x"] - cx) ** 2 + (pos[nid]["y"] - cy) ** 2) ** 0.5, 1)
+
+    sg_ids = [n.id for n in graph.nodes if n.type == "security_group"]
+    src_ids = [n.id for n in graph.nodes if n.type in {"internet", "cidr"}]
+    assert sg_ids and src_ids  # the fixture produces both
+    for nid in sg_ids:
+        assert dist(nid) == round(rings[3], 1)  # security-group ring
+    for nid in src_ids:
+        assert dist(nid) == round(rings[4], 1)  # outermost source ring
+    assert rings[3] > rings[2] and rings[4] > rings[3]
 
 
 def test_ringed_build_is_deterministic(graph):

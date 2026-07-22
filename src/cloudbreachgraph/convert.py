@@ -24,6 +24,7 @@ from pathlib import Path
 
 from . import __version__
 from .graph_io import GraphLoadError, load_graph
+from .mapping.collapse import collapse_security_groups
 from .output import dot_export, html_export
 
 
@@ -46,6 +47,14 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("auto", "json", "dot"),
         default="auto",
         help="input format (default: auto — inferred from the .json/.dot extension)",
+    )
+    p.add_argument(
+        "--security-groups",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="keep security-group nodes as-is (default: on). --no-security-groups collapses the "
+        "SG layer, bringing the source IPs forward to connect directly to the ENIs. It can only "
+        "remove SG nodes present in the input, not add them (no AWS re-collection)",
     )
     p.add_argument(
         "--ringed",
@@ -76,6 +85,10 @@ def main(argv: list[str] | None = None) -> int:
     except GraphLoadError as exc:
         print(f"cloudbreachgraph-to-html: {exc}", file=sys.stderr)
         return 2
+
+    if not args.security_groups:
+        # Collapse the SG layer of the loaded graph (a view transform; can only remove SG nodes).
+        graph = collapse_security_groups(graph)
 
     result = html_export.write_layout_html(
         graph, out_path, ringed=args.ringed, optimize_passes=args.optimize_passes

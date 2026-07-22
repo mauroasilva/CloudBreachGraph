@@ -42,7 +42,8 @@ CloudBreachGraph/
 │       ├── mapping/
 │       │   ├── __init__.py
 │       │   ├── builder.py        # build_graph(collected) -> Graph, relationship rules  (Phase 2)
-│       │   └── routing.py        # RouteResolver: routability of reachability edges (§5.6)
+│       │   ├── routing.py        # RouteResolver: routability of reachability edges (§5.6)
+│       │   └── collapse.py       # collapse_security_groups(graph): SG-layer view transform (§5.5)
 │       └── output/
 │           ├── __init__.py
 │           ├── json_export.py    # Graph -> JSON  (Phase 3)
@@ -177,37 +178,50 @@ invent an attachment.
 
 ### 5.5 ENI reachability — who can connect to it (security-group inbound rules)
 
-Beyond *what an ENI is*, the map records *how each ENI is reachable*. For every ENI, read each
-of its security groups' (`Eni.security_groups` → `SecurityGroup.ingress`) **inbound** rules and
-add a **reachability source node** plus a `can_reach` edge (**source → ENI**) for each distinct
-source the rule allows. The edge's `ports` attribute summarises the protocol/port ranges that
-reach the ENI (e.g. `"tcp/443"`, `"tcp/80, tcp/443"`, `"all"` for the `-1` protocol).
+Beyond *what an ENI is*, the map records *how each ENI is reachable*, from its security groups'
+(`Eni.security_groups` → `SecurityGroup.ingress`) **inbound** rules. Reachability edges carry a
+`ports` attribute summarising the protocol/port ranges (e.g. `"tcp/443"`, `"tcp/80, tcp/443"`,
+`"all"` for the `-1` protocol). Load-balancer reachability rides this path with no special case: an
+ALB / Classic-ELB ENI carries its LB's security groups in its own `Groups[]`, so the LB's inbound
+rules flow in as the fronting ENI's sources. The pass is **always on** (independent of
+`--include-orphans`). `build_graph(show_security_groups=...)` picks one of two shapes:
 
-Load-balancer reachability rides this same path with no special case: an ALB / Classic-ELB ENI
-carries its load balancer's security groups in its own `Groups[]`, so the LB's inbound rules flow
-in as the fronting ENI's reachability sources.
+**Shown (default, `_map_reachability_via_sgs`).** Security groups are first-class nodes so the
+source fan-out collapses through them:
 
-Three source kinds (node `type` in parentheses):
+* each ENI links to every SG it carries — edge `secured_by` (ENI → SG);
+* each SG's inbound rules add a source per distinct allowance, linked to the SG — edge `can_reach`
+  (source → SG). Source kinds (node `type`): **`internet`** (a `0.0.0.0/0`/`::/0` rule → a per-SG
+  `internet:<sg-id>` node), **`cidr`** (any other range → a shared `cidr:<cidr>` node), and a
+  **referencing security group** (a `UserIdGroupPairs[].GroupId` → that SG's own node, id the raw
+  `sg-<id>`, so it is an SG → SG `can_reach` edge).
 
-1. **The whole internet** (`internet`) — a rule open to `0.0.0.0/0` **or** `::/0`. Emit a
-   **per-ENI** node with id `internet:<eni-id>` and label `Internet`. These are **never shared**:
-   a single global Internet node would collect a spoke from every internet-facing ENI, and those
-   long crossing edges are exactly what a per-ENI node avoids.
-2. **A specific CIDR** (`cidr`) — any other IPv4/IPv6 range. Emit a **shared** node with id
-   `cidr:<cidr>` (attribute `cidr`), so one source range reaching several ENIs reads as one node
-   with a spoke to each.
-3. **A referencing security group** (`security_group`) — a `UserIdGroupPairs[].GroupId`. Emit a
-   **shared** node with id `sg-source:<group-id>` (attribute `group_id`), labelled with the peer
-   SG's name when it was collected.
+Routability (§5.6) is **not** represented in this shape — it is a *(source, ENI)* property and an
+SG can front ENIs in different subnets.
 
-An ENI with no security groups, or one whose SGs weren't collected, gets **no** reachability
-edges — never invent one. This pass is **always on** (independent of `--include-orphans`); it is
-the point of the reachability feature.
+**Hidden (`--no-security-groups`, `_map_reachability_direct`).** No SG node is emitted; only the
+**IPs behind** the SGs are brought forward, connected **directly** to the ENIs, and each edge
+carries the routability split (§5.6):
+
+* **`internet`** — a per-ENI `internet:<eni-id>` node (never one shared Internet node — a single
+  hub would collect a spoke from every internet-facing ENI, the crossings a per-ENI node avoids);
+* **`cidr`** — a shared `cidr:<cidr>` node;
+* a **peer-SG reference** is expanded to the **private IPs of that SG's member ENIs** (each a `/32`
+  `cidr` node), so the concrete addresses a referencing group lets in are surfaced, not dropped.
+
+An ENI with no security groups (or whose SGs weren't collected) gets no sources either way — never
+invent one; shown mode still records its `secured_by` membership. The `cloudbreachgraph-to-html`
+converter collapses a *shown* graph to the hidden shape after the fact via
+`mapping/collapse.py::collapse_security_groups` (a view transform — it can only remove SG nodes, so
+it no-ops on a graph that lacks `secured_by` membership, and its collapsed edges are plain
+`can_reach` since a written graph carries no route data).
 
 ### 5.6 Routability — is the source actually routed to the ENI?
 
 A security-group rule says a source is **allowed**; §5.6 asks whether a network path actually
-**routes** it there. The reachability edge's *relationship* carries the verdict, computed from the
+**routes** it there. This split applies only in the **hidden** (`--no-security-groups`) shape,
+where reachability edges point at ENIs; in the shown shape edges point at shared SG nodes, which
+have no single per-ENI verdict. The edge's *relationship* carries the verdict, computed from the
 ENI's **route table** (`mapping/routing.py`, `RouteResolver`):
 
 * `routable_can_reach`     — allowed **and** a route exists.
@@ -226,9 +240,10 @@ simulator — NACLs, TGW route propagation, VPN/DX propagation are out of scope)
   addressable from outside).
 * **cidr** source: routable if the CIDR is inside the VPC (a `local` route always covers it), or a
   route explicitly covers it via a connective gateway (`vgw-`/`tgw-`/`pcx-`), or the ENI is
-  internet-reachable as above; otherwise not routable.
-* **security_group** source: a referencing SG is VPC-local (SG references don't cross accounts, and
-  the local route always covers the VPC), so it is treated as routable.
+  internet-reachable as above; otherwise not routable. A peer-SG reference has already been
+  expanded to its members' `/32` private IPs (§5.5), so it arrives here as an intra-VPC `cidr`
+  (routable via the local route). `RouteResolver.classify` keeps a `security_group` branch as a
+  defensive default, but the hidden shape no longer feeds it one.
 
 ## 6. Graph data model (Phase 2 defines, Phase 3 consumes)
 
@@ -239,14 +254,14 @@ Node:
   id:    str            # eni-..., i-..., subnet-..., vpc-..., LB arn/name, or a reachability
                         #   source: internet:<eni>, cidr:<cidr>, sg-source:<gid>
   type:  str            # "eni" | "ec2_instance" | "load_balancer" | "subnet" | "vpc"
-                        #   | "internet" | "cidr" | "security_group"   (reachability sources, §5.5)
+                        #   | "security_group" | "internet" | "cidr"   (reachability, §5.5)
   label: str            # human-friendly (Name tag or id)
   attributes: dict      # type-specific metadata (state, cidr, interface_type, synthetic, ...)
 
 Edge:
   source: str           # node id
   target: str           # node id
-  relationship: str     # "attached_to" | "in_subnet" | "in_vpc"
+  relationship: str     # "attached_to" | "in_subnet" | "in_vpc" | "secured_by" (ENI->SG, §5.5)
                         #   | "can_reach" / "routable_can_reach" / "not_routable_can_reach" (§5.5/§5.6)
   attributes: dict      # e.g. {"match_rule": "elbv2_description"} or {"ports": "tcp/443"}
 
@@ -269,12 +284,13 @@ Requirements:
 - **JSON** (`graph.json`): `Graph.to_dict()`, pretty-printed, stable ordering.
 - **Graphviz DOT** (`graph.dot`): nodes grouped/colored by type; edge labels show the
   relationship (and `match_rule` for LB edges, `ports` for `can_reach` edges, when useful).
-  Consider `subgraph cluster_*` per VPC so the layout groups subnets/ENIs inside their VPC
-  visually. Reachability sources (`internet`/`cidr`/`security_group`, §5.5) are top-level nodes
-  linked to the ENIs they reach; a per-ENI `internet` node marks full `0.0.0.0/0` exposure. (This
-  replaced the earlier public-IP-only shared `Internet` decoration; a public IP still shows on the
-  ENI's own `Public IP:` label line.) The reachability edge is colored by **routability** (§5.6):
+  Consider `subgraph cluster_*` per VPC so the layout groups subnets/ENIs (and `security_group`
+  nodes, which are VPC-scoped) inside their VPC visually. Reachability (§5.5): with SGs shown each
+  ENI has a dashed `secured_by` edge to its SG and the `internet`/`cidr` sources link to the SG;
+  hidden, the sources link straight to the ENIs and the edge is colored by **routability** (§5.6):
   `routable_can_reach` solid red, `not_routable_can_reach` grey dashed, plain `can_reach` default.
+  A public IP shows on the ENI's own `Public IP:` label line (this replaced the earlier
+  public-IP-only shared `Internet` decoration).
 - **Optional render:** if the `dot` binary is on PATH, offer `--render png|svg` that shells
   out to `dot -T<fmt>`. Absence of `dot` must degrade gracefully (still write the `.dot`).
 - **Interactive HTML** (`graph.html`, opt-in via `--html`, *not* produced by default):
@@ -311,12 +327,14 @@ Requirements:
   guard and `.dot` fallback. Its `--ringed` flag selects an alternative **concentric-ringed** layout
   (`html_export.write_ringed_html`/`build_ringed_html`): each VPC is a cluster center, ringed
   by its subnets, then its ENIs on a dedicated ring, then everything else under that VPC (EC2
-  instances, load balancers), then a new **outermost** ring of its reachability sources (§5.5).
-  The ENI ring is the angular anchor: each subnet is placed at the
-  mean angle of the ENIs it contains (ENIs are grouped by subnet on their ring), each
-  EC2/LB at the mean angle of the ENIs attached to it, and each reachability source at the mean
-  angle of the ENIs it can reach, so all stay radially next to their
-  interfaces; orphan resources collect into a final ring-cluster (empty center). Ring positions are
+  instances, load balancers), then a **security-group** ring, then a new **outermost** ring of the
+  IP sources (`internet`/`cidr`, §5.5). The ENI ring is the angular anchor: each subnet is placed at
+  the mean angle of the ENIs it contains (ENIs are grouped by subnet on their ring), each
+  EC2/LB at the mean angle of the ENIs attached to it, each security group at the mean angle of the
+  ENIs it secures, and each source at the mean angle of the ENIs it can reach (through its SG), so
+  all stay radially next to their interfaces; orphan resources collect into a final ring-cluster
+  (empty center). With `--no-security-groups` the SG ring is empty and the source ring nests onto
+  the ENIs. Ring positions are
   computed deterministically in Python (no in-browser force sim), and the same `MAX_NODES`/
   `MAX_HTML_BYTES` guard and `.dot` fallback apply. The `--optimize-passes N` flag runs up to
   N barycenter passes (`html_export._optimize_cluster`) that move each node toward the mean
