@@ -26,6 +26,7 @@ _COMMAND_FIXTURES = {
     ("elb", "describe-load-balancers"): "elb_describe-load-balancers.json",
     ("ec2", "describe-subnets"): "ec2_describe-subnets.json",
     ("ec2", "describe-vpcs"): "ec2_describe-vpcs.json",
+    ("ec2", "describe-security-groups"): "ec2_describe-security-groups.json",
 }
 
 
@@ -59,6 +60,7 @@ def _eni(
     interface_type="interface",
     description="",
     instance_id=None,
+    groups=None,
 ):
     return {
         "NetworkInterfaceId": eni_id,
@@ -78,7 +80,35 @@ def _eni(
             "Status": None,
         },
         "PrivateIpAddresses": [],
-        "Groups": [],
+        "Groups": [{"GroupId": g} for g in (groups or [])],
+    }
+
+
+def _sg(group_id, *, name=None, vpc_id="vpc-1", ingress=()):
+    """A normalized security-group dict. Each ``ingress`` entry is
+    ``(protocol, from_port, to_port, cidrs, ipv6_cidrs, group_ids)`` (trailing items optional)."""
+    perms = []
+    for rule in ingress:
+        proto, fromp, top = rule[0], rule[1], rule[2]
+        cidrs = rule[3] if len(rule) > 3 else []
+        ipv6 = rule[4] if len(rule) > 4 else []
+        gids = rule[5] if len(rule) > 5 else []
+        perms.append(
+            {
+                "IpProtocol": proto,
+                "FromPort": fromp,
+                "ToPort": top,
+                "IpRanges": [{"CidrIp": c} for c in cidrs],
+                "Ipv6Ranges": [{"CidrIpv6": c} for c in ipv6],
+                "UserIdGroupPairs": [{"GroupId": g} for g in gids],
+            }
+        )
+    return {
+        "GroupId": group_id,
+        "GroupName": name,
+        "VpcId": vpc_id,
+        "Description": None,
+        "IpPermissions": perms,
     }
 
 
@@ -284,6 +314,138 @@ def test_missing_subnet_with_no_vpc_hint_gets_placeholder_vpc():
     assert len(in_vpc) == 1
     assert in_vpc[0].target == "unknown-vpc:subnet-orphan"
     assert graph.get_node("unknown-vpc:subnet-orphan").attributes["synthetic"] is True
+
+
+# --------------------------------------------------------------------------- #
+# §5.5 — reachability from security-group inbound rules
+# --------------------------------------------------------------------------- #
+def _reach_edges(graph, eni_id):
+    return [e for e in graph.edges if e.target == eni_id and e.relationship == "can_reach"]
+
+
+def test_full_internet_exposure_creates_per_eni_internet_node():
+    bundle = _bundle(
+        network_interfaces=[_eni("eni-web", groups=["sg-web"])],
+        security_groups=[_sg("sg-web", name="web", ingress=[("tcp", 443, 443, ["0.0.0.0/0"])])],
+    )
+    graph = build_graph(bundle)
+    node = graph.get_node("internet:eni-web")
+    assert node is not None
+    assert node.type == "internet"
+    assert node.label == "Internet"
+    edges = _reach_edges(graph, "eni-web")
+    assert len(edges) == 1
+    assert edges[0].source == "internet:eni-web"
+    assert edges[0].attributes["ports"] == "tcp/443"
+
+
+def test_internet_nodes_are_not_shared_between_enis():
+    # Two ENIs both open to 0.0.0.0/0 get their OWN Internet node (per the change request, to
+    # avoid a single high-fan-in node and the crossings it causes).
+    bundle = _bundle(
+        network_interfaces=[_eni("eni-a", groups=["sg-x"]), _eni("eni-b", groups=["sg-x"])],
+        security_groups=[_sg("sg-x", ingress=[("tcp", 80, 80, ["0.0.0.0/0"])])],
+    )
+    graph = build_graph(bundle)
+    assert graph.get_node("internet:eni-a") is not None
+    assert graph.get_node("internet:eni-b") is not None
+    assert graph.get_node("internet") is None  # no shared node
+    assert not [e for e in graph.edges if e.relationship == "can_reach" and e.source == "internet"]
+
+
+def test_ipv6_full_range_also_maps_to_internet():
+    bundle = _bundle(
+        network_interfaces=[_eni("eni-6", groups=["sg-6"])],
+        security_groups=[_sg("sg-6", ingress=[("tcp", 443, 443, [], ["::/0"])])],
+    )
+    graph = build_graph(bundle)
+    assert graph.get_node("internet:eni-6") is not None
+
+
+def test_specific_cidr_creates_shared_cidr_node():
+    # A specific source CIDR that reaches two ENIs is a single shared node with a spoke to each.
+    bundle = _bundle(
+        network_interfaces=[_eni("eni-a", groups=["sg-a"]), _eni("eni-b", groups=["sg-a"])],
+        security_groups=[_sg("sg-a", ingress=[("tcp", 22, 22, ["203.0.113.0/24"])])],
+    )
+    graph = build_graph(bundle)
+    node = graph.get_node("cidr:203.0.113.0/24")
+    assert node is not None and node.type == "cidr"
+    assert node.attributes["cidr"] == "203.0.113.0/24"
+    targets = {e.target for e in graph.edges if e.source == "cidr:203.0.113.0/24"}
+    assert targets == {"eni-a", "eni-b"}
+
+
+def test_referencing_security_group_becomes_source_node():
+    bundle = _bundle(
+        network_interfaces=[_eni("eni-app", groups=["sg-app"])],
+        security_groups=[
+            _sg("sg-app", ingress=[("-1", None, None, [], [], ["sg-lb"])]),
+            _sg("sg-lb", name="alb-sg"),
+        ],
+    )
+    graph = build_graph(bundle)
+    node = graph.get_node("sg-source:sg-lb")
+    assert node is not None and node.type == "security_group"
+    assert node.label == "alb-sg"  # labelled with the peer SG's name
+    assert node.attributes["group_id"] == "sg-lb"
+    edge = _reach_edges(graph, "eni-app")[0]
+    assert edge.source == "sg-source:sg-lb"
+    assert edge.attributes["ports"] == "all"  # -1 protocol => all traffic
+
+
+def test_multiple_ports_from_same_source_aggregate_onto_one_edge():
+    bundle = _bundle(
+        network_interfaces=[_eni("eni-m", groups=["sg-m"])],
+        security_groups=[
+            _sg(
+                "sg-m",
+                ingress=[
+                    ("tcp", 443, 443, ["0.0.0.0/0"]),
+                    ("tcp", 80, 80, ["0.0.0.0/0"]),
+                ],
+            )
+        ],
+    )
+    graph = build_graph(bundle)
+    edges = _reach_edges(graph, "eni-m")
+    assert len(edges) == 1  # one deduped edge, both ports aggregated (sorted)
+    assert edges[0].attributes["ports"] == "tcp/443, tcp/80"
+
+
+def test_eni_without_security_groups_has_no_reachability():
+    bundle = _bundle(network_interfaces=[_eni("eni-none")])  # no groups
+    graph = build_graph(bundle)
+    assert _reach_edges(graph, "eni-none") == []
+
+
+def test_missing_security_group_is_skipped_not_synthesized():
+    # An ENI references an SG we didn't collect -> no reachability guessed, no phantom node.
+    bundle = _bundle(network_interfaces=[_eni("eni-x", groups=["sg-uncollected"])])
+    graph = build_graph(bundle)
+    assert _reach_edges(graph, "eni-x") == []
+    assert graph.get_node("sg-source:sg-uncollected") is None
+
+
+def test_reachability_is_included_regardless_of_orphans_flag():
+    bundle = _bundle(
+        network_interfaces=[_eni("eni-web", groups=["sg-web"])],
+        security_groups=[_sg("sg-web", ingress=[("tcp", 443, 443, ["0.0.0.0/0"])])],
+    )
+    assert build_graph(bundle).get_node("internet:eni-web") is not None
+    assert build_graph(bundle, include_orphans=True).get_node("internet:eni-web") is not None
+
+
+def test_reachability_from_full_fixture_bundle(full_bundle):
+    # End-to-end over the recorded fixtures: the instance ENI's SG opens 443 to the world, a
+    # bastion CIDR to 22, and a peer SG; the ALB ENI's SG opens 80/443 to the world.
+    graph = build_graph(full_bundle)
+    assert graph.get_node("internet:eni-00instance0000001") is not None
+    assert graph.get_node("internet:eni-00alb00000000002") is not None
+    assert graph.get_node("cidr:203.0.113.0/24") is not None
+    assert graph.get_node("sg-source:sg-0aaa0002") is not None
+    # The NAT-gateway ENI has no security groups -> no reachability edges.
+    assert _reach_edges(graph, "eni-00natgw000000004") == []
 
 
 # --------------------------------------------------------------------------- #

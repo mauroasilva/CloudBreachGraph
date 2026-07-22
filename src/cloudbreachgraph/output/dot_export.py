@@ -8,8 +8,12 @@
   layout visually nests reachability inside each VPC. EC2 instances and load balancers are
   clustered too when their ``vpc_id`` is known; anything without a resolvable VPC is drawn
   at the top level.
-* **Edges are labeled by relationship** (``in_subnet``/``in_vpc``/``attached_to``), and
-  load-balancer attachment edges additionally show their ``match_rule``.
+* **Edges are labeled by relationship** (``in_subnet``/``in_vpc``/``attached_to``/``can_reach``),
+  load-balancer attachment edges additionally show their ``match_rule``, and reachability
+  (``can_reach``) edges show the protocol/port range that reaches the ENI.
+* **Reachability sources** (``internet``/``cidr``/``security_group`` nodes, §5.5) are ordinary
+  top-level nodes linked to the ENIs they can reach; a per-ENI ``internet`` node marks full
+  ``0.0.0.0/0`` / ``::/0`` exposure.
 
 ``render(dot_path, fmt)`` optionally rasterizes the ``.dot`` with the system ``dot`` binary
 (``dot -T<fmt>``) — but only if ``dot`` is on ``PATH``. It returns ``None`` when ``dot`` is
@@ -33,6 +37,10 @@ _TYPE_STYLE: dict[str, tuple[str, str]] = {
     "eni": ("#E8F5E9", "ellipse"),  # light green
     "ec2_instance": ("#FFF3E0", "box3d"),  # light orange
     "load_balancer": ("#F3E5F5", "component"),  # light purple
+    # Reachability sources (docs/02_architecture.md §5.5) — who can reach an ENI.
+    "internet": ("#FFEBEE", "doubleoctagon"),  # the whole internet (0.0.0.0/0 / ::/0), per-ENI
+    "cidr": ("#FFF8E1", "note"),  # a specific source CIDR
+    "security_group": ("#FCE4EC", "tab"),  # a referencing security group
 }
 _DEFAULT_STYLE = ("#FFFFFF", "box")
 
@@ -124,6 +132,9 @@ def _edge_stmt(edge: Edge) -> str:
     match_rule = edge.attributes.get("match_rule")
     if match_rule:
         lines.append(f"({match_rule})")
+    ports = edge.attributes.get("ports")
+    if ports:  # reachability (can_reach) edges annotate the protocol/port range that reaches
+        lines.append(str(ports))
     dashed = ', style="dashed"' if edge.relationship in ("in_subnet", "in_vpc") else ""
     return f'"{_esc(edge.source)}" -> "{_esc(edge.target)}" [label="{_label(lines)}"{dashed}];'
 
@@ -171,21 +182,11 @@ def _dot_lines(graph: Graph) -> list[str]:
     for node in by_vpc.get(None, []):
         out.append(f"  {_node_stmt(node)}")
 
-    # Edges (already deterministically sorted by the Graph).
+    # Edges (already deterministically sorted by the Graph). Reachability (``can_reach``) edges
+    # and their internet/CIDR/security-group source nodes are ordinary graph nodes/edges now
+    # (docs/02_architecture.md §5.5), so they render through the loops above — no special case.
     for edge in graph.edges:
         out.append(f"  {_edge_stmt(edge)}")
-
-    # Any ENI with a public IP is reachable from the internet: draw a single generic
-    # "Internet" node at the top level and connect each such ENI to it. graph.nodes is
-    # already sorted, so the edges are deterministic.
-    public_enis = [n for n in graph.nodes if n.type == "eni" and n.attributes.get("public_ips")]
-    if public_enis:
-        out.append(
-            '  "Internet" [label="Internet", shape=doubleoctagon, '
-            'style="filled", fillcolor="#FFEBEE"];'
-        )
-        for node in public_enis:
-            out.append(f'  "{_esc(node.id)}" -> "Internet" [label="public_ip"];')
 
     out.append("}")
     return out

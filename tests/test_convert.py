@@ -32,6 +32,7 @@ _COMMAND_FIXTURES = {
     ("elb", "describe-load-balancers"): "elb_describe-load-balancers.json",
     ("ec2", "describe-subnets"): "ec2_describe-subnets.json",
     ("ec2", "describe-vpcs"): "ec2_describe-vpcs.json",
+    ("ec2", "describe-security-groups"): "ec2_describe-security-groups.json",
 }
 
 
@@ -226,11 +227,13 @@ def test_ringed_view_data_groups_by_vpc_and_ring(graph):
     cluster = data["clusters"][0]
     assert cluster["label"] == vpc.label
     rings = cluster["rings"]
-    assert len(rings) == 3  # subnets, then ENIs, then everything else
-    assert 0 < rings[0] < rings[1] < rings[2]  # each successive ring is further out
+    # subnets, ENIs, EC2/LB, then the reachability-source ring (internet/CIDR/SG) — §5.5.
+    assert len(rings) == 4
+    assert 0 < rings[0] < rings[1] < rings[2] < rings[3]  # each successive ring is further out
 
     pos = {n["id"]: n for n in data["nodes"]}
-    # VPC at the center; subnets on ring 1; ENIs on their own ring 2; everything else on ring 3.
+    reach_types = {"internet", "cidr", "security_group"}
+    # VPC at the center; subnets ring 1; ENIs ring 2; EC2/LB ring 3; reach sources ring 4.
     assert (pos[vpc.id]["x"], pos[vpc.id]["y"]) == (cluster["cx"], cluster["cy"])
     for n in graph.nodes:
         d = round(
@@ -243,6 +246,8 @@ def test_ringed_view_data_groups_by_vpc_and_ring(graph):
             assert d == round(rings[0], 1)
         elif n.type == "eni":
             assert d == round(rings[1], 1)
+        elif n.type in reach_types:
+            assert d == round(rings[3], 1)
         else:
             assert d == round(rings[2], 1)
 
@@ -392,6 +397,22 @@ def test_ringed_unassigned_nodes_form_their_own_cluster():
     assert group["eni-lonely"] == html_export._UNASSIGNED
     data = html_export._ringed_view_data(g)
     assert data["clusters"][-1]["label"] == "unassigned"
+
+
+def test_ringed_reachability_sources_form_the_outer_ring(graph):
+    # The §5.5 reachability sources (internet/CIDR/SG) sit on ring 4 — strictly outside the
+    # EC2/LB ring — of the VPC cluster whose ENIs they can reach.
+    data = html_export._ringed_view_data(graph)
+    cluster = data["clusters"][0]
+    cx, cy, rings = cluster["cx"], cluster["cy"], cluster["rings"]
+    assert len(rings) == 4
+    pos = {n["id"]: n for n in data["nodes"]}
+    reach_ids = [n.id for n in graph.nodes if n.type in {"internet", "cidr", "security_group"}]
+    assert reach_ids  # the fixture produces reachability sources
+    for nid in reach_ids:
+        d = ((pos[nid]["x"] - cx) ** 2 + (pos[nid]["y"] - cy) ** 2) ** 0.5
+        assert round(d, 1) == round(rings[3], 1)  # on the outermost ring
+    assert rings[3] > rings[2]  # outside the EC2/LB ring
 
 
 def test_ringed_build_is_deterministic(graph):

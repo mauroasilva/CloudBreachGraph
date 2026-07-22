@@ -8,6 +8,8 @@ The traversal follows the order requested in ``docs/01_overview.md`` and the rul
    priority order in §5.4 and recording which rule fired in the edge's ``match_rule``.
 3. Map each ENI to its **subnet** (``in_subnet``).
 4. Connect each subnet to its **VPC** (``in_vpc``).
+5. Read each ENI's **security-group inbound rules** and add a reachability *source* node per
+   distinct source (internet / CIDR / referencing SG) with a ``can_reach`` edge (§5.5).
 
 Referenced-but-missing subnets, VPCs, instances and load balancers become ``synthetic`` /
 ``unresolved`` placeholder nodes so no edge ever dangles.
@@ -24,12 +26,16 @@ from ..model.resources import (
     Ec2Instance,
     Elbv2LoadBalancer,
     Eni,
+    SecurityGroup,
     Subnet,
     Vpc,
 )
 
 # Interface types that signal an LB-owned ENI even when the description didn't resolve (§5.4.3).
 _LB_INTERFACE_TYPES = {"network_load_balancer", "gateway_load_balancer"}
+
+# CIDRs that mean "the entire internet" — a rule allowing one exposes the ENI to the world (§5.5).
+_INTERNET_CIDRS = {"0.0.0.0/0", "::/0"}
 
 
 class _LoadBalancerLike(Protocol):
@@ -169,6 +175,12 @@ def build_graph(collected: dict[str, Any], *, include_orphans: bool = False) -> 
     elbv2_by_token = {lb.elb_token: lb for lb in elbv2 if lb.elb_token}
     classic_by_name = {lb.name: lb for lb in classic if lb.name}
 
+    security_groups = {
+        sg.id: sg
+        for sg in map(SecurityGroup.from_collected, collected.get("security_groups", []))
+        if sg.id
+    }
+
     # 1. Anchor: every ENI is a node.
     for eni in enis:
         graph.add_node(_eni_node(eni))
@@ -204,7 +216,12 @@ def build_graph(collected: dict[str, Any], *, include_orphans: bool = False) -> 
         _ensure_vpc_node(graph, vpc_id, vpcs)
         graph.add_edge(Edge(source=subnet_id, target=vpc_id, relationship="in_vpc"))
 
-    # 5. Orphans — only when requested: surface every collected resource that no ENI references,
+    # 5. Reachability (§5.5): read each ENI's security-group inbound rules to find who can reach
+    #    it, and add a source node + ``can_reach`` edge per distinct source. Always on — it is the
+    #    point of this pass, not an orphan extra.
+    _map_reachability(graph, enis, security_groups)
+
+    # 6. Orphans — only when requested: surface every collected resource that no ENI references,
     #    as an isolated node. Re-adding an already-referenced resource is an idempotent merge, so
     #    this cleanly adds just the unreferenced ones (VPCs with no subnet, instances with no ENI,
     #    load balancers with no ENI). Instances and LBs have no outgoing edges in this model, so an
@@ -288,6 +305,75 @@ def _attribute_eni(
 
     # Otherwise: no compute/LB attachment (NAT gateway, VPC endpoint, RDS, Lambda, ...).
     # The ENI node is already tagged with its InterfaceType — do not invent an attachment.
+
+
+def _map_reachability(
+    graph: Graph,
+    enis: list[Eni],
+    security_groups: dict[str, SecurityGroup],
+) -> None:
+    """Add reachability *source* nodes + ``can_reach`` edges from each ENI's inbound rules (§5.5).
+
+    For every ENI, each of its security groups' **inbound** rules names one or more sources that
+    can connect to it. Each distinct source becomes a node with a ``can_reach`` edge (source ->
+    ENI), and the edge's ``ports`` attribute summarises the protocol/port ranges that reach it:
+
+    * a rule open to the whole internet (``0.0.0.0/0`` or ``::/0``) -> a dedicated **per-ENI**
+      ``internet`` node (id ``internet:<eni-id>``). We deliberately do **not** share one global
+      Internet node: every internet-facing ENI would fan into it, and those long crossing spokes
+      are exactly what a per-ENI node avoids (``CHANGE REQUEST``).
+    * any other CIDR -> a **shared** ``cidr`` node (id ``cidr:<cidr>``), so one source range that
+      reaches several ENIs reads as a single node with a spoke to each.
+    * a referencing security group (``UserIdGroupPairs``) -> a shared ``security_group`` node
+      (id ``sg-source:<group-id>``), labelled with the peer SG's name when it was collected.
+
+    Load-balancer reachability is captured through this same path: an ALB/Classic-ELB ENI carries
+    its load balancer's security groups in ``eni.security_groups``, so the LB's inbound rules flow
+    in as the fronting ENI's reachability sources with no special case.
+    """
+    # (source_id, eni_id) -> the set of port labels that source reaches the ENI on. Aggregated
+    # first (rather than one edge per rule) so the single deduped edge carries every port.
+    reach: dict[tuple[str, str], set[str]] = {}
+    source_nodes: dict[str, Node] = {}
+
+    for eni in enis:
+        for sg_id in eni.security_groups:
+            sg = security_groups.get(sg_id)
+            if sg is None:  # SG not in the collected set (e.g. missing permission) — skip, no guess
+                continue
+            for rule in sg.ingress:
+                port = rule.port_label()
+                for cidr in (*rule.cidrs, *rule.ipv6_cidrs):
+                    if cidr in _INTERNET_CIDRS:
+                        sid = f"internet:{eni.id}"  # per-ENI, never shared
+                        source_nodes.setdefault(
+                            sid, Node(id=sid, type="internet", label="Internet")
+                        )
+                    else:
+                        sid = f"cidr:{cidr}"  # shared across ENIs
+                        source_nodes.setdefault(
+                            sid, Node(id=sid, type="cidr", label=cidr, attributes={"cidr": cidr})
+                        )
+                    reach.setdefault((sid, eni.id), set()).add(port)
+                for gid in rule.referenced_group_ids:
+                    sid = f"sg-source:{gid}"  # shared across ENIs
+                    peer = security_groups.get(gid)
+                    label = peer.name if peer and peer.name else gid
+                    source_nodes.setdefault(
+                        sid,
+                        Node(
+                            id=sid, type="security_group", label=label, attributes={"group_id": gid}
+                        ),
+                    )
+                    reach.setdefault((sid, eni.id), set()).add(port)
+
+    for sid in sorted(source_nodes):
+        graph.add_node(source_nodes[sid])
+    for sid, eni_id in sorted(reach):
+        ports = ", ".join(sorted(reach[(sid, eni_id)]))
+        graph.add_edge(
+            Edge(source=sid, target=eni_id, relationship="can_reach", attributes={"ports": ports})
+        )
 
 
 def _ensure_subnet_node(graph: Graph, subnet_id: str, subnets: dict[str, Subnet]) -> None:

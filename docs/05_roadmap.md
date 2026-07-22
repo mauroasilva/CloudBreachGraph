@@ -65,7 +65,15 @@ from `log_archive`, in one run.
 ## Other candidate roles (not yet designed)
 - `dns` — Route 53 / Resolver, often centralized in a networking account.
 - `cloudtrail` — organization trail in a management/audit account.
-- `security_groups` / `route_tables` — deeper networking, likely part of `network`.
+- `route_tables` — deeper networking, likely part of `network`. Pairing route reachability with
+  the security-group reachability already in `network` would let the map distinguish an ENI that
+  is *allowed* by a `0.0.0.0/0` rule from one that is *actually routable* from the internet.
+
+**Shipped since v1:** **security groups** landed as part of the `network` role (not a separate
+role) — `collect_security_groups` feeds the ENI *reachability* mapping (source `internet`/`cidr`/
+`security_group` nodes + `can_reach` edges, `02_architecture.md §5.5`). It was folded into
+`network` rather than made its own role because SGs live in the same account as the ENIs they
+govern; see `learnings_2026-07-22_eni-reachability-mapping.md`.
 
 Each follows the same recipe. When any of these is picked up, add a short section here and, per
 the build process, do it in its **own** phase with its **own** `learnings_phaseX.md`.

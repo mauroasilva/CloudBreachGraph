@@ -19,6 +19,7 @@ _COMMAND_FIXTURES = {
     ("elb", "describe-load-balancers"): "elb_describe-load-balancers.json",
     ("ec2", "describe-subnets"): "ec2_describe-subnets.json",
     ("ec2", "describe-vpcs"): "ec2_describe-vpcs.json",
+    ("ec2", "describe-security-groups"): "ec2_describe-security-groups.json",
 }
 
 
@@ -107,6 +108,25 @@ def test_collect_subnets_and_vpcs(fake_aws):
     assert default_vpc["VpcId"] == "vpc-0defdefdefdefdefd"
 
 
+def test_collect_security_groups_normalizes(fake_aws):
+    sgs = collectors.collect_security_groups("prod-audit", "us-east-1")
+    by_id = {s["GroupId"]: s for s in sgs}
+    assert set(by_id) == {"sg-0aaa0001", "sg-0aaa0002"}
+
+    web = by_id["sg-0aaa0001"]
+    assert web["GroupName"] == "web"
+    # Only ingress (IpPermissions) is kept; egress is dropped.
+    assert "IpPermissionsEgress" not in web
+    # The 0.0.0.0/0 HTTPS rule, the bastion CIDR rule, and the peer-SG rule are all present.
+    protos = {
+        (p["FromPort"], tuple(r["CidrIp"] for r in p["IpRanges"])) for p in web["IpPermissions"]
+    }
+    assert (443, ("0.0.0.0/0",)) in protos
+    assert (22, ("203.0.113.0/24",)) in protos
+    peer_rule = next(p for p in web["IpPermissions"] if p["UserIdGroupPairs"])
+    assert peer_rule["UserIdGroupPairs"][0]["GroupId"] == "sg-0aaa0002"
+
+
 def test_role_registry_is_consistent():
     # Each role's collectors and result keys line up 1:1.
     for role, funcs in collectors.ROLE_COLLECTORS.items():
@@ -118,6 +138,7 @@ def test_role_registry_is_consistent():
         "load_balancers_classic",
         "subnets",
         "vpcs",
+        "security_groups",
     ]
 
 
@@ -140,6 +161,7 @@ def test_collect_all_bundle_shape_and_provenance(fake_aws):
         "load_balancers_classic",
         "subnets",
         "vpcs",
+        "security_groups",
     }
     assert bundle["meta"] == {
         "target": "prod",

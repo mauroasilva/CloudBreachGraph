@@ -68,6 +68,7 @@ flags. The AWS CLI auto-paginates by default, returning the full result set.
 | Load Balancers (v1: Classic) | `aws elb describe-load-balancers --region <r>` | `.LoadBalancerDescriptions[]` |
 | Subnets | `aws ec2 describe-subnets --region <r>` | `.Subnets[]` |
 | VPCs | `aws ec2 describe-vpcs --region <r>` | `.Vpcs[]` |
+| Security Groups | `aws ec2 describe-security-groups --region <r>` | `.SecurityGroups[]` |
 | Caller identity (account check) | `aws sts get-caller-identity` | `.Account`, `.Arn` |
 
 Notes for the collection layer (Phase 1):
@@ -109,6 +110,12 @@ Notes for the collection layer (Phase 1):
 **Subnet** (`.Subnets[]`): `SubnetId`, `VpcId`, `CidrBlock`, `AvailabilityZone`, `Tags[]`
 
 **VPC** (`.Vpcs[]`): `VpcId`, `CidrBlock`, `IsDefault`, `Tags[]`
+
+**Security Group** (`.SecurityGroups[]`): `GroupId`, `GroupName`, `VpcId`, `Description`,
+`IpPermissions[]` (**ingress** — what we depend on for reachability; egress is dropped). Each
+`IpPermissions[]` entry has `IpProtocol` (`"-1"` = all traffic), `FromPort`/`ToPort`, and its
+sources: `IpRanges[].CidrIp` (IPv4), `Ipv6Ranges[].CidrIpv6` (IPv6), and `UserIdGroupPairs[].GroupId`
+(a referencing security group). An ENI's `Groups[].GroupId` (see above) says which SGs apply to it.
 
 ## 5. Relationship-mapping rules (THE CORE — Phase 2)
 
@@ -159,22 +166,55 @@ invent an attachment.
 > is the documented, stable way to attribute ELB ENIs; verify against a real capture and note
 > any account where it didn't hold. Never attribute an ENI to both an instance and an LB.
 
+### 5.5 ENI reachability — who can connect to it (security-group inbound rules)
+
+Beyond *what an ENI is*, the map records *how each ENI is reachable*. For every ENI, read each
+of its security groups' (`Eni.security_groups` → `SecurityGroup.ingress`) **inbound** rules and
+add a **reachability source node** plus a `can_reach` edge (**source → ENI**) for each distinct
+source the rule allows. The edge's `ports` attribute summarises the protocol/port ranges that
+reach the ENI (e.g. `"tcp/443"`, `"tcp/80, tcp/443"`, `"all"` for the `-1` protocol).
+
+Load-balancer reachability rides this same path with no special case: an ALB / Classic-ELB ENI
+carries its load balancer's security groups in its own `Groups[]`, so the LB's inbound rules flow
+in as the fronting ENI's reachability sources.
+
+Three source kinds (node `type` in parentheses):
+
+1. **The whole internet** (`internet`) — a rule open to `0.0.0.0/0` **or** `::/0`. Emit a
+   **per-ENI** node with id `internet:<eni-id>` and label `Internet`. These are **never shared**:
+   a single global Internet node would collect a spoke from every internet-facing ENI, and those
+   long crossing edges are exactly what a per-ENI node avoids.
+2. **A specific CIDR** (`cidr`) — any other IPv4/IPv6 range. Emit a **shared** node with id
+   `cidr:<cidr>` (attribute `cidr`), so one source range reaching several ENIs reads as one node
+   with a spoke to each.
+3. **A referencing security group** (`security_group`) — a `UserIdGroupPairs[].GroupId`. Emit a
+   **shared** node with id `sg-source:<group-id>` (attribute `group_id`), labelled with the peer
+   SG's name when it was collected.
+
+An ENI with no security groups, or one whose SGs weren't collected, gets **no** reachability
+edges — never invent one. This pass is **always on** (independent of `--include-orphans`); it is
+the point of the reachability feature. Reachability does **not** gate on a route to the ENI (a
+public IP or route-table analysis) — the SG inbound rule is the recorded source of truth for
+"who is allowed to connect", which is what the map answers.
+
 ## 6. Graph data model (Phase 2 defines, Phase 3 consumes)
 
 A minimal, serialization-friendly model:
 
 ```
 Node:
-  id:    str            # eni-..., i-..., subnet-..., vpc-..., or LB arn/name
+  id:    str            # eni-..., i-..., subnet-..., vpc-..., LB arn/name, or a reachability
+                        #   source: internet:<eni>, cidr:<cidr>, sg-source:<gid>
   type:  str            # "eni" | "ec2_instance" | "load_balancer" | "subnet" | "vpc"
+                        #   | "internet" | "cidr" | "security_group"   (reachability sources, §5.5)
   label: str            # human-friendly (Name tag or id)
   attributes: dict      # type-specific metadata (state, cidr, interface_type, synthetic, ...)
 
 Edge:
   source: str           # node id
   target: str           # node id
-  relationship: str     # "attached_to" | "in_subnet" | "in_vpc"
-  attributes: dict      # e.g. {"match_rule": "elbv2_description"}
+  relationship: str     # "attached_to" | "in_subnet" | "in_vpc" | "can_reach" (§5.5)
+  attributes: dict      # e.g. {"match_rule": "elbv2_description"} or {"ports": "tcp/443"}
 
 Graph:
   nodes: list[Node]     # unique by id
@@ -194,8 +234,12 @@ Requirements:
 
 - **JSON** (`graph.json`): `Graph.to_dict()`, pretty-printed, stable ordering.
 - **Graphviz DOT** (`graph.dot`): nodes grouped/colored by type; edge labels show the
-  relationship (and `match_rule` for LB edges when useful). Consider `subgraph cluster_*`
-  per VPC so the layout groups subnets/ENIs inside their VPC visually.
+  relationship (and `match_rule` for LB edges, `ports` for `can_reach` edges, when useful).
+  Consider `subgraph cluster_*` per VPC so the layout groups subnets/ENIs inside their VPC
+  visually. Reachability sources (`internet`/`cidr`/`security_group`, §5.5) are top-level nodes
+  linked to the ENIs they reach; a per-ENI `internet` node marks full `0.0.0.0/0` exposure. (This
+  replaced the earlier public-IP-only shared `Internet` decoration; a public IP still shows on the
+  ENI's own `Public IP:` label line.)
 - **Optional render:** if the `dot` binary is on PATH, offer `--render png|svg` that shells
   out to `dot -T<fmt>`. Absence of `dot` must degrade gracefully (still write the `.dot`).
 - **Interactive HTML** (`graph.html`, opt-in via `--html`, *not* produced by default):
@@ -222,14 +266,17 @@ Requirements:
   writers and lives in `graph_io.py`: `load_json`/`graph_from_dict` is a **lossless** inverse
   of `Graph.to_dict()`; `load_dot` is a **best-effort** parser for *this tool's own* DOT
   (recovers node id/type/name, public/synthetic flags, the one display attribute per type,
-  and every edge + `match_rule`; folds the DOT-only `Internet` decoration back into
-  `public_ips`). The converter reuses the same `write_html` size guard and `.dot` fallback.
-  Its `--ringed` flag selects an alternative **concentric-ringed** layout
+  and every edge + `match_rule`/`ports`; reachability sources (`internet`/`cidr`/`security_group`,
+  §5.5) round-trip as ordinary nodes. (Legacy `.dot` files with the old shared `Internet`
+  decoration still fold back into `public_ips`.) The converter reuses the same `write_html` size
+  guard and `.dot` fallback. Its `--ringed` flag selects an alternative **concentric-ringed** layout
   (`html_export.write_ringed_html`/`build_ringed_html`): each VPC is a cluster center, ringed
   by its subnets, then its ENIs on a dedicated ring, then everything else under that VPC (EC2
-  instances, load balancers). The ENI ring is the angular anchor: each subnet is placed at the
-  mean angle of the ENIs it contains (ENIs are grouped by subnet on their ring) and each
-  EC2/LB at the mean angle of the ENIs attached to it, so both stay radially next to their
+  instances, load balancers), then a new **outermost** ring of its reachability sources (§5.5).
+  The ENI ring is the angular anchor: each subnet is placed at the
+  mean angle of the ENIs it contains (ENIs are grouped by subnet on their ring), each
+  EC2/LB at the mean angle of the ENIs attached to it, and each reachability source at the mean
+  angle of the ENIs it can reach, so all stay radially next to their
   interfaces; orphan resources collect into a final ring-cluster (empty center). Ring positions are
   computed deterministically in Python (no in-browser force sim), and the same `MAX_NODES`/
   `MAX_HTML_BYTES` guard and `.dot` fallback apply. The `--optimize-passes N` flag runs up to
@@ -399,7 +446,7 @@ form an extensible registry; new features add new roles without changing the con
 
 | Role | Resources | Status |
 |------|-----------|--------|
-| `network` | ENIs, EC2 instances, load balancers, subnets, VPCs (everything in §3 today) | **v1** |
+| `network` | ENIs, EC2 instances, load balancers, subnets, VPCs, security groups (everything in §3 today) | **v1** |
 | `flow_logs` | VPC Flow Logs (CloudWatch Logs log groups / S3), the flow-log configs on VPCs/subnets/ENIs | **future** (design for it now, don't build in v1) |
 
 Additional future roles (e.g. `dns`, `cloudtrail`) plug in the same way. See `05_roadmap.md`.
@@ -490,6 +537,7 @@ ROLE_COLLECTORS: dict[str, list[Collector]] = {
         collect_load_balancers_classic,  # aws elb describe-load-balancers     -> .LoadBalancerDescriptions[]
         collect_subnets,              # aws ec2   describe-subnets              -> .Subnets[]
         collect_vpcs,                 # aws ec2   describe-vpcs                 -> .Vpcs[]
+        collect_security_groups,      # aws ec2   describe-security-groups      -> .SecurityGroups[]
     ],
     # ── future (Phase 4; do NOT implement in v1, see 05_roadmap.md) ───────────────
     # "flow_logs": [
@@ -501,7 +549,7 @@ ROLE_COLLECTORS: dict[str, list[Collector]] = {
 # The output key each role writes into the collected bundle (see §11.7).
 ROLE_RESULT_KEYS: dict[str, list[str]] = {
     "network": ["network_interfaces", "ec2_instances", "load_balancers_v2",
-                "load_balancers_classic", "subnets", "vpcs"],
+                "load_balancers_classic", "subnets", "vpcs", "security_groups"],
     # "flow_logs": ["flow_logs", "log_destinations"],  # future
 }
 ```
