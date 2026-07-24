@@ -30,6 +30,9 @@ _COMMAND_FIXTURES = {
     ("ec2", "describe-route-tables"): "ec2_describe-route-tables.json",
     ("ec2", "describe-nat-gateways"): "ec2_describe-nat-gateways.json",
     ("ec2", "describe-vpc-endpoints"): "ec2_describe-vpc-endpoints.json",
+    ("ec2", "describe-flow-logs"): "ec2_describe-flow-logs.json",
+    ("cloudtrail", "lookup-events"): "cloudtrail_lookup-events.json",
+    ("logs", "filter-log-events"): "logs_filter-log-events.json",
 }
 
 _CONFIG = """
@@ -301,6 +304,63 @@ def test_optimize_passes_negative_errors(tmp_path):
         ["--from-cache", str(FIXTURES), "--output-dir", str(out), "--optimize-passes", "-1"]
     )
     assert rc == 2
+
+
+# --------------------------------------------------------------------------- #
+# --flow-logs (§5.7): IP history + VPC flow-log analysis
+# --------------------------------------------------------------------------- #
+def test_flow_logs_off_by_default(tmp_path):
+    out = tmp_path / "out"
+    assert cli.main(["--from-cache", str(FIXTURES), "--output-dir", str(out)]) == 0
+    data = json.loads((out / "graph.json").read_text())
+    types = {n["type"] for n in data["nodes"]}
+    assert not types & {"flow_log", "log_group", "log_bucket", "flow_peer"}
+
+
+def test_flow_logs_flag_adds_history_config_and_connections(tmp_path):
+    out = tmp_path / "out"
+    rc = cli.main(["--from-cache", str(FIXTURES), "--flow-logs", "--output-dir", str(out)])
+    assert rc == 0
+    data = json.loads((out / "graph.json").read_text())
+    nodes = {n["id"]: n for n in data["nodes"]}
+
+    # IP history folded onto an ENI node.
+    assert nodes["eni-00instance0000001"]["attributes"]["ip_allocations"]
+    # Flow-log config + destinations.
+    assert nodes["fl-0abc00000000001"]["type"] == "flow_log"
+    assert nodes["/vpc/flowlogs/prod"]["type"] == "log_group"
+
+    edges = {(e["source"], e["target"], e["relationship"]) for e in data["edges"]}
+    # An ENI->ENI connection discovered from the flow logs.
+    assert (
+        "eni-00instance0000001",
+        "eni-00nlb00000000003",
+        "connects_to",
+    ) in edges
+    # An external peer connecting in.
+    assert nodes["flow-peer:203.0.113.5"]["type"] == "flow_peer"
+    assert data["meta"]["flow_log_window_days"] == 60
+
+
+def test_flow_logs_live_run_uses_role_collectors(tmp_path, fake_aws):
+    cfg = _write_config(tmp_path)
+    rc = cli.main(
+        [
+            "--account",
+            "workload_prod",
+            "--flow-logs",
+            "--config",
+            cfg,
+            "--no-verify-account",
+            "--output-dir",
+            str(tmp_path / "out"),
+        ]
+    )
+    assert rc == 0
+    ran = {tuple(c["args"][:2]) for c in fake_aws.calls}
+    assert ("ec2", "describe-flow-logs") in ran
+    assert ("cloudtrail", "lookup-events") in ran
+    assert ("logs", "filter-log-events") in ran
 
 
 def test_all_accounts_writes_one_graph_each(tmp_path, fake_aws):

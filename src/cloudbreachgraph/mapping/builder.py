@@ -23,12 +23,16 @@ from __future__ import annotations
 from typing import Any, Protocol
 
 from .. import __version__
+from ..aws.collectors import FLOW_LOG_MAX_LOOKBACK_DAYS
 from ..model.graph import Edge, Graph, Node
 from ..model.resources import (
     ClassicLoadBalancer,
     Ec2Instance,
     Elbv2LoadBalancer,
     Eni,
+    FlowLog,
+    FlowLogRecord,
+    IpAllocation,
     NatGateway,
     RouteTable,
     SecurityGroup,
@@ -36,6 +40,7 @@ from ..model.resources import (
     Vpc,
     VpcEndpoint,
 )
+from . import flowlogs
 from .routing import RouteResolver
 
 # Interface types that signal an LB-owned ENI even when the description didn't resolve (§5.4.3).
@@ -192,6 +197,7 @@ def build_graph(
     *,
     include_orphans: bool = False,
     show_security_groups: bool = True,
+    map_flow_logs: bool = False,
 ) -> Graph:
     """Build the topology graph from a Phase 1 ``collect_all()`` bundle.
 
@@ -210,6 +216,13 @@ def build_graph(
     * **False** (``--no-security-groups``) — SGs are hidden and only the **IPs behind** them are
       brought forward, connected **directly** to the ENIs, with the routability split (§5.6). A
       peer-SG reference is expanded to the private IPs of that SG's member ENIs (``/32`` CIDRs).
+
+    ``map_flow_logs`` (the ``flow_logs`` role, §5.7) folds IP-allocation history onto the ENI nodes
+    and analyses the collected VPC flow logs: it adds the flow-log configuration/destination nodes
+    and, for every observed connection, a ``connects_to`` edge to the peer — **ENI → ENI** when the
+    peer IP belongs to another collected ENI, otherwise to a ``flow_peer`` node. It reads the
+    ``flow_logs`` / ``ip_allocations`` / ``flow_log_records`` bundle keys; when they are absent (a
+    run without ``--flow-logs``) it is a no-op.
     """
     meta = dict(collected.get("meta", {}))
     meta.setdefault("tool_version", __version__)
@@ -324,6 +337,15 @@ def build_graph(
         for vpce in vpc_endpoints:
             if vpce.id:
                 graph.add_node(_vpc_endpoint_node(vpce))
+
+    # 7. Flow logs (§5.7): IP history + VPC-log configuration + observed connections. Only when the
+    #    flow_logs role ran (``--flow-logs``); otherwise the bundle keys are absent and this no-ops.
+    if map_flow_logs:
+        flow_log_models = [FlowLog.from_collected(x) for x in collected.get("flow_logs", [])]
+        allocations = [IpAllocation.from_collected(x) for x in collected.get("ip_allocations", [])]
+        records = [FlowLogRecord.from_collected(x) for x in collected.get("flow_log_records", [])]
+        flowlogs.map_flow_logs(graph, enis, flow_log_models, allocations, records)
+        graph.meta.setdefault("flow_log_window_days", FLOW_LOG_MAX_LOOKBACK_DAYS)
 
     return graph
 

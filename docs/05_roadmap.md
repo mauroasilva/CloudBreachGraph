@@ -19,7 +19,19 @@ collectors, (3) map its nodes/edges into the existing graph model, (4) let users
 an account in config. Steps 1 and 4 are pure data; the config grammar, CLI, resolver, and driver
 loop (`§11.7`) don't change.
 
-## First planned future feature: VPC Flow Logs (`flow_logs` role)
+## VPC Flow Logs (`flow_logs` role) — **SHIPPED** (opt-in via `--flow-logs`)
+
+> **Status update.** The `flow_logs` role is now implemented (see
+> `learnings_2026-07-24_vpc-logs-ip-history.md` and `docs/02_architecture.md §5.7`). It follows the
+> extension model exactly: new collectors + two registry entries (`ROLE_COLLECTORS`/
+> `ROLE_RESULT_KEYS`), a new `mapping/flowlogs.py`, and new node/edge types on the existing graph
+> model — no config-grammar change. It went **beyond** the original design below in one deliberate
+> way: it reads flow-log *record contents* (not just the destination) to derive observed
+> connections, and it uses CloudTrail `lookup-events` for IP-allocation history and `logs
+> filter-log-events` for records — read-only retrievals whose verbs aren't `describe`/`get`/`list`
+> (still non-mutating, §9). The current implementation reads all three commands from the single
+> account bound to `flow_logs` (default: the `network` account); full cross-account splitting
+> (config in the workload account, records in a log-archive account) remains the design below.
 
 ### Why it's cross-account
 VPC Flow Logs are frequently centralized: a VPC in a **workload account** publishes its flow

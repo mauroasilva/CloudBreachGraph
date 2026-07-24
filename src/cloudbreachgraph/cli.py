@@ -42,9 +42,14 @@ from .config import (
 from .mapping.builder import build_graph
 from .output import dot_export, html_export, json_export
 
-# The roles a run activates. v1 = network only; binding another role in config later means
-# extending this default (or a future --roles flag) — the rest of the pipeline is role-aware.
+# The roles a run activates. ``network`` is always on; ``--flow-logs`` adds ``flow_logs`` (§5.7).
+# The rest of the pipeline is role-aware, so this is the only place the active set is chosen.
 _ROLES: tuple[str, ...] = ("network",)
+
+
+def _active_roles(args: argparse.Namespace) -> tuple[str, ...]:
+    """The roles this run collects: always ``network``, plus ``flow_logs`` under ``--flow-logs``."""
+    return (*_ROLES, "flow_logs") if getattr(args, "flow_logs", False) else _ROLES
 
 
 # --------------------------------------------------------------------------- #
@@ -92,6 +97,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--include-orphans",
         action="store_true",
         help="also emit collected resources that no ENI references (subnets, VPCs, EC2, LBs)",
+    )
+    col.add_argument(
+        "--flow-logs",
+        action="store_true",
+        help="also gather IP-allocation history and analyse VPC flow logs (last 60 days): add "
+        "flow-log config/destination nodes and, for each observed connection, a connects_to edge "
+        "to the peer (ENI->ENI when the peer IP is another collected ENI, else a flow_peer node). "
+        "Needs extra read-only IAM: ec2:DescribeFlowLogs, cloudtrail:LookupEvents, "
+        "logs:FilterLogEvents",
     )
     col.add_argument(
         "--security-groups",
@@ -170,16 +184,18 @@ def _make_cache_reader(cache_dir: str | Path):
     return _reader
 
 
-def _collect_from_cache(cache_dir: str, region: str | None) -> dict:
+def _collect_from_cache(cache_dir: str, region: str | None, roles: tuple[str, ...]) -> dict:
     """Run the collectors against cached JSON by temporarily swapping ``runner.run_aws``."""
     resolved = ResolvedTarget(
         target=None,
-        roles={"network": ResolvedAccount(profile=None, account_id=None, region=region)},
+        roles={
+            role: ResolvedAccount(profile=None, account_id=None, region=region) for role in roles
+        },
     )
     original = runner.run_aws
     runner.run_aws = _make_cache_reader(cache_dir)  # type: ignore[assignment]
     try:
-        return collectors.collect_all(resolved, roles=_ROLES)
+        return collectors.collect_all(resolved, roles=roles)
     finally:
         runner.run_aws = original  # type: ignore[assignment]
 
@@ -187,7 +203,9 @@ def _collect_from_cache(cache_dir: str, region: str | None) -> dict:
 # --------------------------------------------------------------------------- #
 # Live collection
 # --------------------------------------------------------------------------- #
-def _collect_live(resolved: ResolvedTarget, args: argparse.Namespace) -> dict:
+def _collect_live(
+    resolved: ResolvedTarget, args: argparse.Namespace, roles: tuple[str, ...]
+) -> dict:
     # Verification defaults ON only when at least one role has a known expected account id.
     if args.verify_account is None:
         verify_enabled = any(acct.account_id for acct in resolved.roles.values())
@@ -196,7 +214,7 @@ def _collect_live(resolved: ResolvedTarget, args: argparse.Namespace) -> dict:
     if verify_enabled:
         # Resolve run_aws at call time so --from-cache/tests can swap the boundary.
         verify_target(resolved, enabled=True, run_aws=runner.run_aws)
-    return collectors.collect_all(resolved, roles=_ROLES, cache_dir=args.cache_dir)
+    return collectors.collect_all(resolved, roles=roles, cache_dir=args.cache_dir)
 
 
 # --------------------------------------------------------------------------- #
@@ -207,6 +225,7 @@ def _write_outputs(collected: dict, out_dir: Path, stem: str, args: argparse.Nam
         collected,
         include_orphans=args.include_orphans,
         show_security_groups=args.security_groups,
+        map_flow_logs=args.flow_logs,
     )
     json_path = json_export.write_json(graph, out_dir / f"{stem}.json")
     dot_path = dot_export.write_dot(graph, out_dir / f"{stem}.dot")
@@ -251,10 +270,11 @@ def _run_all_accounts(cfg: AccountConfig, out_dir: Path, args: argparse.Namespac
     if cfg.is_empty or not cfg.accounts:
         print("cloudbreachgraph: --all-accounts needs a config with [accounts.*]", file=sys.stderr)
         return 2
+    roles = _active_roles(args)
     for alias in sorted(cfg.accounts):
-        resolved = resolve_target(cfg, account=alias, region=args.region, roles=_ROLES)
+        resolved = resolve_target(cfg, account=alias, region=args.region, roles=roles)
         print(f"== account {alias} ==")
-        collected = _collect_live(resolved, args)
+        collected = _collect_live(resolved, args, roles)
         _write_outputs(collected, out_dir, f"graph.{alias}", args)
     return 0
 
@@ -282,9 +302,11 @@ def main(argv: list[str] | None = None) -> int:
             )
 
     try:
+        roles = _active_roles(args)
+
         # Offline: build from cached JSON, no config/credentials needed.
         if args.from_cache:
-            collected = _collect_from_cache(args.from_cache, args.region)
+            collected = _collect_from_cache(args.from_cache, args.region, roles)
             _write_outputs(collected, out_dir, "graph", args)
             return 0
 
@@ -299,9 +321,9 @@ def main(argv: list[str] | None = None) -> int:
             account=args.account,
             profile_override=args.profile,
             region=args.region,
-            roles=_ROLES,
+            roles=roles,
         )
-        collected = _collect_live(resolved, args)
+        collected = _collect_live(resolved, args, roles)
         _write_outputs(collected, out_dir, "graph", args)
         return 0
 

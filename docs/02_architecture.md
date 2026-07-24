@@ -74,7 +74,16 @@ flags. The AWS CLI auto-paginates by default, returning the full result set.
 | Route Tables | `aws ec2 describe-route-tables --region <r>` | `.RouteTables[]` |
 | NAT Gateways | `aws ec2 describe-nat-gateways --region <r>` | `.NatGateways[]` |
 | VPC Endpoints | `aws ec2 describe-vpc-endpoints --region <r>` | `.VpcEndpoints[]` |
+| VPC Flow Logs config (`flow_logs`) | `aws ec2 describe-flow-logs --region <r>` | `.FlowLogs[]` |
+| IP-allocation history (`flow_logs`) | `aws cloudtrail lookup-events --lookup-attributes=AttributeKey=EventName,AttributeValue=CreateNetworkInterface` | `.Events[].CloudTrailEvent` |
+| Flow-log records (`flow_logs`) | `aws logs filter-log-events --log-group-name=<g> --start-time=<ms>` | `.events[].message` |
 | Caller identity (account check) | `aws sts get-caller-identity` | `.Account`, `.Arn` |
+
+The three `flow_logs`-role commands are opt-in (`--flow-logs`, §5.7). They are **read-only**
+retrievals — `cloudtrail lookup-events` and `logs filter-log-events` retrieve, never mutate — even
+though their verbs aren't the usual `describe`/`list`/`get`/`head` (the read-only guarantee is about
+*not mutating*, §9). Value-carrying flags are passed in `--flag=value` form so the cache-key /
+`--from-cache` file naming (which keys on the positional sub-command) stays stable.
 
 Notes for the collection layer (Phase 1):
 
@@ -274,6 +283,52 @@ simulator — NACLs, TGW route propagation, VPN/DX propagation are out of scope)
   (routable via the local route). `RouteResolver.classify` keeps a `security_group` branch as a
   defensive default, but the hidden shape no longer feeds it one.
 
+### 5.7 Flow-log analysis — IP history + observed connections (`flow_logs` role)
+
+The `network` rules above map what the topology *is*. The **`flow_logs`** role (opt-in via
+`--flow-logs`; collectors in `aws/collectors.py`, mapping in `mapping/flowlogs.py`,
+`build_graph(map_flow_logs=True)`) adds what the topology *did* — the traffic actually observed
+to/from each ENI — plus where the logs that record it live. It reads three things and folds them
+into the already-built graph:
+
+1. **IP history.** `cloudtrail lookup-events` for `CreateNetworkInterface` gives *when* each ENI's
+   private IP was allocated. Each ENI node gains an `ip_allocations` attribute
+   (`[{ip, allocated_at}]`). The **earliest** allocation time is the per-ENI lower bound for the
+   flow-log window: a flow record with a capture-window `start` *before* it is dropped — that
+   traffic belonged to a **different interface reusing the address**, not this ENI.
+
+2. **Flow-log configuration** (`ec2 describe-flow-logs`, the "where each VPC stores its logs"
+   config). Per flow log: a `flow_log` node (attributes `resource_id`, `destination_type`,
+   `traffic_type`, `status`); a **destination** node — `log_group` (CloudWatch Logs) or
+   `log_bucket` (S3), keyed by the log-group name / S3 ARN; and edges `logs_to`
+   (logged resource → flow_log, added only when the resource node exists so nothing dangles) and
+   `delivers_to` (flow_log → destination).
+
+3. **Observed connections** (`logs filter-log-events`, up to `FLOW_LOG_MAX_LOOKBACK_DAYS = 60` days
+   of default-format records from each CloudWatch flow-log group). For each record captured on a
+   collected ENI `A`, the *peer* end (the address that isn't one of `A`'s private IPs) becomes the
+   other node of a directed **`connects_to`** edge — `peer → A` when `A` is the destination (*what
+   connected to it*), `A → peer` when `A` is the source (*what it connects to*):
+   - if the peer IP belongs to **another collected ENI `B`**, the edge runs **ENI → ENI** directly
+     (`B → A` or `A → B`) — the acceptance-criteria "if the connecting IP belongs to another ENI,
+     add an edge from one ENI to another";
+   - otherwise the peer is an external **`flow_peer`** node (`flow-peer:<ip>`).
+   Ports are aggregated per directed edge into a `ports` label (e.g. `tcp/443`), with
+   `via = "flow_log"` so a `connects_to` edge is distinguishable from a reachability edge. Records
+   with a missing address (`-`, e.g. NODATA/skipped) are dropped; the record's own `interface-id`
+   (field 2) identifies the home ENI, and direction is decided by matching `srcaddr`/`dstaddr`
+   against that ENI's private IPs.
+
+**Scope & simplifications.** Only the **CloudWatch-Logs** record path is analysed for connections;
+an S3 destination is shown as a `log_bucket` node but its objects are not fetched (that would need
+per-object `s3api get-object`). All three commands run against the account bound to the `flow_logs`
+role (§11) — which defaults to the same account as `network`, so the common single-account case
+needs no config. Reading flow-log *records* (not just their config/destination) goes beyond the
+original roadmap's "show the destination, don't parse traffic" line — a deliberate extension for
+this feature. Determinism holds: allocation times and record timestamps come from the data, and the
+60-day bound is applied at the *collection* query (not from wall-clock in the output), so a fixed
+capture always yields the same graph.
+
 ## 6. Graph data model (Phase 2 defines, Phase 3 consumes)
 
 A minimal, serialization-friendly model:
@@ -285,6 +340,7 @@ Node:
   type:  str            # "eni" | "ec2_instance" | "load_balancer" | "nat_gateway"
                         #   | "vpc_endpoint" | "subnet" | "vpc"
                         #   | "security_group" | "internet" | "cidr"   (reachability, §5.5)
+                        #   | "flow_log" | "log_group" | "log_bucket" | "flow_peer"  (flow logs, §5.7)
   label: str            # human-friendly (Name tag or id)
   attributes: dict      # type-specific metadata (state, cidr, interface_type, synthetic, ...)
 
@@ -293,6 +349,7 @@ Edge:
   target: str           # node id
   relationship: str     # "attached_to" | "in_subnet" | "in_vpc" | "secured_by" (ENI->SG, §5.5)
                         #   | "can_reach" / "routable_can_reach" / "not_routable_can_reach" (§5.5/§5.6)
+                        #   | "logs_to" / "delivers_to" / "connects_to" (flow logs, §5.7)
   attributes: dict      # e.g. {"match_rule": "elbv2_description"} or {"ports": "tcp/443"}
 
 Graph:
@@ -556,7 +613,7 @@ form an extensible registry; new features add new roles without changing the con
 | Role | Resources | Status |
 |------|-----------|--------|
 | `network` | ENIs, EC2 instances, load balancers, NAT gateways, VPC endpoints, subnets, VPCs, security groups, route tables (everything in §3 today) | **v1** |
-| `flow_logs` | VPC Flow Logs (CloudWatch Logs log groups / S3), the flow-log configs on VPCs/subnets/ENIs | **future** (design for it now, don't build in v1) |
+| `flow_logs` | VPC Flow Log config + destinations (CloudWatch log groups / S3), IP-allocation history (CloudTrail), and analysed flow records → observed connections (§5.7) | **shipped** (opt-in via `--flow-logs`) |
 
 Additional future roles (e.g. `dns`, `cloudtrail`) plug in the same way. See `05_roadmap.md`.
 

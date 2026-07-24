@@ -86,6 +86,11 @@ _TYPE_COLORS: dict[str, str] = {
     "internet": "#EF9A9A",
     "cidr": "#FFE082",
     "security_group": "#F48FB1",
+    # Flow logs (docs/02_architecture.md §5.7).
+    "flow_log": "#4FC3F7",
+    "log_group": "#4DD0E1",
+    "log_bucket": "#FFB74D",
+    "flow_peer": "#B0BEC5",
 }
 _DEFAULT_COLOR = "#CFD8DC"
 
@@ -153,6 +158,8 @@ def _detail_line(node_type: str, attrs: dict) -> str:
         return str(attrs["cidr"])
     if node_type == "ec2_instance" and attrs.get("state"):
         return str(attrs["state"])
+    if node_type == "flow_log" and attrs.get("destination_type"):
+        return str(attrs["destination_type"])
     return ""
 
 

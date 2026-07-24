@@ -140,6 +140,13 @@ cloudbreachgraph --from-cache tests/fixtures --output-dir out/
 --cache-dir DIR            also write raw AWS JSON responses here
 --from-cache DIR           build from cached AWS JSON in DIR, no live calls
 --include-orphans          also emit collected resources no ENI references
+--flow-logs                also gather IP-allocation history and analyse VPC flow
+                             logs (last 60 days): add flow-log config/destination
+                             nodes and, per observed connection, a connects_to edge
+                             to the peer (ENI->ENI when the peer IP is another ENI,
+                             else a flow_peer node). Needs extra read-only IAM
+                             (ec2:DescribeFlowLogs, cloudtrail:LookupEvents,
+                             logs:FilterLogEvents)
 --security-groups /        show security groups as nodes between ENIs and their
   --no-security-groups       sources (default: on); --no-security-groups connects the
                              source IPs directly to the ENIs with routability
@@ -261,6 +268,40 @@ These nodes/edges appear in **all** outputs (JSON, DOT, HTML). In the
 [ringed layout](#ringed-layout---ringed) security groups form a ring just outside the ENIs and the
 IP sources form the **outermost ring**. `cloudbreachgraph-to-html --no-security-groups` collapses
 the SG layer of an existing graph too (it can only remove SG nodes, not re-collect them).
+
+## Flow-log analysis (`--flow-logs`)
+
+Beyond the *static* topology, CloudBreachGraph can map the **observed traffic** to and from each
+ENI by reading the account's **VPC Flow Logs**. Pass `--flow-logs` (off by default — it needs extra
+read-only permissions and reads recent log data) to add, all read-only:
+
+- **IP history.** For each ENI it looks up (via CloudTrail `CreateNetworkInterface` events) **when
+  its private IP was allocated**, and records that on the ENI node as an `ip_allocations` attribute
+  (shown as an `IP since:` line in the DOT/HTML). That allocation time bounds how far back that
+  ENI's flow logs are analysed — traffic seen *before* the IP was allocated belonged to a different
+  interface reusing the address, so it's dropped.
+- **Where the logs live.** From `ec2 describe-flow-logs` it adds a `flow_log` node per configured
+  flow log and a **destination** node — a `log_group` (CloudWatch Logs) or `log_bucket` (S3) — with
+  `logs_to` (VPC/subnet/ENI → flow_log) and `delivers_to` (flow_log → destination) edges. This
+  surfaces *where each VPC stores its logs*.
+- **What connected to what.** It reads up to **60 days** of CloudWatch-Logs flow records
+  (`logs filter-log-events`) — from each ENI's IP-allocation moment until now — and, for every
+  observed connection, adds a directed **`connects_to`** edge to the peer:
+  - if the peer IP belongs to **another ENI in the account**, the edge runs **ENI → ENI** directly
+    (so the map shows which interfaces actually talk to each other);
+  - otherwise the peer is an external **`flow_peer`** node (`flow-peer:<ip>`).
+  Edges are labelled with the protocol/port ranges observed (e.g. `tcp/443`), and direction
+  encodes meaning: `peer → ENI` is *what connected to it*, `ENI → peer` is *what it connects to*.
+
+```bash
+cloudbreachgraph --account prod --flow-logs --output-dir out/
+cloudbreachgraph --from-cache tests/fixtures --flow-logs --output-dir out/   # offline demo
+```
+
+Only the **CloudWatch-Logs** flow-record path is read for connection analysis; an **S3** destination
+is shown as a `log_bucket` node but its object contents aren't parsed. All flow-log data is read
+from the account bound to the `flow_logs` role — which defaults to the same account as `network`, so
+in the common single-account case `--flow-logs` "just works" (see `docs/02_architecture.md §5.7`).
 
 ## Converting an existing graph to HTML
 
@@ -448,13 +489,14 @@ sorted `graph.json` shape, so you can feed it straight back into `cloudbreachgra
 substring of structural text (e.g. a VPC literally named `network`) could over-match; give
 resources ordinary names if you plan to anonymise.
 
-## Future roles (flow logs, etc.)
+## Roles (network, flow logs)
 
-v1 maps the **`network`** role. VPC Flow Logs (`flow_logs`) — often published to a separate
-central logging account — are a **future role**: the config grammar, targets, and CLI are
-already designed for it, so binding `flow_logs = "log_archive"` in a target will "just work"
-once the collectors ship, with no CLI change. See
-[`docs/05_roadmap.md`](docs/05_roadmap.md) and `docs/02_architecture.md §11`.
+The `network` role (ENIs → EC2/LB → subnets → VPCs, security groups, route tables) is always
+active. The **`flow_logs`** role — IP-allocation history + VPC Flow Log analysis, above — is opt-in
+via `--flow-logs`; it reads its data from whichever account the `flow_logs` role is bound to in the
+config (default: the same account as `network`). Additional roles (e.g. `dns`, `cloudtrail`) plug
+into the same registry. See [`docs/05_roadmap.md`](docs/05_roadmap.md) and
+`docs/02_architecture.md §5.7, §11`.
 
 ## Development
 

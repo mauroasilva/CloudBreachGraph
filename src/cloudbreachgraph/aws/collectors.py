@@ -14,12 +14,20 @@ collectors — no change to the driver loop, the config grammar, or the CLI.
 
 from __future__ import annotations
 
+import json as _json
+import time
 from collections.abc import Callable
 
 from . import runner
 
 # A collector's contract: given an optional profile and region, return normalized dicts.
 Collector = Callable[[str | None, str | None], list[dict]]
+
+# How far back the flow-log analysis ever reaches (``docs/02_architecture.md §5.7``). The
+# per-ENI window starts when the ENI's IP was allocated (from CloudTrail) but is clamped to at
+# most this many days in the past — both by this collection-time query bound and, per ENI, in the
+# mapping layer. Kept as a module constant so the CLI/docs and the mapping layer agree.
+FLOW_LOG_MAX_LOOKBACK_DAYS = 60
 
 
 # --------------------------------------------------------------------------- #
@@ -229,6 +237,105 @@ def _normalize_security_group(raw: dict) -> dict:
     }
 
 
+def _normalize_flow_log(raw: dict) -> dict:
+    """Keep a VPC Flow Log's *configuration*: which resource logs, and **where to**.
+
+    A flow log is attached to a ``ResourceId`` (a ``vpc-``/``subnet-``/``eni-`` id) and delivers
+    to either CloudWatch Logs (``LogDestinationType == "cloud-watch-logs"``, ``LogGroupName`` set)
+    or an S3 bucket (``LogDestinationType == "s3"``, ``LogDestination`` an S3 ARN). This is the
+    "where each VPC stores its logs" configuration (``docs/02_architecture.md §5.7``)."""
+    return {
+        "FlowLogId": raw.get("FlowLogId"),
+        "ResourceId": raw.get("ResourceId"),
+        "LogDestinationType": raw.get("LogDestinationType"),
+        "LogGroupName": raw.get("LogGroupName"),
+        "LogDestination": raw.get("LogDestination"),
+        "DeliverLogsStatus": raw.get("DeliverLogsStatus"),
+        "FlowLogStatus": raw.get("FlowLogStatus"),
+        "TrafficType": raw.get("TrafficType"),
+    }
+
+
+def _normalize_allocation_event(raw: dict) -> dict | None:
+    """Parse one CloudTrail ``CreateNetworkInterface`` event into an IP-allocation record.
+
+    The interesting fields live inside the ``CloudTrailEvent`` JSON *string*:
+    ``responseElements.networkInterface.{networkInterfaceId,privateIpAddress}`` and the
+    ``eventTime``. Returns ``None`` for an event we can't parse into an (eni, ip, time) triple, so
+    the collector simply drops it (``docs/02_architecture.md §5.7``)."""
+    detail = raw.get("CloudTrailEvent")
+    parsed: dict = {}
+    if isinstance(detail, str):
+        try:
+            parsed = _json.loads(detail)
+        except ValueError:
+            parsed = {}
+    elif isinstance(detail, dict):
+        parsed = detail
+
+    iface = ((parsed.get("responseElements") or {}).get("networkInterface")) or {}
+    eni_id = iface.get("networkInterfaceId")
+    if not eni_id:
+        return None
+    allocated_at = parsed.get("eventTime") or raw.get("EventTime")
+    return {
+        "NetworkInterfaceId": eni_id,
+        "PrivateIpAddress": iface.get("privateIpAddress"),
+        "AllocatedAt": allocated_at,
+    }
+
+
+# VPC Flow Log default (version 2) record fields, space-separated. We only depend on a handful.
+_FLOW_FIELD_IDX = {
+    "interface_id": 2,
+    "srcaddr": 3,
+    "dstaddr": 4,
+    "srcport": 5,
+    "dstport": 6,
+    "protocol": 7,
+    "start": 10,
+    "action": 12,
+}
+
+
+def _parse_flow_log_message(message: str, log_group: str | None) -> dict | None:
+    """Parse one default-format VPC flow-log record line into a normalized dict.
+
+    Fields we keep (``docs/02_architecture.md §5.7``): ``interface_id`` (the ENI the flow was
+    captured on), ``srcaddr``/``dstaddr`` (the two ends), ``srcport``/``dstport``, ``protocol``,
+    the capture-window ``start`` (epoch seconds, used to clamp to the IP-allocation window) and the
+    ``action`` (ACCEPT/REJECT). A missing address (``-``, common for skipped/NODATA records) makes
+    the line unusable, so we drop it — never guess."""
+    parts = message.split()
+    if len(parts) <= _FLOW_FIELD_IDX["action"]:
+        return None
+
+    def _field(name: str) -> str:
+        return parts[_FLOW_FIELD_IDX[name]]
+
+    srcaddr, dstaddr = _field("srcaddr"), _field("dstaddr")
+    if srcaddr in ("", "-") or dstaddr in ("", "-"):
+        return None
+
+    def _int(value: str) -> int | None:
+        try:
+            return int(value)
+        except ValueError:
+            return None
+
+    return {
+        "InterfaceId": _field("interface_id"),
+        "SrcAddr": srcaddr,
+        "DstAddr": dstaddr,
+        "SrcPort": _int(_field("srcport")),
+        "DstPort": _int(_field("dstport")),
+        "Protocol": _field("protocol"),
+        "Start": _int(_field("start")),
+        "Action": _field("action"),
+        "LogGroup": log_group,
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Collectors — one AWS command each (network role)
 # --------------------------------------------------------------------------- #
@@ -317,6 +424,85 @@ def collect_route_tables(profile: str | None, region: str | None) -> list[dict]:
 
 
 # --------------------------------------------------------------------------- #
+# Collectors — flow_logs role (§5.7). These gather the material the flow-log analysis
+# (``mapping/flowlogs.py``) turns into IP-history + connection nodes/edges. They are read-only:
+# ``ec2 describe-flow-logs``, ``cloudtrail lookup-events`` and ``logs filter-log-events`` all only
+# *retrieve* data. Value-carrying flags are passed as ``--flag=value`` so both the runner cache key
+# and the ``--from-cache`` reader (which key on the positional sub-command) stay stable.
+# --------------------------------------------------------------------------- #
+def collect_flow_logs(profile: str | None, region: str | None) -> list[dict]:
+    """``aws ec2 describe-flow-logs`` -> normalized ``.FlowLogs[]`` (the log *configuration*).
+
+    Where each VPC/subnet/ENI publishes its flow logs. Accounts with no flow logs return an empty
+    list — handled gracefully via the ``.get`` default."""
+    data = runner.run_aws(["ec2", "describe-flow-logs"], profile=profile, region=region)
+    return [_normalize_flow_log(x) for x in data.get("FlowLogs", [])]
+
+
+def collect_ip_allocation_events(profile: str | None, region: str | None) -> list[dict]:
+    """``aws cloudtrail lookup-events`` for ``CreateNetworkInterface`` -> IP-allocation records.
+
+    Each record is ``{NetworkInterfaceId, PrivateIpAddress, AllocatedAt}`` — *when* an ENI's IP was
+    allocated (``docs/02_architecture.md §5.7``), which bounds how far back that ENI's flow logs are
+    analysed. CloudTrail retention is 90 days; accounts/events we can't parse simply yield fewer
+    records (never an error)."""
+    data = runner.run_aws(
+        [
+            "cloudtrail",
+            "lookup-events",
+            "--lookup-attributes=AttributeKey=EventName,AttributeValue=CreateNetworkInterface",
+        ],
+        profile=profile,
+        region=region,
+    )
+    events = data.get("Events", [])
+    out: list[dict] = []
+    for ev in events:
+        rec = _normalize_allocation_event(ev)
+        if rec is not None:
+            out.append(rec)
+    return out
+
+
+def collect_flow_log_records(profile: str | None, region: str | None) -> list[dict]:
+    """Fetch and parse the CloudWatch-Logs flow-log *records* for the account's flow logs.
+
+    Discovers which CloudWatch log groups receive flow logs (``describe-flow-logs``), then reads up
+    to :data:`FLOW_LOG_MAX_LOOKBACK_DAYS` days of records from each with ``aws logs
+    filter-log-events`` and parses every line (``docs/02_architecture.md §5.7``). S3-destined flow
+    logs are shown as a destination node but their object contents are **not** read here (that would
+    need per-object S3 ``get-object`` calls); this collector covers the CloudWatch path. Read-only:
+    ``filter-log-events`` only retrieves. Returns a flat list of normalized flow records."""
+    config = runner.run_aws(["ec2", "describe-flow-logs"], profile=profile, region=region)
+    log_groups = sorted(
+        {
+            fl.get("LogGroupName")
+            for fl in config.get("FlowLogs", [])
+            if fl.get("LogDestinationType") == "cloud-watch-logs" and fl.get("LogGroupName")
+        }
+    )
+
+    start_ms = int((time.time() - FLOW_LOG_MAX_LOOKBACK_DAYS * 86400) * 1000)
+    records: list[dict] = []
+    for group in log_groups:
+        data = runner.run_aws(
+            [
+                "logs",
+                "filter-log-events",
+                f"--log-group-name={group}",
+                f"--start-time={start_ms}",
+            ],
+            profile=profile,
+            region=region,
+        )
+        for event in data.get("events", []):
+            rec = _parse_flow_log_message(event.get("message", ""), group)
+            if rec is not None:
+                records.append(rec)
+    return records
+
+
+# --------------------------------------------------------------------------- #
 # Role registry (§11.6) — the seam future roles extend
 # --------------------------------------------------------------------------- #
 ROLE_COLLECTORS: dict[str, list[Collector]] = {
@@ -332,11 +518,14 @@ ROLE_COLLECTORS: dict[str, list[Collector]] = {
         collect_nat_gateways,
         collect_vpc_endpoints,
     ],
-    # ── future (see docs/05_roadmap.md); do NOT implement in v1 ──────────────
-    # "flow_logs": [
-    #     collect_flow_logs,          # aws ec2  describe-flow-logs   -> .FlowLogs[]
-    #     collect_log_destinations,   # aws logs describe-log-groups / s3api ...
-    # ],
+    # flow_logs (§5.7): IP-allocation history + VPC flow-log config/records. Opt-in via
+    # ``--flow-logs`` (the CLI adds the role to the active set); needs extra read-only IAM
+    # (ec2:DescribeFlowLogs, cloudtrail:LookupEvents, logs:FilterLogEvents).
+    "flow_logs": [
+        collect_flow_logs,  # aws ec2        describe-flow-logs   -> .FlowLogs[]
+        collect_ip_allocation_events,  # aws cloudtrail lookup-events        -> allocation records
+        collect_flow_log_records,  # aws logs       filter-log-events    -> parsed flow records
+    ],
 }
 
 # Parallel to ROLE_COLLECTORS: the bundle key each collector's result is stored under.
@@ -354,7 +543,7 @@ ROLE_RESULT_KEYS: dict[str, list[str]] = {
         "nat_gateways",
         "vpc_endpoints",
     ],
-    # "flow_logs": ["flow_logs", "log_destinations"],  # future
+    "flow_logs": ["flow_logs", "ip_allocations", "flow_log_records"],
 }
 
 
