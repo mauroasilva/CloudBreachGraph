@@ -464,14 +464,22 @@ Requirements:
   `MAX_HTML_BYTES` guard and `.dot` fallback apply. The `--optimize-passes N` flag runs up to
   N barycenter passes (`html_export._optimize_cluster`) that move each node toward the mean
   angle of its neighbours, placed via an L2 isotonic min-gap projection (`_place_min_gap`) so
-  connected nodes cluster as close as an overlap-free gap allows (not merely reordered), then
-  nudge apart any residual overlaps. A geometric cooling schedule shrinks each pass's movement
-  so the iteration freezes to a stable layout (otherwise it limit-cycles on dense graphs and the
-  bytes would depend on the pass count). A final greedy crossing-reduction local search
-  (`_reduce_crossings`) relocates each node to the same-ring slot with the fewest incident edge
-  crossings — a monotone minimiser (moving one node only changes crossings on its own edges), it
-  clears whole spokes the barycenter passes leave crossing. Rings preserved, output
-  deterministic; `N=0` (default) is the exact ENI-aligned layout. Without `--ringed`, the same
+  connected nodes cluster as close as an overlap-free gap allows (not merely reordered). A geometric
+  cooling schedule shrinks each pass's movement so the iteration freezes to a stable layout
+  (otherwise it limit-cycles on dense graphs and the bytes would depend on the pass count). A greedy
+  crossing-reduction local search (`_reduce_crossings`) relocates each node to the same-ring slot
+  with the fewest incident edge crossings — a monotone minimiser (moving one node only changes
+  crossings on its own edges), it clears whole spokes the barycenter passes leave crossing. When
+  optimising, the layout is also made **fully overlap-free**: the rings are sized for the nodes'
+  whole **labels** (`_label_ring_radii`), the barycenter min-gap is label-aware, and a final
+  per-cluster **inflation about the centre + projection** (`_clear_cluster_overlaps`, a
+  similarity transform that preserves crossings and the ring shape) drives node-node,
+  edge-over-node, label-label and disk-over-label overlaps all to zero; the grown clusters are then
+  tiled into a grid whose cells reserve room for the rings and labels. Because labels are then
+  separated in world space, the ringed variant sets `SCALE_LABELS` on (scaling label fonts with the
+  view) when `N > 0`. Rings preserved, output deterministic; `N=0` (default) is the exact
+  ENI-aligned layout (disk-sized rings, fixed-size labels), byte-for-byte unchanged. Without
+  `--ringed`, the same
   `--optimize-passes N` flag instead selects a third, **overlap-free** layout
   (`html_export.write_optimized_html`/
   `build_optimized_html`, sharing the draw-only template via `_render_static_layout`): it runs up
