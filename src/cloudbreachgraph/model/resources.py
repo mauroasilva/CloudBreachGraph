@@ -394,14 +394,9 @@ class FlowLog:
         )
 
     @property
-    def destination_id(self) -> str | None:
-        """Graph node id of this flow log's destination (log group name or S3 ARN)."""
+    def destination(self) -> str | None:
+        """Where this flow log is stored: the CloudWatch log-group name or the S3 ARN."""
         return self.log_group_name or self.log_destination
-
-    @property
-    def destination_node_type(self) -> str:
-        """``log_group`` for a CloudWatch destination, else ``log_bucket`` (S3)."""
-        return "log_group" if self.destination_type == "cloud-watch-logs" else "log_bucket"
 
 
 @dataclass

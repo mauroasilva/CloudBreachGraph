@@ -298,11 +298,11 @@ into the already-built graph:
    traffic belonged to a **different interface reusing the address**, not this ENI.
 
 2. **Flow-log configuration** (`ec2 describe-flow-logs`, the "where each VPC stores its logs"
-   config). Per flow log: a `flow_log` node (attributes `resource_id`, `destination_type`,
-   `traffic_type`, `status`); a **destination** node — `log_group` (CloudWatch Logs) or
-   `log_bucket` (S3), keyed by the log-group name / S3 ARN; and edges `logs_to`
-   (logged resource → flow_log, added only when the resource node exists so nothing dangles) and
-   `delivers_to` (flow_log → destination).
+   config). This is **not** modelled as separate nodes — it is a **`flow_logs` attribute on the
+   owning VPC node**: a list of `{flow_log_id, resource_id, destination_type, destination,
+   traffic_type, status}`. A flow log's `ResourceId` (VPC-, subnet-, or ENI-scoped) resolves *up to
+   its VPC* (subnet via `in_vpc`, ENI via `in_subnet` then `in_vpc`), so all of a VPC's flow logs
+   collect on that one VPC. A flow log whose VPC isn't in the (ENI-anchored) graph is skipped.
 
 3. **Observed connections** (`logs filter-log-events`, up to `FLOW_LOG_MAX_LOOKBACK_DAYS = 60` days
    of default-format records from each CloudWatch flow-log group). For each record captured on a
@@ -310,24 +310,35 @@ into the already-built graph:
    other node of a directed **`connects_to`** edge — `peer → A` when `A` is the destination (*what
    connected to it*), `A → peer` when `A` is the source (*what it connects to*):
    - if the peer IP belongs to **another collected ENI `B`**, the edge runs **ENI → ENI** directly
-     (`B → A` or `A → B`) — the acceptance-criteria "if the connecting IP belongs to another ENI,
-     add an edge from one ENI to another";
+     (`B → A` or `A → B`), with **no** new node — the acceptance-criteria "if the connecting IP
+     belongs to another ENI, add an edge from one ENI to another". This is subject to a **temporal
+     guard**: `B` must have already held that IP when the flow was captured. If `B`'s allocation of
+     the IP (from CloudTrail) is *after* the record's `start`, the IP was a **different interface's**
+     at the time (historic reuse) and the record is **dropped** — never linking a current ENI
+     through a stale address. An *unknown* peer-allocation time (`B` predates the analysis window, so
+     it has held the IP throughout) is treated as valid.
    - otherwise the peer is an external **`flow_peer`** node (`flow-peer:<ip>`).
    Ports are aggregated per directed edge into a `ports` label (e.g. `tcp/443`), with
    `via = "flow_log"` so a `connects_to` edge is distinguishable from a reachability edge. Records
    with a missing address (`-`, e.g. NODATA/skipped) are dropped; the record's own `interface-id`
    (field 2) identifies the home ENI, and direction is decided by matching `srcaddr`/`dstaddr`
-   against that ENI's private IPs.
+   against that ENI's *current* private IPs (so a record whose home-side address the ENI no longer
+   holds is naturally skipped too).
+
+The one remaining flow-log node type, **`flow_peer`**, is an external IP source, so in the ringed
+HTML layout it sits on the **outermost IP-source ring** alongside `internet`/`cidr` and is clustered
+into the VPC of the ENI it exchanges flows with (traced via its `connects_to` edge). It has a
+distinct fill colour from the other IP-source nodes in every HTML/DOT view.
 
 **Scope & simplifications.** Only the **CloudWatch-Logs** record path is analysed for connections;
-an S3 destination is shown as a `log_bucket` node but its objects are not fetched (that would need
-per-object `s3api get-object`). All three commands run against the account bound to the `flow_logs`
-role (§11) — which defaults to the same account as `network`, so the common single-account case
-needs no config. Reading flow-log *records* (not just their config/destination) goes beyond the
-original roadmap's "show the destination, don't parse traffic" line — a deliberate extension for
-this feature. Determinism holds: allocation times and record timestamps come from the data, and the
-60-day bound is applied at the *collection* query (not from wall-clock in the output), so a fixed
-capture always yields the same graph.
+an S3 destination is recorded in the VPC's `flow_logs` attribute but its objects are not fetched
+(that would need per-object `s3api get-object`). All three commands run against the account bound to
+the `flow_logs` role (§11) — which defaults to the same account as `network`, so the common
+single-account case needs no config. Reading flow-log *records* (not just their config/destination)
+goes beyond the original roadmap's "show the destination, don't parse traffic" line — a deliberate
+extension for this feature. Determinism holds: allocation times and record timestamps come from the
+data, and the 60-day bound is applied at the *collection* query (not from wall-clock in the output),
+so a fixed capture always yields the same graph.
 
 ## 6. Graph data model (Phase 2 defines, Phase 3 consumes)
 
@@ -340,7 +351,8 @@ Node:
   type:  str            # "eni" | "ec2_instance" | "load_balancer" | "nat_gateway"
                         #   | "vpc_endpoint" | "subnet" | "vpc"
                         #   | "security_group" | "internet" | "cidr"   (reachability, §5.5)
-                        #   | "flow_log" | "log_group" | "log_bucket" | "flow_peer"  (flow logs, §5.7)
+                        #   | "flow_peer"  (external peer seen in flow logs, §5.7; flow-log config
+                        #                   is a `flow_logs` attribute on the vpc node, not a node)
   label: str            # human-friendly (Name tag or id)
   attributes: dict      # type-specific metadata (state, cidr, interface_type, synthetic, ...)
 
@@ -349,7 +361,7 @@ Edge:
   target: str           # node id
   relationship: str     # "attached_to" | "in_subnet" | "in_vpc" | "secured_by" (ENI->SG, §5.5)
                         #   | "can_reach" / "routable_can_reach" / "not_routable_can_reach" (§5.5/§5.6)
-                        #   | "logs_to" / "delivers_to" / "connects_to" (flow logs, §5.7)
+                        #   | "connects_to" (observed flow-log connection, §5.7)
   attributes: dict      # e.g. {"match_rule": "elbv2_description"} or {"ports": "tcp/443"}
 
 Graph:

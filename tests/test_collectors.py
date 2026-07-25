@@ -208,8 +208,8 @@ def test_collect_ip_allocation_events_parses_cloudtrail(fake_aws):
 
 def test_collect_flow_log_records_parses_and_skips_nodata(fake_aws):
     records = collectors.collect_flow_log_records("prod-audit", "us-east-1")
-    # The fixture has 5 events; the NODATA line with a "-" address is dropped -> 4 usable records.
-    assert len(records) == 4
+    # The fixture has 7 events; the NODATA line with a "-" address is dropped -> 6 usable records.
+    assert len(records) == 6
     assert all(r["SrcAddr"] not in (None, "-") and r["DstAddr"] not in (None, "-") for r in records)
     outbound = next(
         r for r in records if r["SrcAddr"] == "10.0.1.10" and r["DstAddr"] == "10.0.2.30"

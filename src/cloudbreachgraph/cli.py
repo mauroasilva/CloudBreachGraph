@@ -101,11 +101,11 @@ def build_parser() -> argparse.ArgumentParser:
     col.add_argument(
         "--flow-logs",
         action="store_true",
-        help="also gather IP-allocation history and analyse VPC flow logs (last 60 days): add "
-        "flow-log config/destination nodes and, for each observed connection, a connects_to edge "
-        "to the peer (ENI->ENI when the peer IP is another collected ENI, else a flow_peer node). "
-        "Needs extra read-only IAM: ec2:DescribeFlowLogs, cloudtrail:LookupEvents, "
-        "logs:FilterLogEvents",
+        help="also gather IP-allocation history and analyse VPC flow logs (last 60 days): record "
+        "flow-log config as a VPC attribute and, for each observed connection, add a connects_to "
+        "edge to the peer (ENI->ENI when the peer IP is another collected ENI that already held it "
+        "at the time, else a flow_peer node). Needs extra read-only IAM: ec2:DescribeFlowLogs, "
+        "cloudtrail:LookupEvents, logs:FilterLogEvents",
     )
     col.add_argument(
         "--security-groups",

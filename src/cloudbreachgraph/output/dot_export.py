@@ -49,11 +49,8 @@ _TYPE_STYLE: dict[str, tuple[str, str]] = {
     "internet": ("#FFEBEE", "doubleoctagon"),  # the whole internet (0.0.0.0/0 / ::/0), per-ENI
     "cidr": ("#FFF8E1", "note"),  # a specific source CIDR
     "security_group": ("#FCE4EC", "tab"),  # a referencing security group
-    # Flow logs (docs/02_architecture.md §5.7) — config, destinations, observed connection peers.
-    "flow_log": ("#E1F5FE", "cds"),  # a VPC flow-log configuration
-    "log_group": ("#E0F7FA", "cylinder"),  # CloudWatch Logs destination
-    "log_bucket": ("#FFF3E0", "folder"),  # S3 destination
-    "flow_peer": ("#ECEFF1", "hexagon"),  # an external address observed in the flow logs
+    # An external address observed in the flow logs (§5.7); flow-log *config* lives on the VPC node.
+    "flow_peer": ("#ECEFF1", "hexagon"),
 }
 _DEFAULT_STYLE = ("#FFFFFF", "box")
 
@@ -140,16 +137,14 @@ def _node_lines(node: Node) -> list[str]:
         lines.append(str(attrs["service_name"]))
     elif node.type == "subnet" and attrs.get("cidr"):
         lines.append(str(attrs["cidr"]))
-    elif node.type == "vpc" and attrs.get("cidr"):
-        lines.append(str(attrs["cidr"]))
+    elif node.type == "vpc":
+        if attrs.get("cidr"):
+            lines.append(str(attrs["cidr"]))
+        for fl in attrs.get("flow_logs", []):  # where this VPC stores its logs (§5.7)
+            dest = fl.get("destination") or fl.get("destination_type") or "?"
+            lines.append(f"Flow logs → {dest}")
     elif node.type == "ec2_instance" and attrs.get("state"):
         lines.append(str(attrs["state"]))
-    elif node.type == "flow_log":
-        detail = ", ".join(
-            str(attrs[k]) for k in ("traffic_type", "destination_type") if attrs.get(k)
-        )
-        if detail:
-            lines.append(detail)
     if attrs.get("synthetic"):
         lines.append("(unresolved)")
     return lines
@@ -194,8 +189,6 @@ def _edge_extra(edge: Edge) -> str:
         return ', style="dashed", color="#9E9E9E"'
     if rel == "connects_to":  # an observed flow-log connection (§5.7) -> solid blue
         return ', color="#1E88E5", penwidth=1.3'
-    if rel in ("logs_to", "delivers_to"):  # flow-log config plumbing -> dotted
-        return ', style="dotted", color="#00838F"'
     return ""
 
 

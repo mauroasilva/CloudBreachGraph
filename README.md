@@ -141,12 +141,12 @@ cloudbreachgraph --from-cache tests/fixtures --output-dir out/
 --from-cache DIR           build from cached AWS JSON in DIR, no live calls
 --include-orphans          also emit collected resources no ENI references
 --flow-logs                also gather IP-allocation history and analyse VPC flow
-                             logs (last 60 days): add flow-log config/destination
-                             nodes and, per observed connection, a connects_to edge
-                             to the peer (ENI->ENI when the peer IP is another ENI,
-                             else a flow_peer node). Needs extra read-only IAM
-                             (ec2:DescribeFlowLogs, cloudtrail:LookupEvents,
-                             logs:FilterLogEvents)
+                             logs (last 60 days): record flow-log config on the VPC
+                             and, per observed connection, add a connects_to edge to
+                             the peer (ENI->ENI when the peer IP is another ENI that
+                             held it at the time, else a flow_peer node). Needs extra
+                             read-only IAM (ec2:DescribeFlowLogs,
+                             cloudtrail:LookupEvents, logs:FilterLogEvents)
 --security-groups /        show security groups as nodes between ENIs and their
   --no-security-groups       sources (default: on); --no-security-groups connects the
                              source IPs directly to the ENIs with routability
@@ -280,16 +280,20 @@ read-only permissions and reads recent log data) to add, all read-only:
   (shown as an `IP since:` line in the DOT/HTML). That allocation time bounds how far back that
   ENI's flow logs are analysed — traffic seen *before* the IP was allocated belonged to a different
   interface reusing the address, so it's dropped.
-- **Where the logs live.** From `ec2 describe-flow-logs` it adds a `flow_log` node per configured
-  flow log and a **destination** node — a `log_group` (CloudWatch Logs) or `log_bucket` (S3) — with
-  `logs_to` (VPC/subnet/ENI → flow_log) and `delivers_to` (flow_log → destination) edges. This
-  surfaces *where each VPC stores its logs*.
+- **Where the logs live.** From `ec2 describe-flow-logs` it records *where each VPC stores its logs*
+  as a **`flow_logs` attribute on the VPC node** (destination log group / S3 bucket, traffic type,
+  status) — VPC-, subnet- and ENI-scoped flow logs all roll up to their VPC. (No separate flow-log
+  nodes; the DOT/HTML show it as a `Flow logs → …` line on the VPC.)
 - **What connected to what.** It reads up to **60 days** of CloudWatch-Logs flow records
   (`logs filter-log-events`) — from each ENI's IP-allocation moment until now — and, for every
   observed connection, adds a directed **`connects_to`** edge to the peer:
   - if the peer IP belongs to **another ENI in the account**, the edge runs **ENI → ENI** directly
-    (so the map shows which interfaces actually talk to each other);
-  - otherwise the peer is an external **`flow_peer`** node (`flow-peer:<ip>`).
+    (no new node — so the map shows which interfaces actually talk to each other). This only happens
+    when that ENI **already held the IP at the time of the flow**: if the IP was allocated to it
+    *later*, the record is a historic-IP reuse and is dropped, so a current ENI is never linked
+    through an address it didn't own then;
+  - otherwise the peer is an external **`flow_peer`** node (`flow-peer:<ip>`), which shares the
+    outermost IP-source ring with the reachability sources in the ringed layout.
   Edges are labelled with the protocol/port ranges observed (e.g. `tcp/443`), and direction
   encodes meaning: `peer → ENI` is *what connected to it*, `ENI → peer` is *what it connects to*.
 
