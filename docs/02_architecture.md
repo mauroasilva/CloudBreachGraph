@@ -292,17 +292,21 @@ to/from each ENI — plus where the logs that record it live. It reads three thi
 into the already-built graph:
 
 1. **IP history.** `cloudtrail lookup-events` for `CreateNetworkInterface` gives *when* each ENI's
-   private IP was allocated. Each ENI node gains an `ip_allocations` attribute
-   (`[{ip, allocated_at}]`). The **earliest** allocation time is the per-ENI lower bound for the
-   flow-log window: a flow record with a capture-window `start` *before* it is dropped — that
-   traffic belonged to a **different interface reusing the address**, not this ENI.
+   private IP was allocated. **Every** ENI node gains an `ip_history` attribute — a dict keyed by
+   each IP the ENI has held, valued `{start, end}` (ISO timestamps): `start` is the allocation time
+   (`None` if unknown), `end` is `None` while the ENI still holds the IP (its *current* addresses)
+   else the allocation time of the IP that superseded it. The **earliest** known allocation is the
+   per-ENI lower bound for the flow-log window: a flow record with a capture-window `start` *before*
+   it is dropped — that traffic belonged to a **different interface reusing the address**, not this
+   ENI. `ip_history` is a **JSON-only** field; the DOT/HTML views show only the ENI's current IPs.
 
 2. **Flow-log configuration** (`ec2 describe-flow-logs`, the "where each VPC stores its logs"
    config). This is **not** modelled as separate nodes — it is a **`flow_logs` attribute on the
    owning VPC node**: a list of `{flow_log_id, resource_id, destination_type, destination,
    traffic_type, status}`. A flow log's `ResourceId` (VPC-, subnet-, or ENI-scoped) resolves *up to
    its VPC* (subnet via `in_vpc`, ENI via `in_subnet` then `in_vpc`), so all of a VPC's flow logs
-   collect on that one VPC. A flow log whose VPC isn't in the (ENI-anchored) graph is skipped.
+   collect on that one VPC. A flow log whose VPC isn't in the (ENI-anchored) graph is skipped. Like
+   `ip_history`, this config is **JSON-only** — it is never drawn in the DOT or HTML output.
 
 3. **Observed connections** (`logs filter-log-events`, up to `FLOW_LOG_MAX_LOOKBACK_DAYS = 60` days
    of default-format records from each CloudWatch flow-log group). For each record captured on a

@@ -61,19 +61,70 @@ def _edges(graph, rel):
 # --------------------------------------------------------------------------- #
 # IP history
 # --------------------------------------------------------------------------- #
-def test_ip_allocation_history_on_eni_nodes(flow_bundle):
+def test_ip_history_on_eni_nodes(flow_bundle):
     graph = build_graph(flow_bundle, map_flow_logs=True)
+    # ip_history: {ip: {start, end}} — start from CloudTrail, end None while the IP is current.
     inst = graph.get_node("eni-00instance0000001")
-    assert inst.attributes["ip_allocations"] == [
-        {"ip": "10.0.1.10", "allocated_at": "2026-06-01T00:00:00+00:00"}
-    ]
-    # An ENI with no CloudTrail event carries no ip_allocations attribute.
-    assert "ip_allocations" not in graph.get_node("eni-00nlb00000000003").attributes
+    assert inst.attributes["ip_history"] == {
+        "10.0.1.10": {"start": "2026-06-01T00:00:00+00:00", "end": None}
+    }
+    # Every ENI gets the field, even one with no CloudTrail event: its current IP, start unknown.
+    assert graph.get_node("eni-00nlb00000000003").attributes["ip_history"] == {
+        "10.0.2.30": {"start": None, "end": None}
+    }
 
 
 def test_ip_history_absent_without_flag(flow_bundle):
     graph = build_graph(flow_bundle)  # map_flow_logs defaults off
-    assert "ip_allocations" not in graph.get_node("eni-00instance0000001").attributes
+    assert "ip_history" not in graph.get_node("eni-00instance0000001").attributes
+
+
+def _eni_dict(eni_id, ips):
+    return {
+        "NetworkInterfaceId": eni_id,
+        "SubnetId": "subnet-1",
+        "VpcId": "vpc-1",
+        "InterfaceType": "interface",
+        "Description": "",
+        "Status": "in-use",
+        "AvailabilityZone": "us-east-1a",
+        "RequesterId": None,
+        "RequesterManaged": False,
+        "Attachment": {"InstanceId": None},
+        "Association": {"PublicIp": None},
+        "PrivateIpAddresses": [{"PrivateIpAddress": ip} for ip in ips],
+        "Groups": [],
+    }
+
+
+def _alloc(ip, at):
+    return {"NetworkInterfaceId": "eni-h", "PrivateIpAddress": ip, "AllocatedAt": at}
+
+
+def test_ip_history_marks_a_superseded_ip_with_start_and_end():
+    # An ENI whose IP changed: 10.0.0.5 (2026-05-01) was replaced by current 10.0.0.9 (2026-06-01).
+    bundle = {
+        "meta": {"target": None, "region": "us-east-1", "accounts": {}},
+        "network_interfaces": [_eni_dict("eni-h", ["10.0.0.9"])],
+        "ec2_instances": [],
+        "load_balancers_v2": [],
+        "load_balancers_classic": [],
+        "subnets": [],
+        "vpcs": [],
+        "flow_logs": [],
+        "ip_allocations": [
+            _alloc("10.0.0.5", "2026-05-01T00:00:00+00:00"),
+            _alloc("10.0.0.9", "2026-06-01T00:00:00+00:00"),
+        ],
+        "flow_log_records": [],
+    }
+    history = build_graph(bundle, map_flow_logs=True).get_node("eni-h").attributes["ip_history"]
+    assert history == {
+        # The released IP: start = its allocation, end = when the successor was allocated.
+        "10.0.0.5": {"start": "2026-05-01T00:00:00+00:00", "end": "2026-06-01T00:00:00+00:00"},
+        # The current IP: still held, so end is open.
+        "10.0.0.9": {"start": "2026-06-01T00:00:00+00:00", "end": None},
+    }
 
 
 # --------------------------------------------------------------------------- #

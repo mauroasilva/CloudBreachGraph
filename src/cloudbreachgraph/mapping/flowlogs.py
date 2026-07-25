@@ -5,8 +5,9 @@ This is the mapping half of the ``flow_logs`` role (the collectors are in
 events, and the parsed flow-log *records*, :func:`map_flow_logs` folds three things into the
 already-built graph:
 
-1. **IP history** — each ENI node gains an ``ip_allocations`` attribute: *when* each of its private
-   IPs was allocated (from CloudTrail ``CreateNetworkInterface`` events).
+1. **IP history** — each ENI node gains an ``ip_history`` attribute: ``{ip: {"start", "end"}}`` for
+   every address it has held (from CloudTrail ``CreateNetworkInterface`` events). JSON-only; the
+   DOT/HTML views show only the ENI's *current* private IPs.
 2. **Flow-log configuration** — *not* separate nodes: each flow log's destination (where the logs
    are stored) is recorded as a ``flow_logs`` **attribute on the VPC** that owns the logged resource
    (a VPC-, subnet- or ENI-scoped flow log all attach to their VPC). So the map answers "where does
@@ -83,16 +84,22 @@ def map_flow_logs(
             # If an IP appears in several events, keep the earliest allocation.
             ip_alloc_epoch[alloc.private_ip] = min(ep, ip_alloc_epoch.get(alloc.private_ip, ep))
 
-    alloc_start = _map_ip_history(graph, allocations)
+    alloc_start = _map_ip_history(graph, enis, allocations)
     _attach_flow_log_config_to_vpcs(graph, flow_logs)
     _map_connections(graph, records, ip_to_eni, eni_ips, alloc_start, ip_alloc_epoch)
 
 
-def _map_ip_history(graph: Graph, allocations: list[IpAllocation]) -> dict[str, int]:
-    """Attach ``ip_allocations`` to each ENI node; return the earliest alloc epoch per ENI.
+def _map_ip_history(
+    graph: Graph, enis: list[Eni], allocations: list[IpAllocation]
+) -> dict[str, int]:
+    """Attach an ``ip_history`` dict to **every** ENI node; return the earliest alloc epoch per ENI.
 
-    The earliest epoch bounds how far back that ENI's flow records are analysed — traffic seen
-    before its IP was allocated is a *different* interface reusing the address and is dropped.
+    ``ip_history`` maps each IP the ENI has held to ``{"start", "end"}`` ISO timestamps: ``start``
+    is when it was allocated (from CloudTrail, ``None`` if unknown), ``end`` is ``None`` while the
+    ENI still holds the IP (its *current* addresses) else the allocation time of the IP that
+    superseded it. This is the full history for the JSON output only — the DOT/HTML views show the
+    *current* private IPs. The returned earliest-alloc epoch per ENI bounds how far back that ENI's
+    flow records are analysed (traffic before its IP existed is a different interface's, dropped).
     """
     by_eni: dict[str, list[IpAllocation]] = {}
     for alloc in allocations:
@@ -100,18 +107,45 @@ def _map_ip_history(graph: Graph, allocations: list[IpAllocation]) -> dict[str, 
             by_eni.setdefault(alloc.eni_id, []).append(alloc)
 
     earliest: dict[str, int] = {}
-    for eni_id, allocs in by_eni.items():
-        node = graph.get_node(eni_id)
+    for eni in enis:
+        node = graph.get_node(eni.id) if eni.id else None
         if node is None or node.type != "eni":
             continue
-        entries = sorted(
-            ({"ip": a.private_ip, "allocated_at": a.allocated_at} for a in allocs),
-            key=lambda e: (e["allocated_at"] or "", e["ip"] or ""),
+        allocs = by_eni.get(eni.id, [])
+
+        # Earliest known allocation start per IP (an IP could appear in several events).
+        start_of: dict[str, str | None] = {}
+        for a in allocs:
+            if not a.private_ip:
+                continue
+            prev = start_of.get(a.private_ip)
+            if prev is None or (a.allocated_at or "") < prev:
+                start_of[a.private_ip] = a.allocated_at
+
+        # Allocation starts in chronological order, to find what superseded a released IP.
+        ordered = sorted(
+            ((_epoch(s), s) for s in start_of.values() if s), key=lambda t: (t[0] or 0, t[1])
         )
-        node.attributes["ip_allocations"] = entries
-        epochs = [e for e in (_epoch(a.allocated_at) for a in allocs) if e is not None]
+        current = {ip for ip in eni.private_ips if ip}
+
+        def _end_for(start_iso: str | None) -> str | None:
+            # The next allocation after this IP's start marks when it stopped being on the ENI.
+            se = _epoch(start_iso)
+            for ep, iso in ordered:  # noqa: B023 - ordered/se are per-iteration by design
+                if se is not None and ep is not None and ep > se:
+                    return iso
+            return None
+
+        history: dict[str, dict[str, str | None]] = {}
+        for ip in sorted(current | set(start_of), key=lambda i: (start_of.get(i) or "", i)):
+            start = start_of.get(ip)
+            end = None if ip in current else _end_for(start)
+            history[ip] = {"start": start, "end": end}
+        node.attributes["ip_history"] = history
+
+        epochs = [e for e in (_epoch(s) for s in start_of.values()) if e is not None]
         if epochs:
-            earliest[eni_id] = min(epochs)
+            earliest[eni.id] = min(epochs)
     return earliest
 
 

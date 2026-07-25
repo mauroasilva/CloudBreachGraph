@@ -152,13 +152,8 @@ def _detail_line(node_type: str, attrs: dict) -> str:
         return str(attrs["state"])
     if node_type == "vpc_endpoint" and attrs.get("service_name"):
         return str(attrs["service_name"])
-    if node_type == "vpc":
-        bits = [attrs["cidr"]] if attrs.get("cidr") else []
-        if attrs.get("flow_logs"):  # where this VPC stores its logs (§5.7)
-            dests = [fl.get("destination") for fl in attrs["flow_logs"] if fl.get("destination")]
-            bits.append("flow logs → " + ", ".join(dests) if dests else "flow logs on")
-        return " · ".join(bits)
-    if node_type == "subnet" and attrs.get("cidr"):
+    if node_type in ("subnet", "vpc") and attrs.get("cidr"):
+        # A VPC's `flow_logs` config and an ENI's `ip_history` (§5.7) are JSON-only, never rendered.
         return str(attrs["cidr"])
     if node_type == "ec2_instance" and attrs.get("state"):
         return str(attrs["state"])

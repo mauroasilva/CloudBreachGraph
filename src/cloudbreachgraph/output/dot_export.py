@@ -120,12 +120,7 @@ def _node_lines(node: Node) -> list[str]:
             lines.append("Private IP: " + ", ".join(attrs["private_ips"]))
         if attrs.get("public_ips"):
             lines.append("Public IP: " + ", ".join(attrs["public_ips"]))
-        if attrs.get("ip_allocations"):  # IP history (§5.7) — earliest allocation time
-            allocated = [
-                a["allocated_at"] for a in attrs["ip_allocations"] if a.get("allocated_at")
-            ]
-            if allocated:
-                lines.append("IP since: " + min(allocated))
+        # Note: full IP history (`ip_history`, §5.7) is JSON-only; the map shows only current IPs.
     elif node.type == "load_balancer" and attrs.get("lb_type"):
         lines.append(str(attrs["lb_type"]))
     elif node.type == "nat_gateway":
@@ -137,12 +132,9 @@ def _node_lines(node: Node) -> list[str]:
         lines.append(str(attrs["service_name"]))
     elif node.type == "subnet" and attrs.get("cidr"):
         lines.append(str(attrs["cidr"]))
-    elif node.type == "vpc":
-        if attrs.get("cidr"):
-            lines.append(str(attrs["cidr"]))
-        for fl in attrs.get("flow_logs", []):  # where this VPC stores its logs (§5.7)
-            dest = fl.get("destination") or fl.get("destination_type") or "?"
-            lines.append(f"Flow logs → {dest}")
+    elif node.type == "vpc" and attrs.get("cidr"):
+        # Note: the VPC's `flow_logs` config (§5.7) is JSON-only; it is not drawn here.
+        lines.append(str(attrs["cidr"]))
     elif node.type == "ec2_instance" and attrs.get("state"):
         lines.append(str(attrs["state"]))
     if attrs.get("synthetic"):

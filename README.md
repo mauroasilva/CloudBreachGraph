@@ -276,14 +276,17 @@ ENI by reading the account's **VPC Flow Logs**. Pass `--flow-logs` (off by defau
 read-only permissions and reads recent log data) to add, all read-only:
 
 - **IP history.** For each ENI it looks up (via CloudTrail `CreateNetworkInterface` events) **when
-  its private IP was allocated**, and records that on the ENI node as an `ip_allocations` attribute
-  (shown as an `IP since:` line in the DOT/HTML). That allocation time bounds how far back that
-  ENI's flow logs are analysed — traffic seen *before* the IP was allocated belonged to a different
-  interface reusing the address, so it's dropped.
+  its private IP was allocated**, and records the full history on the ENI node as an **`ip_history`**
+  attribute — `{ip: {start, end}}`, where `end` is `null` while the ENI still holds the IP, else the
+  time it was superseded. That allocation time bounds how far back that ENI's flow logs are analysed
+  (traffic seen *before* the IP was allocated belonged to a different interface reusing the address,
+  so it's dropped). `ip_history` is written to **`graph.json` only** — the DOT/HTML views show just
+  the ENI's *current* private IP.
 - **Where the logs live.** From `ec2 describe-flow-logs` it records *where each VPC stores its logs*
   as a **`flow_logs` attribute on the VPC node** (destination log group / S3 bucket, traffic type,
-  status) — VPC-, subnet- and ENI-scoped flow logs all roll up to their VPC. (No separate flow-log
-  nodes; the DOT/HTML show it as a `Flow logs → …` line on the VPC.)
+  status) — VPC-, subnet- and ENI-scoped flow logs all roll up to their VPC. There are no separate
+  flow-log nodes, and this config is written to **`graph.json` only** — it is not drawn in the DOT or
+  HTML views.
 - **What connected to what.** It reads up to **60 days** of CloudWatch-Logs flow records
   (`logs filter-log-events`) — from each ENI's IP-allocation moment until now — and, for every
   observed connection, adds a directed **`connects_to`** edge to the peer:

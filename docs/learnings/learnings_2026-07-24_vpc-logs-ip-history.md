@@ -1,10 +1,13 @@
 # Learnings — 2026-07-24 vpc-logs-ip-history
 
-> **Revised within the same session** after review feedback. The flow-log *configuration* is now a
-> **`flow_logs` attribute on the VPC node** (the `flow_log`/`log_group`/`log_bucket` node types and
-> the `logs_to`/`delivers_to` edges were removed). The `flow_peer` node now sits on the **outer
+> **Revised twice within the same session** after review feedback. The flow-log *configuration* is
+> now a **`flow_logs` attribute on the VPC node** (the `flow_log`/`log_group`/`log_bucket` node types
+> and the `logs_to`/`delivers_to` edges were removed). The `flow_peer` node now sits on the **outer
 > IP-source ring** and clusters into its ENI's VPC. ENI→ENI edges gained a **temporal guard** (the
-> peer ENI must have held the IP at record time). Sections below reflect the final state.
+> peer ENI must have held the IP at record time). Finally, the per-ENI IP history is now an
+> **`ip_history`** dict (`{ip: {start, end}}`), and **both** `ip_history` and the VPC `flow_logs`
+> config are **JSON-only** — neither is drawn in the DOT or HTML output (those show only current
+> IPs). Sections below reflect the final state.
 
 ## 1. What this change delivered
 
@@ -28,7 +31,7 @@ new node/edge types — **no** config-grammar or CLI-resolver change).
 - `model/resources.py` — new dataclasses `FlowLog` (+ a `destination` property = log-group name or
   S3 ARN), `IpAllocation`, `FlowLogRecord`, each with `from_collected`.
 - `mapping/flowlogs.py` (**new**) — `map_flow_logs(graph, enis, flow_logs, allocations, records)`:
-  attaches `ip_allocations` to ENI nodes; records each flow log's destination as a **`flow_logs`
+  attaches an `ip_history` dict to **every** ENI node; records each flow log's destination as a **`flow_logs`
   attribute on the owning VPC node** (resolving subnet-/ENI-scoped flow logs up to their VPC via the
   graph's `in_subnet`/`in_vpc` edges); analyses records into `connects_to` edges — **ENI→ENI** when
   the peer IP is another collected ENI *that already held the IP at record time*, else a `flow_peer`
@@ -40,10 +43,10 @@ new node/edge types — **no** config-grammar or CLI-resolver change).
   `_collect_from_cache`/`_collect_live`/`resolve_target`/`_run_all_accounts`; `map_flow_logs` passed
   to `build_graph`.
 - `output/dot_export.py` + `output/html_export.py` — `flow_peer` fill colour (distinct from
-  `internet`/`cidr`), a `Flow logs → …` line on the VPC node (from its `flow_logs` attribute), an
-  `IP since:` ENI label line, and `connects_to` edge styling (blue). In the ringed layout `flow_peer`
-  is added to `_REACH_TYPES` (ring 5) and traced to its ENI's VPC via `connects_to` in
-  `_vpc_group_of` + angle-aligned in `_ringed_view_data`.
+  `internet`/`cidr`) and `connects_to` edge styling (blue). The VPC `flow_logs` config and the ENI
+  `ip_history` are **not** rendered (JSON-only); the writers show only current IPs. In the ringed
+  layout `flow_peer` is added to `_REACH_TYPES` (ring 5) and traced to its ENI's VPC via
+  `connects_to` in `_vpc_group_of` + angle-aligned in `_ringed_view_data`.
 - Fixtures: `ec2_describe-flow-logs.json`, `cloudtrail_lookup-events.json`,
   `logs_filter-log-events.json`. Tests: `tests/test_flowlogs.py` (new) + additions to
   `test_collectors.py` and `test_cli.py`.
@@ -58,9 +61,12 @@ new node/edge types — **no** config-grammar or CLI-resolver change).
   `connects_to` (carries `ports` + `via="flow_log"`). There are **no** `flow_log`/`log_group`/
   `log_bucket` nodes and **no** `logs_to`/`delivers_to` edges — flow-log config is a VPC attribute.
 - **VPC node attribute** `flow_logs`: `[{flow_log_id, resource_id, destination_type, destination,
-  traffic_type, status}]`, sorted by `flow_log_id` (only under `--flow-logs`).
-- **ENI node attribute** `ip_allocations`: `[{"ip", "allocated_at"}]` (only present under
-  `--flow-logs`, and only for ENIs with a CloudTrail event).
+  traffic_type, status}]`, sorted by `flow_log_id` (only under `--flow-logs`). **JSON-only.**
+- **ENI node attribute** `ip_history`: `{ip: {"start": iso|None, "end": iso|None}}` on **every** ENI
+  under `--flow-logs` (`end=None` = current IP; a superseded IP's `end` = the successor's `start`).
+  **JSON-only.** Both writers deliberately omit it — `dot_export._node_lines` and
+  `html_export._detail_line` render only the ENI's *current* `private_ips`. (HTML never carried raw
+  attributes anyway: `_view_data` ships only id/type/label/color/flags/`detail`.)
 - **`connects_to` direction is meaningful**: `peer → ENI` = *what connected to it*; `ENI → peer` =
   *what it connects to*. ENI→ENI edges are the direct form when the peer is another collected ENI
   **and the temporal guard passes**.
@@ -152,7 +158,7 @@ ruff check . && ruff format --check .
 
 # End-to-end, offline, against the checked-in fixtures:
 cloudbreachgraph --from-cache tests/fixtures --flow-logs --output-dir /tmp/cbg-out
-#   graph.json now has: ip_allocations on ENIs; a `flow_logs` attribute on the VPC node (its
+#   graph.json now has: ip_history on every ENI (JSON only); a `flow_logs` attribute on the VPC (its
 #   CloudWatch + S3 destinations); connects_to edges incl. eni-00instance0000001 -> eni-00nlb...003
 #   and -> eni-00alb...002 (ENI->ENI) and flow-peer:203.0.113.5 -> eni-00instance0000001;
 #   the historic nlb->10.0.1.20 (2026-05-01, before the alb held that IP) is dropped;
