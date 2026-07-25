@@ -1,20 +1,25 @@
-"""Flow-log analysis: IP history, flow-log destinations, and observed connections (§5.7).
+"""Flow-log analysis: IP history, per-VPC flow-log config, and observed connections (§5.7).
 
 This is the mapping half of the ``flow_logs`` role (the collectors are in
 ``aws/collectors.py``). Given the collected flow-log *configuration*, the per-ENI IP-allocation
 events, and the parsed flow-log *records*, :func:`map_flow_logs` folds three things into the
 already-built graph:
 
-1. **IP history** — each ENI node gains an ``ip_allocations`` attribute: *when* each of its private
-   IPs was allocated (from CloudTrail ``CreateNetworkInterface`` events).
-2. **Flow-log configuration** — a ``flow_log`` node per configured flow log, a ``log_group`` /
-   ``log_bucket`` node for its destination, and ``logs_to`` (resource → flow_log) / ``delivers_to``
-   (flow_log → destination) edges, so the map shows *where each VPC stores its logs*.
+1. **IP history** — each ENI node gains an ``ip_history`` attribute: ``{ip: {"start", "end"}}`` for
+   every address it has held (from CloudTrail ``CreateNetworkInterface`` events). JSON-only; the
+   DOT/HTML views show only the ENI's *current* private IPs.
+2. **Flow-log configuration** — *not* separate nodes: each flow log's destination (where the logs
+   are stored) is recorded as a ``flow_logs`` **attribute on the VPC** that owns the logged resource
+   (a VPC-, subnet- or ENI-scoped flow log all attach to their VPC). So the map answers "where does
+   this VPC store its logs?" on the VPC itself.
 3. **Observed connections** — for every flow record captured on a collected ENI, from the moment its
    IP was allocated onward (clamped to at most 60 days, ``collectors.FLOW_LOG_MAX_LOOKBACK_DAYS``),
-   the *peer* end of the flow becomes a node and a directed ``connects_to`` edge. When the peer IP
-   belongs to **another collected ENI**, the edge runs **ENI → ENI** directly; otherwise the peer is
-   a ``flow_peer`` node (an external/unmapped address).
+   the *peer* end of the flow becomes a directed ``connects_to`` edge. When the peer IP belongs to
+   **another collected ENI** — *and that ENI already held the IP at the record's time* — the edge
+   runs **ENI → ENI** directly (no new node); otherwise the peer is an external ``flow_peer`` node.
+   A record whose peer IP currently belongs to an ENI but was allocated to it *after* the record was
+   captured is a **historic-IP reuse** and is dropped, so the map never links a current ENI through
+   an address it didn't own at the time.
 
 The transform is deterministic (sorted iteration, aggregated port labels) and read-only — it only
 reshapes an in-memory :class:`~cloudbreachgraph.model.graph.Graph`.
@@ -59,7 +64,7 @@ def map_flow_logs(
     allocations: list[IpAllocation],
     records: list[FlowLogRecord],
 ) -> None:
-    """Fold IP history, flow-log config, and observed connections into ``graph`` (§5.7)."""
+    """Fold IP history, per-VPC flow-log config, and observed connections into ``graph`` (§5.7)."""
     ip_to_eni: dict[str, str] = {}
     eni_ips: dict[str, set[str]] = {}
     for eni in enis:
@@ -70,16 +75,31 @@ def map_flow_logs(
         for ip in ips:
             ip_to_eni.setdefault(ip, eni.id)
 
-    alloc_start = _map_ip_history(graph, allocations)
-    _map_flow_log_config(graph, flow_logs)
-    _map_connections(graph, records, ip_to_eni, eni_ips, alloc_start)
+    # When each *current* ENI IP was allocated (keyed by the IP itself — an IP maps to one ENI).
+    # Used to reject a flow whose peer IP belonged to that ENI only *after* the flow was captured.
+    ip_alloc_epoch: dict[str, int] = {}
+    for alloc in allocations:
+        ep = _epoch(alloc.allocated_at)
+        if alloc.private_ip and ep is not None:
+            # If an IP appears in several events, keep the earliest allocation.
+            ip_alloc_epoch[alloc.private_ip] = min(ep, ip_alloc_epoch.get(alloc.private_ip, ep))
+
+    alloc_start = _map_ip_history(graph, enis, allocations)
+    _attach_flow_log_config_to_vpcs(graph, flow_logs)
+    _map_connections(graph, records, ip_to_eni, eni_ips, alloc_start, ip_alloc_epoch)
 
 
-def _map_ip_history(graph: Graph, allocations: list[IpAllocation]) -> dict[str, int]:
-    """Attach ``ip_allocations`` to each ENI node; return the earliest alloc epoch per ENI.
+def _map_ip_history(
+    graph: Graph, enis: list[Eni], allocations: list[IpAllocation]
+) -> dict[str, int]:
+    """Attach an ``ip_history`` dict to **every** ENI node; return the earliest alloc epoch per ENI.
 
-    The earliest epoch bounds how far back that ENI's flow records are analysed — traffic seen
-    before its IP was allocated is a *different* interface reusing the address and is dropped.
+    ``ip_history`` maps each IP the ENI has held to ``{"start", "end"}`` ISO timestamps: ``start``
+    is when it was allocated (from CloudTrail, ``None`` if unknown), ``end`` is ``None`` while the
+    ENI still holds the IP (its *current* addresses) else the allocation time of the IP that
+    superseded it. This is the full history for the JSON output only — the DOT/HTML views show the
+    *current* private IPs. The returned earliest-alloc epoch per ENI bounds how far back that ENI's
+    flow records are analysed (traffic before its IP existed is a different interface's, dropped).
     """
     by_eni: dict[str, list[IpAllocation]] = {}
     for alloc in allocations:
@@ -87,62 +107,92 @@ def _map_ip_history(graph: Graph, allocations: list[IpAllocation]) -> dict[str, 
             by_eni.setdefault(alloc.eni_id, []).append(alloc)
 
     earliest: dict[str, int] = {}
-    for eni_id, allocs in by_eni.items():
-        node = graph.get_node(eni_id)
+    for eni in enis:
+        node = graph.get_node(eni.id) if eni.id else None
         if node is None or node.type != "eni":
             continue
-        entries = sorted(
-            ({"ip": a.private_ip, "allocated_at": a.allocated_at} for a in allocs),
-            key=lambda e: (e["allocated_at"] or "", e["ip"] or ""),
+        allocs = by_eni.get(eni.id, [])
+
+        # Earliest known allocation start per IP (an IP could appear in several events).
+        start_of: dict[str, str | None] = {}
+        for a in allocs:
+            if not a.private_ip:
+                continue
+            prev = start_of.get(a.private_ip)
+            if prev is None or (a.allocated_at or "") < prev:
+                start_of[a.private_ip] = a.allocated_at
+
+        # Allocation starts in chronological order, to find what superseded a released IP.
+        ordered = sorted(
+            ((_epoch(s), s) for s in start_of.values() if s), key=lambda t: (t[0] or 0, t[1])
         )
-        node.attributes["ip_allocations"] = entries
-        epochs = [e for e in (_epoch(a.allocated_at) for a in allocs) if e is not None]
+        current = {ip for ip in eni.private_ips if ip}
+
+        def _end_for(start_iso: str | None) -> str | None:
+            # The next allocation after this IP's start marks when it stopped being on the ENI.
+            se = _epoch(start_iso)
+            for ep, iso in ordered:  # noqa: B023 - ordered/se are per-iteration by design
+                if se is not None and ep is not None and ep > se:
+                    return iso
+            return None
+
+        history: dict[str, dict[str, str | None]] = {}
+        for ip in sorted(current | set(start_of), key=lambda i: (start_of.get(i) or "", i)):
+            start = start_of.get(ip)
+            end = None if ip in current else _end_for(start)
+            history[ip] = {"start": start, "end": end}
+        node.attributes["ip_history"] = history
+
+        epochs = [e for e in (_epoch(s) for s in start_of.values()) if e is not None]
         if epochs:
-            earliest[eni_id] = min(epochs)
+            earliest[eni.id] = min(epochs)
     return earliest
 
 
-def _map_flow_log_config(graph: Graph, flow_logs: list[FlowLog]) -> None:
-    """Add ``flow_log`` + destination (``log_group``/``log_bucket``) nodes and their edges."""
-    for fl in sorted(flow_logs, key=lambda f: f.id or ""):
+def _attach_flow_log_config_to_vpcs(graph: Graph, flow_logs: list[FlowLog]) -> None:
+    """Record each flow log's destination as a ``flow_logs`` attribute on the owning VPC node.
+
+    A flow log's ``ResourceId`` is a VPC, subnet, or ENI; all three resolve up to a VPC (subnet via
+    its ``in_vpc`` edge, ENI via ``in_subnet`` then ``in_vpc``). The config is stored on the VPC
+    itself — "where does this VPC store its logs?" — rather than as separate ``flow_log``/
+    destination nodes. A flow log whose VPC isn't in the (ENI-anchored) graph is skipped.
+    """
+    eni_subnet = {e.source: e.target for e in graph.edges if e.relationship == "in_subnet"}
+    subnet_vpc = {e.source: e.target for e in graph.edges if e.relationship == "in_vpc"}
+
+    def _vpc_of(resource_id: str | None) -> str | None:
+        if not resource_id:
+            return None
+        if resource_id.startswith("vpc-"):
+            return resource_id
+        if resource_id.startswith("subnet-"):
+            return subnet_vpc.get(resource_id)
+        if resource_id.startswith("eni-"):
+            return subnet_vpc.get(eni_subnet.get(resource_id, ""))
+        return None
+
+    by_vpc: dict[str, list[dict]] = {}
+    for fl in flow_logs:
         if not fl.id:
             continue
-        graph.add_node(
-            Node(
-                id=fl.id,
-                type="flow_log",
-                label=fl.id,
-                attributes={
-                    "resource_id": fl.resource_id,
-                    "destination_type": fl.destination_type,
-                    "traffic_type": fl.traffic_type,
-                    "status": fl.status,
-                },
-            )
+        vpc_id = _vpc_of(fl.resource_id)
+        if vpc_id is None or graph.get_node(vpc_id) is None:
+            continue
+        by_vpc.setdefault(vpc_id, []).append(
+            {
+                "flow_log_id": fl.id,
+                "resource_id": fl.resource_id,
+                "destination_type": fl.destination_type,
+                "destination": fl.destination,
+                "traffic_type": fl.traffic_type,
+                "status": fl.status,
+            }
         )
-        # resource -> flow_log, only when the logged resource is already in the graph so no edge
-        # dangles (a flow log can target a VPC/subnet/ENI that no ENI referenced).
-        if fl.resource_id and graph.get_node(fl.resource_id) is not None:
-            graph.add_edge(Edge(source=fl.resource_id, target=fl.id, relationship="logs_to"))
 
-        dest_id = fl.destination_id
-        if dest_id:
-            graph.add_node(
-                Node(
-                    id=dest_id,
-                    type=fl.destination_node_type,
-                    label=dest_id,
-                    attributes={"destination_type": fl.destination_type},
-                )
-            )
-            graph.add_edge(
-                Edge(
-                    source=fl.id,
-                    target=dest_id,
-                    relationship="delivers_to",
-                    attributes={"destination_type": fl.destination_type},
-                )
-            )
+    for vpc_id, entries in by_vpc.items():
+        graph.get_node(vpc_id).attributes["flow_logs"] = sorted(
+            entries, key=lambda e: e["flow_log_id"] or ""
+        )
 
 
 def _map_connections(
@@ -151,15 +201,18 @@ def _map_connections(
     ip_to_eni: dict[str, str],
     eni_ips: dict[str, set[str]],
     alloc_start: dict[str, int],
+    ip_alloc_epoch: dict[str, int],
 ) -> None:
     """Turn flow records into ``connects_to`` edges (+ ``flow_peer`` nodes for external peers).
 
     For each record captured on a collected ENI ``A``, the *peer* end (the address that is not
     ``A``'s) becomes the other node. A peer IP that belongs to another collected ENI ``B`` yields a
-    direct **ENI → ENI** edge; otherwise the peer is an external ``flow_peer`` node. Ports are
-    aggregated per directed edge so repeated flows collapse to one edge with a merged port label.
+    direct **ENI → ENI** edge — but only if ``B`` already held that IP when the flow was captured
+    (else the record is a historic-IP reuse and is dropped). Otherwise the peer is an external
+    ``flow_peer`` node. Ports are aggregated per directed edge so repeated flows collapse to one
+    edge with a merged port label.
     """
-    # (source_id, target_id) -> {ports, peer_ip (for a flow_peer node), peer_is_eni}
+    # (source_id, target_id) -> {ports, peer_ip (set only for a flow_peer node)}
     agg: dict[tuple[str, str], dict] = {}
 
     for rec in records:
@@ -177,7 +230,7 @@ def _map_connections(
         if not peer_ip:
             continue
 
-        # Clamp to the IP-allocation window: drop traffic seen before the ENI's IP was allocated.
+        # Clamp to the home ENI's IP-allocation window: drop traffic seen before its IP existed.
         start_bound = alloc_start.get(home)
         if start_bound is not None and rec.start is not None and rec.start < start_bound:
             continue
@@ -187,6 +240,11 @@ def _map_connections(
             continue  # a flow between this ENI's own addresses — no peer
 
         if peer_eni is not None:
+            # Temporal guard: only link to the peer ENI if it already held this IP at record time.
+            # A known allocation *after* the flow means the IP was a different interface's then.
+            peer_alloc = ip_alloc_epoch.get(peer_ip)
+            if peer_alloc is not None and rec.start is not None and rec.start < peer_alloc:
+                continue  # historic-IP reuse — don't link the current ENI through a stale address
             src, tgt = (peer_eni, home) if inbound else (home, peer_eni)
             peer_node_ip = None
         else:

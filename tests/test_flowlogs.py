@@ -1,8 +1,9 @@
 """Tests for the flow-log analysis (``mapping/flowlogs.py`` via ``build_graph``, §5.7).
 
-Covers the §5.7 rules: IP-allocation history on ENI nodes, flow-log configuration + destination
-nodes/edges, observed-connection ``connects_to`` edges (ENI->ENI when the peer is another collected
-ENI, else a ``flow_peer`` node), and the IP-allocation-time clamp. Fully offline.
+Covers the §5.7 rules: IP-allocation history on ENI nodes, flow-log configuration as a VPC
+attribute, observed-connection ``connects_to`` edges (ENI->ENI when the peer is another collected
+ENI that already held the IP at record time, else a ``flow_peer`` node), and the allocation-time
+clamps. Fully offline.
 """
 
 from __future__ import annotations
@@ -60,43 +61,95 @@ def _edges(graph, rel):
 # --------------------------------------------------------------------------- #
 # IP history
 # --------------------------------------------------------------------------- #
-def test_ip_allocation_history_on_eni_nodes(flow_bundle):
+def test_ip_history_on_eni_nodes(flow_bundle):
     graph = build_graph(flow_bundle, map_flow_logs=True)
+    # ip_history: {ip: {start, end}} — start from CloudTrail, end None while the IP is current.
     inst = graph.get_node("eni-00instance0000001")
-    assert inst.attributes["ip_allocations"] == [
-        {"ip": "10.0.1.10", "allocated_at": "2026-06-01T00:00:00+00:00"}
-    ]
-    # An ENI with no CloudTrail event carries no ip_allocations attribute.
-    assert "ip_allocations" not in graph.get_node("eni-00nlb00000000003").attributes
+    assert inst.attributes["ip_history"] == {
+        "10.0.1.10": {"start": "2026-06-01T00:00:00+00:00", "end": None}
+    }
+    # Every ENI gets the field, even one with no CloudTrail event: its current IP, start unknown.
+    assert graph.get_node("eni-00nlb00000000003").attributes["ip_history"] == {
+        "10.0.2.30": {"start": None, "end": None}
+    }
 
 
 def test_ip_history_absent_without_flag(flow_bundle):
     graph = build_graph(flow_bundle)  # map_flow_logs defaults off
-    assert "ip_allocations" not in graph.get_node("eni-00instance0000001").attributes
+    assert "ip_history" not in graph.get_node("eni-00instance0000001").attributes
+
+
+def _eni_dict(eni_id, ips):
+    return {
+        "NetworkInterfaceId": eni_id,
+        "SubnetId": "subnet-1",
+        "VpcId": "vpc-1",
+        "InterfaceType": "interface",
+        "Description": "",
+        "Status": "in-use",
+        "AvailabilityZone": "us-east-1a",
+        "RequesterId": None,
+        "RequesterManaged": False,
+        "Attachment": {"InstanceId": None},
+        "Association": {"PublicIp": None},
+        "PrivateIpAddresses": [{"PrivateIpAddress": ip} for ip in ips],
+        "Groups": [],
+    }
+
+
+def _alloc(ip, at):
+    return {"NetworkInterfaceId": "eni-h", "PrivateIpAddress": ip, "AllocatedAt": at}
+
+
+def test_ip_history_marks_a_superseded_ip_with_start_and_end():
+    # An ENI whose IP changed: 10.0.0.5 (2026-05-01) was replaced by current 10.0.0.9 (2026-06-01).
+    bundle = {
+        "meta": {"target": None, "region": "us-east-1", "accounts": {}},
+        "network_interfaces": [_eni_dict("eni-h", ["10.0.0.9"])],
+        "ec2_instances": [],
+        "load_balancers_v2": [],
+        "load_balancers_classic": [],
+        "subnets": [],
+        "vpcs": [],
+        "flow_logs": [],
+        "ip_allocations": [
+            _alloc("10.0.0.5", "2026-05-01T00:00:00+00:00"),
+            _alloc("10.0.0.9", "2026-06-01T00:00:00+00:00"),
+        ],
+        "flow_log_records": [],
+    }
+    history = build_graph(bundle, map_flow_logs=True).get_node("eni-h").attributes["ip_history"]
+    assert history == {
+        # The released IP: start = its allocation, end = when the successor was allocated.
+        "10.0.0.5": {"start": "2026-05-01T00:00:00+00:00", "end": "2026-06-01T00:00:00+00:00"},
+        # The current IP: still held, so end is open.
+        "10.0.0.9": {"start": "2026-06-01T00:00:00+00:00", "end": None},
+    }
 
 
 # --------------------------------------------------------------------------- #
-# Flow-log configuration + destinations
+# Flow-log configuration — a VPC attribute, not separate nodes
 # --------------------------------------------------------------------------- #
-def test_flow_log_config_and_destination_nodes(flow_bundle):
+def test_flow_log_config_is_a_vpc_attribute_not_nodes(flow_bundle):
     graph = build_graph(flow_bundle, map_flow_logs=True)
-    cw = graph.get_node("fl-0abc00000000001")
-    assert cw is not None and cw.type == "flow_log"
-    assert cw.attributes["destination_type"] == "cloud-watch-logs"
+    # No standalone flow-log / destination nodes or plumbing edges any more.
+    assert not any(n.type in ("flow_log", "log_group", "log_bucket") for n in graph.nodes)
+    assert not any(e.relationship in ("logs_to", "delivers_to") for e in graph.edges)
 
-    log_group = graph.get_node("/vpc/flowlogs/prod")
-    assert log_group is not None and log_group.type == "log_group"
-    log_bucket = graph.get_node("arn:aws:s3:::prod-flow-logs-bucket/AWSLogs/")
-    assert log_bucket is not None and log_bucket.type == "log_bucket"
-
-    # resource -> flow_log (the VPC logs to fl-...001; the subnet to fl-...002).
-    logs_to = {(e.source, e.target) for e in _edges(graph, "logs_to")}
-    assert ("vpc-0aaaaaaaaaaaaaaaa", "fl-0abc00000000001") in logs_to
-    assert ("subnet-022222222222222", "fl-0abc00000000002") in logs_to
-    # flow_log -> destination.
-    delivers = {(e.source, e.target) for e in _edges(graph, "delivers_to")}
-    assert ("fl-0abc00000000001", "/vpc/flowlogs/prod") in delivers
-    assert ("fl-0abc00000000002", "arn:aws:s3:::prod-flow-logs-bucket/AWSLogs/") in delivers
+    # The config lives on the VPC that owns the logged resource. Both flow logs (one VPC-scoped,
+    # one subnet-scoped) resolve up to the same VPC and its destination is recorded there.
+    vpc = graph.get_node("vpc-0aaaaaaaaaaaaaaaa")
+    flow_logs = vpc.attributes["flow_logs"]
+    assert [fl["flow_log_id"] for fl in flow_logs] == [
+        "fl-0abc00000000001",
+        "fl-0abc00000000002",
+    ]
+    by_id = {fl["flow_log_id"]: fl for fl in flow_logs}
+    assert by_id["fl-0abc00000000001"]["destination"] == "/vpc/flowlogs/prod"
+    assert by_id["fl-0abc00000000001"]["destination_type"] == "cloud-watch-logs"
+    # A subnet-scoped flow log still attaches to its VPC (resolved via the subnet).
+    assert by_id["fl-0abc00000000002"]["resource_id"] == "subnet-022222222222222"
+    assert by_id["fl-0abc00000000002"]["destination"].startswith("arn:aws:s3:::")
 
 
 # --------------------------------------------------------------------------- #
@@ -123,11 +176,24 @@ def test_external_peer_becomes_flow_peer_node(flow_bundle):
     assert edge.attributes["ports"] == "tcp/22"
 
 
-def test_traffic_before_ip_allocation_is_dropped(flow_bundle):
+def test_traffic_before_home_ip_allocation_is_dropped(flow_bundle):
     # The 198.51.100.9 record predates the instance ENI's 2026-06-01 IP allocation -> excluded.
     graph = build_graph(flow_bundle, map_flow_logs=True)
     assert graph.get_node("flow-peer:198.51.100.9") is None
     assert not any(e.source == "flow-peer:198.51.100.9" for e in _edges(graph, "connects_to"))
+
+
+def test_eni_to_eni_edge_requires_peer_held_the_ip_at_record_time(flow_bundle):
+    # A valid instance->alb flow (2026-06-15, after the alb's 2026-05-20 IP allocation) links them.
+    graph = build_graph(flow_bundle, map_flow_logs=True)
+    connects = {(e.source, e.target) for e in _edges(graph, "connects_to")}
+    assert ("eni-00instance0000001", "eni-00alb00000000002") in connects
+
+    # But the nlb->10.0.1.20 flow at 2026-05-01 predates when the alb ENI got 10.0.1.20
+    # (2026-05-20): the IP was a different interface's then -> historic reuse, dropped.
+    assert ("eni-00nlb00000000003", "eni-00alb00000000002") not in connects
+    # ...and no flow_peer is invented for an IP that currently belongs to an ENI.
+    assert graph.get_node("flow-peer:10.0.1.20") is None
 
 
 def test_flow_logs_are_a_noop_without_the_flag(flow_bundle):
@@ -136,6 +202,8 @@ def test_flow_logs_are_a_noop_without_the_flag(flow_bundle):
     assert not types & {"flow_log", "log_group", "log_bucket", "flow_peer"}
     rels = {e.relationship for e in graph.edges}
     assert not rels & {"connects_to", "logs_to", "delivers_to"}
+    # And the VPC carries no flow-log attribute in the network-only view.
+    assert "flow_logs" not in graph.get_node("vpc-0aaaaaaaaaaaaaaaa").attributes
 
 
 def test_flow_log_mapping_is_deterministic(flow_bundle):

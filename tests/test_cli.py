@@ -315,6 +315,8 @@ def test_flow_logs_off_by_default(tmp_path):
     data = json.loads((out / "graph.json").read_text())
     types = {n["type"] for n in data["nodes"]}
     assert not types & {"flow_log", "log_group", "log_bucket", "flow_peer"}
+    vpc = next(n for n in data["nodes"] if n["id"] == "vpc-0aaaaaaaaaaaaaaaa")
+    assert "flow_logs" not in vpc["attributes"]
 
 
 def test_flow_logs_flag_adds_history_config_and_connections(tmp_path):
@@ -324,22 +326,48 @@ def test_flow_logs_flag_adds_history_config_and_connections(tmp_path):
     data = json.loads((out / "graph.json").read_text())
     nodes = {n["id"]: n for n in data["nodes"]}
 
-    # IP history folded onto an ENI node.
-    assert nodes["eni-00instance0000001"]["attributes"]["ip_allocations"]
-    # Flow-log config + destinations.
-    assert nodes["fl-0abc00000000001"]["type"] == "flow_log"
-    assert nodes["/vpc/flowlogs/prod"]["type"] == "log_group"
+    # IP history folded onto an ENI node (JSON only).
+    assert nodes["eni-00instance0000001"]["attributes"]["ip_history"] == {
+        "10.0.1.10": {"start": "2026-06-01T00:00:00+00:00", "end": None}
+    }
+    # Flow-log config lives on the VPC (no standalone flow_log/log_group/log_bucket nodes).
+    assert not {"flow_log", "log_group", "log_bucket"} & {n["type"] for n in data["nodes"]}
+    vpc_flow_logs = nodes["vpc-0aaaaaaaaaaaaaaaa"]["attributes"]["flow_logs"]
+    assert {fl["destination"] for fl in vpc_flow_logs} == {
+        "/vpc/flowlogs/prod",
+        "arn:aws:s3:::prod-flow-logs-bucket/AWSLogs/",
+    }
 
     edges = {(e["source"], e["target"], e["relationship"]) for e in data["edges"]}
     # An ENI->ENI connection discovered from the flow logs.
-    assert (
-        "eni-00instance0000001",
-        "eni-00nlb00000000003",
-        "connects_to",
-    ) in edges
-    # An external peer connecting in.
+    assert ("eni-00instance0000001", "eni-00nlb00000000003", "connects_to") in edges
+    # An external peer connecting in (an IP that is not one of the account's ENIs).
     assert nodes["flow-peer:203.0.113.5"]["type"] == "flow_peer"
     assert data["meta"]["flow_log_window_days"] == 60
+
+
+def test_flow_log_config_and_ip_history_are_json_only(tmp_path):
+    out = tmp_path / "out"
+    rc = cli.main(
+        ["--from-cache", str(FIXTURES), "--flow-logs", "--html", "--output-dir", str(out)]
+    )
+    assert rc == 0
+    json_text = (out / "graph.json").read_text()
+    dot_text = (out / "graph.dot").read_text()
+    html_text = (out / "graph.html").read_text()
+
+    # The JSON keeps both the flow-log destinations and the per-ENI IP history.
+    assert "/vpc/flowlogs/prod" in json_text and '"ip_history"' in json_text
+
+    # Neither the flow-log config (destinations) nor the historical allocation timestamps show in
+    # the DOT or HTML display output — only current IPs are drawn there.
+    for text in (dot_text, html_text):
+        assert "/vpc/flowlogs/prod" not in text
+        assert "prod-flow-logs-bucket" not in text
+        assert "ip_history" not in text
+        assert "2026-06-01" not in text  # an allocation timestamp
+    # ...but the ENI's current private IP is still shown in the DOT.
+    assert "10.0.1.10" in dot_text
 
 
 def test_flow_logs_live_run_uses_role_collectors(tmp_path, fake_aws):

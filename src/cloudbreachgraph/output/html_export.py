@@ -86,17 +86,15 @@ _TYPE_COLORS: dict[str, str] = {
     "internet": "#EF9A9A",
     "cidr": "#FFE082",
     "security_group": "#F48FB1",
-    # Flow logs (docs/02_architecture.md §5.7).
-    "flow_log": "#4FC3F7",
-    "log_group": "#4DD0E1",
-    "log_bucket": "#FFB74D",
+    # An external address seen in the flow logs (§5.7); it shares the outer IP-source ring.
     "flow_peer": "#B0BEC5",
 }
 _DEFAULT_COLOR = "#CFD8DC"
 
-# Node types that are reachability *IP sources* (§5.5) — the outermost ring. Security groups are
-# their own (inner) ring, handled separately, so they are deliberately not in this set.
-_REACH_TYPES = frozenset({"internet", "cidr"})
+# Node types on the outermost *IP-source* ring (§5.5/§5.7): reachability sources (internet/cidr)
+# plus flow-log peers (external addresses observed talking to an ENI). Security groups are their own
+# (inner) ring, handled separately, so they are deliberately not in this set.
+_REACH_TYPES = frozenset({"internet", "cidr", "flow_peer"})
 
 # Edge relationships that connect a reachability source to an SG or ENI (§5.5/§5.6): the routability
 # split (routable/not-routable) plus the undetermined fallback. Grouped so the ringed layout treats
@@ -155,11 +153,10 @@ def _detail_line(node_type: str, attrs: dict) -> str:
     if node_type == "vpc_endpoint" and attrs.get("service_name"):
         return str(attrs["service_name"])
     if node_type in ("subnet", "vpc") and attrs.get("cidr"):
+        # A VPC's `flow_logs` config and an ENI's `ip_history` (§5.7) are JSON-only, never rendered.
         return str(attrs["cidr"])
     if node_type == "ec2_instance" and attrs.get("state"):
         return str(attrs["state"])
-    if node_type == "flow_log" and attrs.get("destination_type"):
-        return str(attrs["destination_type"])
     return ""
 
 
@@ -654,6 +651,7 @@ def _vpc_group_of(graph: Graph) -> dict[str, str]:
     node_eni: dict[str, str] = {}  # ec2/lb (attach target) -> the ENI attached to it
     sg_eni: dict[str, str] = {}  # security_group -> a member ENI (from secured_by)
     reach_target: dict[str, str] = {}  # reach source -> an SG or ENI it can reach
+    peer_eni: dict[str, str] = {}  # flow_peer -> the ENI it exchanges flows with (§5.7)
     for e in graph.edges:
         if e.relationship == "in_subnet":
             eni_subnet.setdefault(e.source, e.target)
@@ -665,6 +663,12 @@ def _vpc_group_of(graph: Graph) -> dict[str, str]:
             sg_eni.setdefault(e.target, e.source)
         elif e.relationship in _REACH_RELS:
             reach_target.setdefault(e.source, e.target)
+        elif e.relationship == "connects_to":
+            # A connects_to edge is flow_peer<->ENI (either direction); map the peer to the ENI end.
+            if node_type.get(e.source) == "flow_peer":
+                peer_eni.setdefault(e.source, e.target)
+            elif node_type.get(e.target) == "flow_peer":
+                peer_eni.setdefault(e.target, e.source)
 
     def _vpc_of_eni(eni: str | None) -> str | None:
         return subnet_vpc.get(eni_subnet.get(eni or "", "")) if eni else None
@@ -692,6 +696,8 @@ def _vpc_group_of(graph: Graph) -> dict[str, str]:
             g = _vpc_of_eni(n.id)
         elif n.type == "security_group":
             g = _vpc_of_sg(n.id)
+        elif n.type == "flow_peer":  # trace to the VPC of the ENI it exchanges flows with (§5.7)
+            g = _vpc_of_eni(peer_eni.get(n.id))
         elif n.type in _REACH_TYPES:
             g = _vpc_of_source(n.id)
         else:
@@ -783,6 +789,16 @@ def _ringed_view_data(graph: Graph, passes: int = 0) -> dict:
             enis_of_source.setdefault(src, []).extend(enis_of_sg.get(tgt, []))
         else:
             enis_of_source.setdefault(src, []).append(tgt)
+
+    # A flow_peer shares the outer IP-source ring (§5.7); align it to the ENI it exchanges flows
+    # with (either direction of the connects_to edge) so it sits radially just outside that ENI.
+    for e in graph.edges:
+        if e.relationship != "connects_to":
+            continue
+        if by_id.get(e.source, {}).get("type") == "flow_peer":
+            enis_of_source.setdefault(e.source, []).append(e.target)
+        elif by_id.get(e.target, {}).get("type") == "flow_peer":
+            enis_of_source.setdefault(e.target, []).append(e.source)
 
     # Bucket nodes into groups, and within a group into rings, preserving the deterministic
     # (type, id) order the Graph already sorted them into.

@@ -29,6 +29,18 @@
       "timestamp": 1781481600000,
       "ingestionTime": 1781481605000,
       "message": "2 111111111111 eni-00instance0000001 10.0.1.10 - 51000 - 6 1 40 1781481600 1781481660 - NODATA"
+    },
+    {
+      "logStreamName": "eni-00instance0000001-all",
+      "timestamp": 1781481600000,
+      "ingestionTime": 1781481605000,
+      "message": "2 111111111111 eni-00instance0000001 10.0.1.10 10.0.1.20 51000 443 6 15 6000 1781481600 1781481660 ACCEPT OK"
+    },
+    {
+      "logStreamName": "eni-00nlb00000000003-all",
+      "timestamp": 1777593600000,
+      "ingestionTime": 1777593605000,
+      "message": "2 111111111111 eni-00nlb00000000003 10.0.2.30 10.0.1.20 51000 8443 6 3 200 1777593600 1777593660 ACCEPT OK"
     }
   ],
   "searchedLogStreams": []
