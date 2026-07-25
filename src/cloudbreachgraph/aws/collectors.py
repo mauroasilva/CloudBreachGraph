@@ -15,6 +15,7 @@ collectors — no change to the driver loop, the config grammar, or the CLI.
 from __future__ import annotations
 
 import json as _json
+import sys
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -286,7 +287,8 @@ def _normalize_allocation_event(raw: dict) -> dict | None:
     }
 
 
-# VPC Flow Log default (version 2) record fields, space-separated. We only depend on a handful.
+# VPC Flow Log **default** (version 2) record field positions, space-separated. Used when a flow log
+# has no explicit ``LogFormat`` (the standard layout).
 _FLOW_FIELD_IDX = {
     "interface_id": 2,
     "srcaddr": 3,
@@ -298,30 +300,75 @@ _FLOW_FIELD_IDX = {
     "action": 12,
 }
 
+# Map a ``LogFormat`` token name (as it appears inside ``${...}``) to our internal field key, so a
+# **custom** flow-log format is parsed by *position derived from its own format string* rather than
+# assuming the default order. Only the fields the analysis needs are mapped.
+_FLOW_TOKEN_TO_KEY = {
+    "interface-id": "interface_id",
+    "srcaddr": "srcaddr",
+    "dstaddr": "dstaddr",
+    "srcport": "srcport",
+    "dstport": "dstport",
+    "protocol": "protocol",
+    "start": "start",
+    "action": "action",
+}
 
-def _parse_flow_log_message(message: str, log_group: str | None) -> dict | None:
-    """Parse one default-format VPC flow-log record line into a normalized dict.
+# The fields we must be able to locate to use a record at all (the ENI + the two ends).
+_FLOW_REQUIRED = ("interface_id", "srcaddr", "dstaddr")
 
-    Fields we keep (``docs/02_architecture.md §5.7``): ``interface_id`` (the ENI the flow was
-    captured on), ``srcaddr``/``dstaddr`` (the two ends), ``srcport``/``dstport``, ``protocol``,
+
+def _field_index_from_format(log_format: str | None) -> dict[str, int] | None:
+    """Build a field-name -> position map from a flow log's ``LogFormat`` string.
+
+    ``LogFormat`` looks like ``"${version} ${account-id} ${interface-id} ${srcaddr} ..."``; each
+    ``${token}`` occupies one space-separated position. An empty/absent format means the **default**
+    layout (:data:`_FLOW_FIELD_IDX`). Returns ``None`` if the format omits a required field
+    (:data:`_FLOW_REQUIRED`), so the caller can skip that group instead of misreading every line."""
+    if not log_format or not log_format.strip():
+        return dict(_FLOW_FIELD_IDX)
+    idx: dict[str, int] = {}
+    for pos, token in enumerate(log_format.split()):
+        name = token.strip()
+        if name.startswith("${") and name.endswith("}"):
+            name = name[2:-1]
+        key = _FLOW_TOKEN_TO_KEY.get(name)
+        if key is not None:
+            idx[key] = pos
+    if any(k not in idx for k in _FLOW_REQUIRED):
+        return None
+    return idx
+
+
+def _parse_flow_log_message(
+    message: str, log_group: str | None, field_idx: dict[str, int] | None = None
+) -> dict | None:
+    """Parse one VPC flow-log record line into a normalized dict, per ``field_idx``.
+
+    ``field_idx`` maps field name -> position (from the flow log's ``LogFormat``, or the default
+    layout). Fields we keep (``docs/02_architecture.md §5.7``): ``interface_id`` (the ENI the flow
+    was captured on), ``srcaddr``/``dstaddr`` (the two ends), ``srcport``/``dstport``, ``protocol``,
     the capture-window ``start`` (epoch seconds, used to clamp to the IP-allocation window) and the
     ``action`` (ACCEPT/REJECT). A missing address (``-``, common for skipped/NODATA records) makes
     the line unusable, so we drop it — never guess."""
+    idx = field_idx if field_idx is not None else _FLOW_FIELD_IDX
     parts = message.split()
-    if len(parts) <= _FLOW_FIELD_IDX["action"]:
+    needed = max((idx[k] for k in _FLOW_REQUIRED), default=0)
+    if len(parts) <= needed:
         return None
 
-    def _field(name: str) -> str:
-        return parts[_FLOW_FIELD_IDX[name]]
+    def _field(name: str) -> str | None:
+        pos = idx.get(name)
+        return parts[pos] if pos is not None and pos < len(parts) else None
 
     srcaddr, dstaddr = _field("srcaddr"), _field("dstaddr")
-    if srcaddr in ("", "-") or dstaddr in ("", "-"):
+    if srcaddr in (None, "", "-") or dstaddr in (None, "", "-"):
         return None
 
-    def _int(value: str) -> int | None:
+    def _int(value: str | None) -> int | None:
         try:
-            return int(value)
-        except ValueError:
+            return int(value)  # type: ignore[arg-type]
+        except (ValueError, TypeError):
             return None
 
     return {
@@ -478,19 +525,30 @@ def collect_flow_log_records(profile: str | None, region: str | None) -> list[di
     filter-log-events`` and parses every line (``docs/02_architecture.md §5.7``). S3-destined flow
     logs are shown as a destination node but their object contents are **not** read here (that would
     need per-object S3 ``get-object`` calls); this collector covers the CloudWatch path. Read-only:
-    ``filter-log-events`` only retrieves. Returns a flat list of normalized flow records."""
+    ``filter-log-events`` only retrieves. Returns a flat list of normalized flow records.
+
+    Emits a one-line diagnostic to stderr (config counts by destination, groups queried, events
+    fetched, records parsed) so an empty result is explainable — the common causes are flow logs
+    delivered to **S3** (whose records this path does not read) or a scope/permission mismatch."""
     config = runner.run_aws(["ec2", "describe-flow-logs"], profile=profile, region=region)
-    log_groups = sorted(
-        {
-            fl.get("LogGroupName")
-            for fl in config.get("FlowLogs", [])
-            if fl.get("LogDestinationType") == "cloud-watch-logs" and fl.get("LogGroupName")
-        }
-    )
+    flow_logs = config.get("FlowLogs", [])
+
+    # group -> field-index map (from that group's LogFormat); skips groups with an unusable format.
+    group_fields: dict[str, dict[str, int]] = {}
+    dest_counts: dict[str, int] = {}
+    for fl in flow_logs:
+        dest = fl.get("LogDestinationType") or "unknown"
+        dest_counts[dest] = dest_counts.get(dest, 0) + 1
+        group = fl.get("LogGroupName")
+        if dest == "cloud-watch-logs" and group and group not in group_fields:
+            fields = _field_index_from_format(fl.get("LogFormat"))
+            if fields is not None:
+                group_fields[group] = fields
 
     start_ms = int((time.time() - FLOW_LOG_MAX_LOOKBACK_DAYS * 86400) * 1000)
     records: list[dict] = []
-    for group in log_groups:
+    total_events = 0
+    for group in sorted(group_fields):
         data = runner.run_aws(
             [
                 "logs",
@@ -501,11 +559,45 @@ def collect_flow_log_records(profile: str | None, region: str | None) -> list[di
             profile=profile,
             region=region,
         )
-        for event in data.get("events", []):
-            rec = _parse_flow_log_message(event.get("message", ""), group)
+        events = data.get("events", [])
+        total_events += len(events)
+        for event in events:
+            rec = _parse_flow_log_message(event.get("message", ""), group, group_fields[group])
             if rec is not None:
                 records.append(rec)
+
+    _report_flow_log_records(flow_logs, dest_counts, group_fields, total_events, len(records))
     return records
+
+
+def _report_flow_log_records(
+    flow_logs: list[dict],
+    dest_counts: dict[str, int],
+    group_fields: dict[str, dict[str, int]],
+    total_events: int,
+    parsed: int,
+) -> None:
+    """Emit a concise stderr diagnostic for the flow-log record fetch (``docs/02_architecture.md
+    §5.7``) so an empty result points at its cause rather than failing silently."""
+    dest = ", ".join(f"{n} {d}" for d, n in sorted(dest_counts.items())) or "none"
+    print(
+        f"cloudbreachgraph: flow logs: {len(flow_logs)} config(s) [{dest}]; "
+        f"queried {len(group_fields)} CloudWatch group(s); fetched {total_events} log event(s); "
+        f"parsed {parsed} flow record(s).",
+        file=sys.stderr,
+    )
+    if dest_counts.get("s3") and not group_fields:
+        print(
+            "cloudbreachgraph: note: flow logs deliver to S3, whose record contents are not read "
+            "(only CloudWatch Logs). No connections will be derived. See docs/05_roadmap.md.",
+            file=sys.stderr,
+        )
+    elif total_events and not parsed:
+        print(
+            "cloudbreachgraph: note: fetched log events but parsed no flow records — the log "
+            "group may hold a non-flow-log or unrecognised custom format.",
+            file=sys.stderr,
+        )
 
 
 # --------------------------------------------------------------------------- #

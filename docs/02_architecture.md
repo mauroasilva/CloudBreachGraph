@@ -312,7 +312,14 @@ into the already-built graph:
    `ip_history`, this config is **JSON-only** — it is never drawn in the DOT or HTML output.
 
 3. **Observed connections** (`logs filter-log-events`, up to `FLOW_LOG_MAX_LOOKBACK_DAYS = 60` days
-   of default-format records from each CloudWatch flow-log group). For each record captured on a
+   of records from each CloudWatch flow-log group). Records are parsed by **field position derived
+   from each flow log's own `LogFormat`** (from `describe-flow-logs`), so a **custom** flow-log
+   format is read correctly; an absent format means the default v2 layout, and a format missing a
+   required field (`interface-id`/`srcaddr`/`dstaddr`) makes the group skip rather than misread. The
+   collector prints a one-line **stderr diagnostic** — config counts by destination, groups queried,
+   events fetched, records parsed — so an empty result is explainable (the usual causes: flow logs
+   delivered to **S3**, whose record contents this path does not read, or a scope/permission
+   mismatch). For each record captured on a
    collected ENI `A`, the *peer* end (the address that isn't one of `A`'s private IPs) becomes the
    other node of a directed **`connects_to`** edge — `peer → A` when `A` is the destination (*what
    connected to it*), `A → peer` when `A` is the source (*what it connects to*):

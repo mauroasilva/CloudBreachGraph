@@ -231,6 +231,41 @@ def test_collect_flow_log_records_parses_and_skips_nodata(fake_aws):
     assert any("--log-group-name=/vpc/flowlogs/prod" == a for a in filt["args"])
 
 
+def test_field_index_from_format_default_and_custom():
+    # Empty/absent LogFormat -> the standard v2 layout.
+    assert collectors._field_index_from_format(None) == collectors._FLOW_FIELD_IDX
+    assert collectors._field_index_from_format("  ") == collectors._FLOW_FIELD_IDX
+    # A custom format is parsed by position from its own token order.
+    idx = collectors._field_index_from_format(
+        "${version} ${interface-id} ${srcaddr} ${dstaddr} ${protocol} ${dstport} ${action} ${start}"
+    )
+    assert idx == {
+        "interface_id": 1,
+        "srcaddr": 2,
+        "dstaddr": 3,
+        "protocol": 4,
+        "dstport": 5,
+        "action": 6,
+        "start": 7,
+    }
+    # A format missing a required field (dstaddr) is rejected so we skip rather than misread.
+    assert collectors._field_index_from_format("${version} ${interface-id} ${srcaddr}") is None
+
+
+def test_parse_flow_log_message_honours_a_custom_format():
+    idx = collectors._field_index_from_format(
+        "${version} ${interface-id} ${srcaddr} ${dstaddr} ${protocol} ${dstport} ${action} ${start}"
+    )
+    rec = collectors._parse_flow_log_message(
+        "5 eni-abc 10.0.0.1 10.0.0.2 6 443 ACCEPT 1781481600", "/g", idx
+    )
+    assert rec["InterfaceId"] == "eni-abc"
+    assert rec["SrcAddr"] == "10.0.0.1" and rec["DstAddr"] == "10.0.0.2"
+    assert rec["DstPort"] == 443 and rec["Protocol"] == "6" and rec["Action"] == "ACCEPT"
+    assert rec["Start"] == 1781481600
+    assert rec["SrcPort"] is None  # not present in this custom format
+
+
 def test_flow_logs_role_registered():
     assert "flow_logs" in collectors.ROLE_COLLECTORS
     assert collectors.ROLE_RESULT_KEYS["flow_logs"] == [
