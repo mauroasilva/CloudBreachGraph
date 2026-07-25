@@ -404,18 +404,28 @@ into an awkward spot when its ENIs span subnets on opposite sides of the ring (l
 edges). Add `--optimize-passes N` (with `--ringed`) to run up to **N passes** that move each
 node toward the mean angle of its neighbours — placing it there **as close as an overlap-free
 minimum gap allows**, so two subnets that share a load balancer are pulled right next to each
-other (not just reordered into distant even slots) and its edges stop crossing the circle — and
-then **nudge apart** any residual overlaps. Finally a **greedy crossing-reduction local search**
-relocates each node to the same-ring slot with the fewest edge crossings — this clears whole
-spokes that the proximity passes leave crossing (typically a load balancer fanning edges to ENIs
-in several subnets). The rings are preserved (nodes keep their VPC/subnet/ENI/outer ring); only
-their angle within the ring changes. A **cooling schedule** shrinks the per-pass movement so the
-layout **freezes** to a stable state (a big `N` converges to the same result rather than
-drifting), and `--optimize-passes 0` (the default) keeps the exact ENI-aligned placement. Output
-stays deterministic.
+other (not just reordered into distant even slots) and its edges stop crossing the circle. A
+**greedy crossing-reduction local search** then relocates each node to the same-ring slot with the
+fewest edge crossings — this clears whole spokes that the proximity passes leave crossing
+(typically a load balancer fanning edges to ENIs in several subnets).
 
-On a real 124-node/4-VPC capture, `--optimize-passes 100` cut edge crossings from **79 to 24**,
-shortened total edge length ~22%, and removed the overlapping nodes the plain ringed layout had.
+Optimising also makes the picture **fully overlap-free**, like the [overlap-free
+layout](#overlap-free-layout---optimize-passes): the rings are sized so a node's whole **label**
+(not just its disk) fits around them, connected nodes are packed no tighter than their labels, and
+a final per-cluster **inflation** (a uniform grow-about-the-centre, which changes no crossing)
+plus projection clears every residual overlap — node-on-node, edge-across-node, **label-on-label
+and disk-on-label** all reach **zero**. Because the labels are now separated in world space the
+page **scales the label fonts with the view** (zoom out to see the shape, zoom in to read the
+labels — like the overlap-free layout); the plain `--optimize-passes 0` ringed layout keeps
+fixed-size labels instead (zoom in to pull two overlapping ring labels apart). Throughout, the
+**concentric-ring shape is preserved** — nodes keep their VPC/subnet/ENI/outer ring and essentially
+their angle; only the ring radii grow to make room. A **cooling schedule** shrinks the per-pass
+movement so the layout **freezes** to a stable state (a big `N` converges to the same result rather
+than drifting), and `--optimize-passes 0` (the default) keeps the exact ENI-aligned placement.
+Output stays deterministic.
+
+On a real 124-node/4-VPC capture, `--optimize-passes 200` cut edge crossings to **25** and
+reached **zero** node, edge and label overlaps — whole-graph and per-VPC (`--split-by-vpc`) alike.
 The residual crossings are structural — e.g. a multi-AZ network load balancer whose interfaces
 genuinely sit in three different subnets must fan its spokes across the ring.
 

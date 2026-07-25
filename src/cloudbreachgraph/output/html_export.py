@@ -247,6 +247,23 @@ _OPT_COOLING = 0.9
 _RELOC_SWEEPS = 8
 _RELOC_MAX_NODES = 260
 
+# Label-aware ring sizing — used **only** on the ``--optimize-passes N`` (N > 0) refinement path so
+# the default (N == 0) placement stays byte-identical (``test_ringed_passes_zero_is_unchanged``).
+# A plain ring is sized for its node *disks* (arc ~92px), but a node's drawn label is ~130px wide,
+# so same-ring neighbours overlap by construction. When optimising, the rings are instead sized so
+# each node's whole *label* fits around the circle (:func:`_label_ring_radii`), the barycenter step
+# packs connected nodes no tighter than their labels (:func:`_place_min_gap` label-aware), and a
+# final uniform per-cluster inflation about the centre (:func:`_inflate_cluster_labels`) — a
+# ring- and adjacency-preserving similarity transform — clears any residual (cross-ring) label
+# overlap. Growing the radii and inflating the whole cluster is what makes room *without* distorting
+# the concentric-ring shape or the angular adjacency the barycenter/crossing passes established.
+_RINGED_LABEL_PAD = 12.0  # min clear gap kept between adjacent same-ring label rectangles (px)
+_RINGED_LABEL_HEADROOM = 1.35  # ring circumference slack over the exact label-packing minimum, so
+# connected nodes can still bunch to a small angular gap (adjacency) while every label clears
+_RINGED_INFLATE_STEP = 1.12  # per-attempt growth of the cluster inflation when labels won't clear
+_RINGED_INFLATE_CAP = 60  # max inflation attempts before accepting the fewest-overlap arrangement
+_RINGED_PROJECT_CAP = 200  # per-attempt hard-projection sweeps to settle a cluster overlap-free
+
 
 def _ring_of(node_type: str) -> int:
     """Ring index by type: VPC 0, subnet 1, ENI 2, EC2/LB 3, security group 4, source (IP) 5."""
@@ -282,6 +299,34 @@ def _ring_radii(counts: list[int]) -> list[float]:
         r = max(base, c * _RING_ARC / (2 * math.pi))
         radii.append(r)
         prev = r
+    return radii
+
+
+def _label_ring_radii(counts: list[int], half_widths: list[float]) -> list[float]:
+    """Label-aware :func:`_ring_radii` for the ``--optimize-passes`` refinement (N > 0 only).
+
+    Sizes each ring so its nodes' whole **labels** fit around the circle, not just their disks:
+    ring ``i``'s arc spacing is its widest label (``2 * half_widths[i] + _RINGED_LABEL_PAD``) rather
+    than the fixed :data:`_RING_ARC`, and the radial step out to it is widened by the same so an
+    inner ring's labels can't reach the next ring. A :data:`_RINGED_LABEL_HEADROOM` factor leaves
+    the circumference some slack over the exact label-packing minimum, so the barycenter step can
+    still bunch connected nodes to a small angular gap while every label clears. Empty rings still
+    collapse to radius 0 (as in :func:`_ring_radii`) so later rings nest tightly.
+    """
+    radii: list[float] = []
+    prev = 0.0
+    prev_hw = 0.0
+    for c, hw in zip(counts, half_widths, strict=True):
+        if not c:
+            radii.append(0.0)
+            continue
+        arc = max(_RING_ARC, 2 * hw + _RINGED_LABEL_PAD)
+        gap = max(_RING_GAP, prev_hw + hw + _RINGED_LABEL_PAD)
+        base = (prev + gap) if prev else max(_RING1_MIN, arc / 2)
+        r = max(base, _RINGED_LABEL_HEADROOM * c * arc / (2 * math.pi))
+        radii.append(r)
+        prev = r
+        prev_hw = hw
     return radii
 
 
@@ -364,7 +409,9 @@ def _isotonic_l2(y: list[float]) -> list[float]:
     return out
 
 
-def _place_min_gap(members: list, cx: float, cy: float, radius: float, target: dict) -> None:
+def _place_min_gap(
+    members: list, cx: float, cy: float, radius: float, target: dict, label_aware: bool = False
+) -> None:
     """Place ``members`` near their ``target`` angle, spread just enough to not overlap.
 
     Unlike even spacing, this lets connected nodes actually sit *close* together (only a
@@ -374,6 +421,10 @@ def _place_min_gap(members: list, cx: float, cy: float, radius: float, target: d
     wrap-around slack lands where it's least binding), then find the ordered positions closest to
     the targets subject to the min-gap — a min-gap-shifted isotonic regression. Reorders
     ``members`` in place to match the placement.
+
+    With ``label_aware`` (the ``--optimize-passes`` refinement) the minimum gap is sized to the
+    widest *label* rather than the disks, so connected nodes bunch no tighter than their labels —
+    keeping same-ring label rectangles clear while still sitting as close as legibility allows.
     """
     n = len(members)
     if n == 0:
@@ -384,8 +435,12 @@ def _place_min_gap(members: list, cx: float, cy: float, radius: float, target: d
         return
 
     ts = [target[m["id"]] for m in members]  # ascending in (-π, π]
-    max_r = max(_node_radius(m) for m in members)
-    gap = min((2 * max_r + 8.0) / radius, 2 * math.pi / n)  # never exceed even spacing
+    if label_aware:
+        sep = max(_label_dims(m)[0] for m in members)  # widest label half-width on the ring
+        gap = min((2 * sep + _RINGED_LABEL_PAD) / radius, 2 * math.pi / n)
+    else:
+        max_r = max(_node_radius(m) for m in members)
+        gap = min((2 * max_r + 8.0) / radius, 2 * math.pi / n)  # never exceed even spacing
 
     # Cut after the widest gap between consecutive (circular) targets.
     gaps = [(ts[(i + 1) % n] - ts[i]) % (2 * math.pi) for i in range(n)]
@@ -597,7 +652,7 @@ def _optimize_cluster(bucket: dict, cx: float, cy: float, rs: list, adj: dict, p
                 cur = angle[m["id"]]
                 bary = _circular_mean(neigh) if neigh else cur
                 target[m["id"]] = cur + alpha * _ang_diff(bary, cur)  # damped step toward it
-            _place_min_gap(members, cx, cy, rs[r - 1], target)
+            _place_min_gap(members, cx, cy, rs[r - 1], target, label_aware=True)
             for m in members:
                 a = math.atan2(m["y"] - cy, m["x"] - cx)
                 max_move = max(max_move, abs(_ang_diff(a, angle[m["id"]])))
@@ -624,6 +679,113 @@ def _optimize_cluster(bucket: dict, cx: float, cy: float, rs: list, adj: dict, p
         _reduce_crossings(node_by_id, cedges, rings, cx, cy, rs)
 
     _nudge_overlaps([m for r in (1, 2, 3, 4, 5) for m in bucket[r]])
+
+
+def _clear_cluster_overlaps(members: list, cx: float, cy: float, adj: dict) -> float:
+    """Inflate a cluster about its centre and project it overlap-free; return the inflation factor.
+
+    The barycenter / crossing-reduction passes leave a cluster whose rings are sized for its labels
+    but that may still carry a few residual overlaps — two labels touching, or a near-radial edge
+    grazing a neighbouring node. This clears **all four** overlap kinds (node-node, edge-over-node,
+    label-label, node-over-label) the same way the overlap-free layout's final phase does: uniformly
+    **inflate** the cluster about its centre (a crossings-preserving similarity transform that grows
+    the ring radii and so makes room for the fixed-size labels), then run hard geometric projection
+    sweeps (:func:`_separate_overlaps`) until nothing moves. Each attempt re-inflates the pristine
+    post-optimise layout by a larger factor (:data:`_RINGED_INFLATE_STEP`) so more room always helps
+    and the escalation converges; the fewest-overlap arrangement reached is kept. Because inflation
+    supplies the room, the projection's nudges are tiny, so nodes stay essentially on their rings
+    and at their angles — the concentric-ring shape and the angular adjacency both survive. Node
+    coordinates are updated in place (unrounded for the caller); returns the factor applied.
+    """
+    n = len(members)
+    if n < 2:
+        return 1.0
+    idx = {m["id"]: i for i, m in enumerate(members)}
+    base_x = [m["x"] - cx for m in members]
+    base_y = [m["y"] - cy for m in members]
+    radii = [_node_radius(m) for m in members]
+    lhw = [0.0] * n
+    lh = [0.0] * n
+    for i, m in enumerate(members):
+        lhw[i], lh[i] = _label_dims(m)
+    epairs = sorted(
+        {
+            (min(idx[m["id"]], idx[nb]), max(idx[m["id"]], idx[nb]))
+            for m in members
+            for nb in adj.get(m["id"], ())
+            if nb in idx
+        }
+    )
+
+    def remaining(xs: list, ys: list) -> int:
+        rects = [_label_rect(xs[i], ys[i], radii[i], lhw[i], lh[i]) for i in range(n)]
+        bad = 0
+        for i in range(n):
+            for j in range(i + 1, n):
+                if math.hypot(xs[i] - xs[j], ys[i] - ys[j]) < radii[i] + radii[j] - 1e-6:
+                    bad += 1
+                if _rects_overlap(rects[i], rects[j]):
+                    bad += 1
+        for i in range(n):
+            for j in range(n):
+                if i != j and _disk_rect_overlap(xs[i], ys[i], radii[i], rects[j]):
+                    bad += 1
+        for a, b in epairs:
+            for k in range(n):
+                if k != a and k != b:
+                    d, _, _ = _seg_point_dist(xs[k], ys[k], xs[a], ys[a], xs[b], ys[b])
+                    if d < radii[k] - 1e-6:
+                        bad += 1
+        return bad
+
+    best_scale = 1.0
+    best_xs = [cx + bx for bx in base_x]
+    best_ys = [cy + by for by in base_y]
+    best_bad = remaining(best_xs, best_ys)
+    scale = 1.0
+    for _ in range(_RINGED_INFLATE_CAP):
+        if best_bad == 0:
+            break
+        xs = [cx + bx * scale for bx in base_x]
+        ys = [cy + by * scale for by in base_y]
+        for _ in range(_RINGED_PROJECT_CAP):
+            moved = _separate_overlaps(xs, ys, epairs, radii, lhw, lh, n, include_labels=True)
+            if not moved or not _has_overlap(xs, ys, epairs, radii, lhw, lh, n):
+                break
+        bad = remaining(xs, ys)
+        if bad < best_bad:
+            best_bad, best_xs, best_ys, best_scale = bad, xs[:], ys[:], scale
+        if bad == 0:
+            break
+        scale *= _RINGED_INFLATE_STEP
+    for i, m in enumerate(members):
+        m["x"] = best_xs[i]
+        m["y"] = best_ys[i]
+    return best_scale
+
+
+def _cluster_label_extent(members: list, cx: float, cy: float) -> float:
+    """Max distance from ``(cx, cy)`` to any node disk edge or label-rectangle corner in a cluster.
+
+    Used to size the grid cell so a cluster's rings **and** the labels hanging off its outer nodes
+    fit without spilling into a neighbour — the ringed-layout counterpart of
+    :func:`_pack_components` folding label extents into its bounding boxes.
+    """
+    ext = 0.0
+    for m in members:
+        r = _node_radius(m)
+        hw, h = _label_dims(m)
+        x0, y0, x1, y1 = _label_rect(m["x"], m["y"], r, hw, h)
+        ext = max(
+            ext,
+            abs(m["x"] - cx) + r,
+            abs(m["y"] - cy) + r,
+            abs(x0 - cx),
+            abs(x1 - cx),
+            abs(y0 - cy),
+            abs(y1 - cy),
+        )
+    return ext
 
 
 def _adjacency(graph: Graph) -> dict[str, list[str]]:
@@ -748,10 +910,18 @@ def _ringed_view_data(graph: Graph, passes: int = 0) -> dict:
     — used to place the cluster label and fit the view; the rings themselves are conveyed by
     node position alone (no guide circles are drawn).
 
-    With ``passes > 0`` each cluster is post-processed by :func:`_optimize_cluster`: up to that
-    many barycenter passes reorder nodes within their rings to pull connected nodes together
-    (fewer crossing edges) and separate any overlaps. ``passes == 0`` (the default) leaves the
-    deterministic ENI-aligned placement byte-for-byte unchanged.
+    With ``passes > 0`` each cluster is sized with **label-aware ring radii**
+    (:func:`_label_ring_radii` — big enough that a node's whole label, not just its disk, fits on
+    its ring), placed, then post-processed by :func:`_optimize_cluster`: up to that many barycenter
+    passes reorder nodes within their rings to pull connected nodes together (fewer crossing edges,
+    no tighter than their labels) and reduce crossings. A final :func:`_clear_cluster_overlaps`
+    inflates each cluster about its centre and projects it until **every** overlap is gone —
+    node-node, edge-over-node, label-label and disk-over-label — so the optimised ringed layout is
+    fully overlap-free like the ``--optimize-passes`` layout, while the concentric-ring shape and
+    angular adjacency survive (inflation is a similarity transform, its projection nudges tiny).
+    The grown clusters are then tiled into a grid whose cells reserve room for the rings and their
+    labels. ``passes == 0`` (the default) leaves the deterministic ENI-aligned placement (on the
+    disk-sized rings) byte-for-byte unchanged.
     """
     base = _view_data(graph)
     by_id = {n["id"]: n for n in base["nodes"]}
@@ -816,18 +986,27 @@ def _ringed_view_data(graph: Graph, passes: int = 0) -> dict:
     if _UNASSIGNED in groups:
         order.append(_UNASSIGNED)
 
-    # radii[g] holds the radius of each outer ring (rings 1..3); ring 0 is the center at 0.
-    radii = {g: _ring_radii([len(groups[g][r]) for r in range(1, _RING_COUNT)]) for g in order}
-    cluster_r = {g: max([*radii[g], 60.0]) + _CLUSTER_MARGIN for g in order}
-    cell = 2 * (max(cluster_r.values(), default=0.0)) + _CLUSTER_PAD
+    # radii[g] holds the radius of each outer ring (rings 1..5); ring 0 is the center at 0. With
+    # optimisation (passes > 0) the rings are sized for the nodes' whole *labels* (bigger), so that
+    # — together with the label-aware barycenter gap and a final per-cluster inflation — labels can
+    # be driven overlap-free; the default path keeps the disk-sized rings byte-for-byte unchanged.
+    if passes > 0:
+        radii = {
+            g: _label_ring_radii(
+                [len(groups[g][r]) for r in range(1, _RING_COUNT)],
+                [
+                    max((_label_dims(m)[0] for m in groups[g][r]), default=0.0)
+                    for r in range(1, _RING_COUNT)
+                ],
+            )
+            for g in order
+        }
+    else:
+        radii = {g: _ring_radii([len(groups[g][r]) for r in range(1, _RING_COUNT)]) for g in order}
     cols = max(1, math.ceil(math.sqrt(len(order))))
     adj = _adjacency(graph) if passes > 0 else {}
 
-    clusters = []
-    for i, g in enumerate(order):
-        cx = (i % cols) * cell
-        cy = (i // cols) * cell
-        rs = radii[g]
+    def _place_cluster(g: str, cx: float, cy: float, rs: list) -> None:
         _place_on_ring(groups[g][0], cx, cy, 0.0)  # VPC center (0..1 nodes)
         # ring 2: ENIs, evenly spaced but ordered so a subnet's ENIs are contiguous (grouped by
         # subnet id, then ENI id) — this makes each subnet's ENIs a single arc it can center on.
@@ -843,14 +1022,61 @@ def _ringed_view_data(graph: Graph, passes: int = 0) -> dict:
         # ring 5 (outermost): IP sources aligned to the mean angle of the ENIs they can reach
         # (through their SG when shown), so a source sits radially outside what it exposes (§5.5).
         _place_aligned_to_enis(groups[g][5], cx, cy, rs[4], eni_angle, enis_of_source)
-        # Optional: reorder within rings to cut edge crossings and nudge apart overlaps.
-        if passes > 0:
-            _optimize_cluster(groups[g], cx, cy, rs, adj, passes)
+
+    if passes == 0:
+        # Default path: place each cluster straight into its grid cell (byte-identical to before).
+        cluster_r = {g: max([*radii[g], 60.0]) + _CLUSTER_MARGIN for g in order}
+        cell = 2 * (max(cluster_r.values(), default=0.0)) + _CLUSTER_PAD
+        clusters = []
+        for i, g in enumerate(order):
+            cx = (i % cols) * cell
+            cy = (i // cols) * cell
+            _place_cluster(g, cx, cy, radii[g])
+            clusters.append(
+                {
+                    "cx": round(cx, 2),
+                    "cy": round(cy, 2),
+                    "rings": [round(r, 2) for r in radii[g]],
+                    "label": labels.get(g, "unassigned"),
+                }
+            )
+        base["clusters"] = clusters
+        return base
+
+    # Optimised path: lay out, de-tangle and label-inflate each cluster **about the origin** first,
+    # so its final size is known, then tile the grown clusters into a grid that reserves room for
+    # every ring and label. Inflation scales the ring radii uniformly, so the reported ring radii
+    # are the base radii times the factor applied.
+    scale_of: dict[str, float] = {}
+    for g in order:
+        _place_cluster(g, 0.0, 0.0, radii[g])
+        _optimize_cluster(groups[g], 0.0, 0.0, radii[g], adj, passes)
+        scale_of[g] = _clear_cluster_overlaps(
+            [m for r in range(_RING_COUNT) for m in groups[g][r]], 0.0, 0.0, adj
+        )
+    cluster_r = {
+        g: max(
+            _cluster_label_extent([m for r in range(_RING_COUNT) for m in groups[g][r]], 0.0, 0.0),
+            60.0,
+        )
+        + _CLUSTER_MARGIN
+        for g in order
+    }
+    cell = 2 * (max(cluster_r.values(), default=0.0)) + _CLUSTER_PAD
+
+    clusters = []
+    for i, g in enumerate(order):
+        cx = (i % cols) * cell
+        cy = (i // cols) * cell
+        for r in range(_RING_COUNT):
+            for m in groups[g][r]:
+                m["x"] = round(m["x"] + cx, 2)
+                m["y"] = round(m["y"] + cy, 2)
         clusters.append(
             {
                 "cx": round(cx, 2),
                 "cy": round(cy, 2),
-                "rings": [round(r, 2) for r in rs],
+                "rings": [round(r * scale_of[g], 2) for r in radii[g]],
                 "label": labels.get(g, "unassigned"),
             }
         )
@@ -867,7 +1093,7 @@ def build_ringed_html(graph: Graph, passes: int = 0) -> str:
     """
     data_json = json.dumps(_ringed_view_data(graph, passes), ensure_ascii=False, default=str)
     return (
-        _render_static_layout(data_json, "ringed", _RINGED_HINT)
+        _render_static_layout(data_json, "ringed", _RINGED_HINT, scale_labels=passes > 0)
         .replace("__NODE_COUNT__", str(len(graph.nodes)))
         .replace("__EDGE_COUNT__", str(len(graph.edges)))
     )
@@ -1674,7 +1900,7 @@ def build_optimized_html(graph: Graph, max_passes: int) -> str:
     """
     data_json = json.dumps(_optimized_view_data(graph, max_passes), ensure_ascii=False, default=str)
     return (
-        _render_static_layout(data_json, "overlap-free", _OPTIMIZED_HINT)
+        _render_static_layout(data_json, "overlap-free", _OPTIMIZED_HINT, scale_labels=True)
         .replace("__NODE_COUNT__", str(len(graph.nodes)))
         .replace("__EDGE_COUNT__", str(len(graph.edges)))
     )
@@ -1728,8 +1954,9 @@ OPTIMIZE_PASSES_HELP = (
     "run up to N graph-optimisation passes (stops early once it converges). Without --ringed this "
     "renders the deterministic overlap-free layout (no overlapping nodes, no edge drawn across a "
     "node, no label overlapping another label or node, fewer edge crossings, independent clusters "
-    "kept apart); with --ringed it reorders nodes within their rings to reduce crossings. 0 "
-    "(default) keeps the base layout (force-directed, or plain ringed)."
+    "kept apart); with --ringed it reorders nodes within their rings to reduce crossings and sizes "
+    "the rings so labels don't overlap either, keeping the concentric-ring shape. 0 (default) "
+    "keeps the base layout (force-directed, or plain ringed)."
 )
 
 
@@ -2158,20 +2385,22 @@ _OPTIMIZED_HINT = (
 )
 
 
-def _render_static_layout(data_json: str, variant: str, hint: str) -> str:
+def _render_static_layout(data_json: str, variant: str, hint: str, scale_labels: bool) -> str:
     """Fill the shared draw-only template with a graph payload, variant name, and hint line.
 
     Injects via ``str.replace`` (not ``%``/``format``) so the template's CSS/JS braces need no
-    escaping. ``__NODE_COUNT__``/``__EDGE_COUNT__`` are left for the caller to fill. Label fonts
-    scale with the view only for the ``overlap-free`` variant (:data:`__SCALE_LABELS__`), whose
-    layout separates label rectangles in world space; the ringed variant keeps fixed-size labels.
+    escaping. ``__NODE_COUNT__``/``__EDGE_COUNT__`` are left for the caller to fill.
+    ``scale_labels`` drives the injected :data:`__SCALE_LABELS__` flag: pass ``True`` only when the
+    layout has separated its label rectangles in *world* space, so the page scales label fonts with
+    the view and that clearance holds at every zoom. The overlap-free layout always qualifies; the
+    ringed layout qualifies only under ``--optimize-passes N`` (N > 0) — its default placement
+    leaves labels overlapping, so it keeps fixed-size fonts (the reader zooms in to pull two apart).
     """
-    scale_labels = "true" if variant == "overlap-free" else "false"
     return (
         _STATIC_TEMPLATE.replace("__GRAPH_DATA__", data_json)
         .replace("__VARIANT__", variant)
         .replace("__HINT__", hint)
-        .replace("__SCALE_LABELS__", scale_labels)
+        .replace("__SCALE_LABELS__", "true" if scale_labels else "false")
     )
 
 

@@ -603,6 +603,57 @@ def test_ringed_optimize_is_deterministic():
     assert html_export.build_ringed_html(g, 20) == html_export.build_ringed_html(g, 20)
 
 
+def test_ringed_optimize_reaches_zero_label_overlap_on_example():
+    # The optimised ringed layout drives *label* overlap to zero (both label-on-label and
+    # disk-on-another-node's-label) while keeping zero node-node and zero edge-over-node overlap —
+    # the same guarantee the overlap-free layout gives, but with the concentric rings preserved.
+    g = load_graph(_EXAMPLE_GRAPH)
+    data = html_export._ringed_view_data(g, 200)
+    assert html_export._count_label_overlaps(data["nodes"], data["edges"]) == (0, 0)
+    assert html_export._count_overlaps(data["nodes"], data["edges"]) == (0, 0)
+
+
+def test_ringed_optimize_reaches_zero_label_overlap_on_each_split_vpc():
+    # Same guarantee on every per-VPC sub-graph (--ringed --split-by-vpc).
+    g = load_graph(_EXAMPLE_GRAPH)
+    subs = html_export.split_by_vpc(g)
+    assert subs  # the example has VPCs to split
+    for sub in subs.values():
+        data = html_export._ringed_view_data(sub, 200)
+        assert html_export._count_label_overlaps(data["nodes"], data["edges"]) == (0, 0)
+        assert html_export._count_overlaps(data["nodes"], data["edges"]) == (0, 0)
+
+
+def test_ringed_optimize_keeps_clusters_apart():
+    # Growing the rings for label room must still tile VPC clusters without overlapping: each
+    # cluster's disk+label bounding box stays within its own grid cell (no box intersects another).
+    g = load_graph(_EXAMPLE_GRAPH)
+    data = html_export._ringed_view_data(g, 200)
+    boxes = []
+    for c in data["clusters"]:
+        members = [
+            n
+            for n in data["nodes"]
+            if min(
+                data["clusters"], key=lambda k: (n["x"] - k["cx"]) ** 2 + (n["y"] - k["cy"]) ** 2
+            )
+            is c
+        ]
+        xs0, ys0, xs1, ys1 = [], [], [], []
+        for n in members:
+            r = html_export._node_radius(n)
+            hw, h = html_export._label_dims(n)
+            lx0, ly0, lx1, ly1 = html_export._label_rect(n["x"], n["y"], r, hw, h)
+            xs0.append(min(n["x"] - r, lx0))
+            ys0.append(min(n["y"] - r, ly0))
+            xs1.append(max(n["x"] + r, lx1))
+            ys1.append(max(n["y"] + r, ly1))
+        boxes.append((min(xs0), min(ys0), max(xs1), max(ys1)))
+    for i in range(len(boxes)):
+        for j in range(i + 1, len(boxes)):
+            assert not html_export._rects_overlap(boxes[i], boxes[j])
+
+
 def test_ringed_passes_zero_is_unchanged(graph):
     # The default (0 passes) must be byte-identical to the pre-optimizer placement.
     assert html_export.build_ringed_html(graph, 0) == html_export.build_ringed_html(graph)
@@ -763,13 +814,18 @@ def test_count_label_overlaps_detects_planted_overlaps():
 
 
 def test_optimized_template_scales_label_fonts_but_ringed_does_not():
-    # The label-overlap guarantee is computed in world space, so the overlap-free page must scale
-    # label fonts with the view (like the node disks) for it to hold on screen at every zoom. The
-    # ringed layout does not separate labels, so it keeps fixed-size labels (the reader can zoom in
-    # to pull two ring labels apart, which scaled fonts would prevent).
+    # The label-overlap guarantee is computed in world space, so a page that separates labels must
+    # scale label fonts with the view (like the node disks) for the clearance to hold on screen at
+    # every zoom. The overlap-free layout always does; the *default* ringed layout leaves ring
+    # labels overlapping, so it keeps fixed-size labels (the reader zooms in to pull two apart,
+    # which scaled fonts would prevent). Under --optimize-passes N (>0) the ringed layout now clears
+    # its labels in world space too, so it switches to scaled fonts.
     graph = load_graph(_EXAMPLE_GRAPH)
     assert "const SCALE_LABELS = true;" in html_export.build_optimized_html(graph, 500)
     assert "const SCALE_LABELS = false;" in html_export.build_ringed_html(graph, 0)
+    assert "const SCALE_LABELS = true;" in html_export.build_ringed_html(graph, 200)
+    # The overlap-free marker string never leaks into ringed HTML.
+    assert "overlap-free" not in html_export.build_ringed_html(graph, 200)
 
 
 def test_connected_components_splits_disjoint_graphs():
