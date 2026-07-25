@@ -28,6 +28,7 @@ _COMMAND_FIXTURES = {
     ("ec2", "describe-flow-logs"): "ec2_describe-flow-logs.json",
     ("cloudtrail", "lookup-events"): "cloudtrail_lookup-events.json",
     ("logs", "filter-log-events"): "logs_filter-log-events.json",
+    ("s3api", "list-objects-v2"): "s3api_list-objects-v2.json",
 }
 
 
@@ -264,6 +265,88 @@ def test_parse_flow_log_message_honours_a_custom_format():
     assert rec["DstPort"] == 443 and rec["Protocol"] == "6" and rec["Action"] == "ACCEPT"
     assert rec["Start"] == 1781481600
     assert rec["SrcPort"] is None  # not present in this custom format
+
+
+def test_collect_flow_log_records_reads_s3(monkeypatch):
+    import gzip
+
+    header = (
+        "version account-id interface-id srcaddr dstaddr srcport dstport "
+        "protocol packets bytes start end action log-status"
+    )
+    record = (
+        "2 111111111111 eni-s3 10.0.0.1 10.0.0.2 40000 443 6 5 500 1781481600 1781481660 ACCEPT OK"
+    )
+    recent = datetime.now(UTC).isoformat()
+
+    def _run(args, *, profile=None, region=None, cache_dir=None):
+        key = tuple(args[:2])
+        if key == ("ec2", "describe-flow-logs"):
+            return {
+                "FlowLogs": [
+                    {
+                        "FlowLogId": "fl-s3",
+                        "ResourceId": "vpc-1",
+                        "LogDestinationType": "s3",
+                        "LogDestination": "arn:aws:s3:::my-bucket/AWSLogs/",
+                        "LogFormat": None,
+                    }
+                ]
+            }
+        if key == ("s3api", "list-objects-v2"):
+            # A .gz flow-log object (recent) plus a non-.gz object that must be ignored.
+            assert any(a == "--bucket=my-bucket" for a in args)
+            return {
+                "Contents": [
+                    {"Key": "AWSLogs/x/flow.log.gz", "LastModified": recent},
+                    {"Key": "AWSLogs/x/other.txt", "LastModified": recent},
+                ]
+            }
+        raise AssertionError(f"unexpected run_aws call: {key}")
+
+    def _download(args, dest, *, profile=None, region=None):
+        assert ("s3api", "get-object") == tuple(args[:2])
+        with gzip.open(dest, "wt", encoding="utf-8") as fh:
+            fh.write(header + "\n" + record + "\n")
+        return dest
+
+    monkeypatch.setattr(runner, "run_aws", _run)
+    monkeypatch.setattr(runner, "download_object", _download)
+
+    records = collectors.collect_flow_log_records("prod-audit", "us-east-1")
+    assert len(records) == 1  # the .txt object was skipped, the .gz parsed via its header row
+    rec = records[0]
+    assert rec["InterfaceId"] == "eni-s3"
+    assert rec["SrcAddr"] == "10.0.0.1" and rec["DstAddr"] == "10.0.0.2"
+    assert rec["DstPort"] == 443 and rec["Protocol"] == "6" and rec["Action"] == "ACCEPT"
+    assert rec["LogGroup"] == "s3://my-bucket/AWSLogs/x/flow.log.gz"
+
+
+def test_unsupported_flow_log_destination_raises(monkeypatch):
+    def _run(args, *, profile=None, region=None, cache_dir=None):
+        if tuple(args[:2]) == ("ec2", "describe-flow-logs"):
+            return {
+                "FlowLogs": [
+                    {
+                        "FlowLogId": "fl-fh",
+                        "LogDestinationType": "kinesis-data-firehose",
+                        "LogDestination": "arn:aws:firehose:us-east-1:111111111111:deliverystream/x",  # noqa: E501
+                    }
+                ]
+            }
+        raise AssertionError("must not fetch records for an unsupported destination")
+
+    monkeypatch.setattr(runner, "run_aws", _run)
+    with pytest.raises(collectors.FlowLogDestinationError) as excinfo:
+        collectors.collect_flow_log_records("prod-audit", "us-east-1")
+    assert "kinesis-data-firehose" in str(excinfo.value)
+
+
+def test_parse_s3_arn():
+    assert collectors._parse_s3_arn("arn:aws:s3:::bucket/AWSLogs/") == ("bucket", "AWSLogs/")
+    assert collectors._parse_s3_arn("arn:aws:s3:::bucket") == ("bucket", "")
+    assert collectors._parse_s3_arn("not-an-arn") is None
+    assert collectors._parse_s3_arn(None) is None
 
 
 def test_flow_logs_role_registered():

@@ -104,8 +104,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="also gather IP-allocation history and analyse VPC flow logs (last 60 days): record "
         "flow-log config as a VPC attribute and, for each observed connection, add a connects_to "
         "edge to the peer (ENI->ENI when the peer IP is another collected ENI that already held it "
-        "at the time, else a flow_peer node). Needs extra read-only IAM: ec2:DescribeFlowLogs, "
-        "cloudtrail:LookupEvents, logs:FilterLogEvents",
+        "at the time, else a flow_peer node). Reads records from CloudWatch Logs or S3 per the "
+        "flow log's destination type. Needs extra read-only IAM: ec2:DescribeFlowLogs, "
+        "cloudtrail:LookupEvents, logs:FilterLogEvents, and s3:ListBucket + s3:GetObject for S3 "
+        "destinations",
     )
     col.add_argument(
         "--security-groups",
@@ -330,6 +332,9 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigError as exc:
         print(f"cloudbreachgraph: config error: {exc}", file=sys.stderr)
         return 2
+    except collectors.FlowLogDestinationError as exc:
+        print(f"cloudbreachgraph: {exc}", file=sys.stderr)
+        return 1
     except runner.AwsCliError as exc:
         print(f"cloudbreachgraph: {exc}", file=sys.stderr)
         return 1

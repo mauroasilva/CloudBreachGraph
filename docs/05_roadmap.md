@@ -27,11 +27,14 @@ loop (`§11.7`) don't change.
 > `ROLE_RESULT_KEYS`), a new `mapping/flowlogs.py`, and new node/edge types on the existing graph
 > model — no config-grammar change. It went **beyond** the original design below in one deliberate
 > way: it reads flow-log *record contents* (not just the destination) to derive observed
-> connections, and it uses CloudTrail `lookup-events` for IP-allocation history and `logs
-> filter-log-events` for records — read-only retrievals whose verbs aren't `describe`/`get`/`list`
-> (still non-mutating, §9). The current implementation reads all three commands from the single
-> account bound to `flow_logs` (default: the `network` account); full cross-account splitting
-> (config in the workload account, records in a log-archive account) remains the design below.
+> connections — from **both CloudWatch Logs and S3**, dispatched by each flow log's
+> `LogDestinationType` (a type with no reader, e.g. `kinesis-data-firehose`, raises). It uses
+> CloudTrail `lookup-events` for IP-allocation history, `logs filter-log-events` for CloudWatch
+> records, and `s3api list-objects-v2` + `get-object` for S3 records — read-only retrievals (still
+> non-mutating, §9). The current implementation reads all commands from the single account bound to
+> `flow_logs` (default: the `network` account); full cross-account splitting (config in the workload
+> account, records in a log-archive account) remains the design below. See also
+> `learnings_2026-07-25_flowlog-format-diagnostics.md`.
 
 ### Why it's cross-account
 VPC Flow Logs are frequently centralized: a VPC in a **workload account** publishes its flow

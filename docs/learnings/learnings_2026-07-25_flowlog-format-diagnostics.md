@@ -1,18 +1,27 @@
-# Learnings — 2026-07-25 flowlog-format-diagnostics
+# Learnings — 2026-07-25 flowlog-format-diagnostics-and-s3
 
 ## 1. What this change delivered
 Follow-up after a real-account test where `--flow-logs` produced **no `connects_to` edges / no
-`flow_peer` nodes** in `graph.json` (flow records weren't coming through). Two robustness fixes in
-`aws/collectors.py`, no model/CLI/graph change:
+`flow_peer` nodes** in `graph.json` (the account's flow logs deliver to **S3**, which we didn't
+read). All in `aws/collectors.py` + a runner helper; no model/graph change:
 
-- **Custom-`LogFormat`-aware parsing.** The v2 record parser previously hard-coded the *default*
-  field positions. `describe-flow-logs` returns each flow log's `LogFormat`; `_field_index_from_format`
-  now derives field positions from that string (falling back to the default layout when absent), and
-  `_parse_flow_log_message` takes the resulting `field_idx`. A format missing a required field
-  (`interface-id`/`srcaddr`/`dstaddr`) returns `None` → that group is skipped rather than misread.
-- **Stderr diagnostic** (`_report_flow_log_records`): one line — `N config(s) [by destination];
-  queried G CloudWatch group(s); fetched E log event(s); parsed P flow record(s).` Plus a targeted
-  note when flow logs go to **S3** (records not read) or when events were fetched but none parsed.
+- **Per-destination-type dispatch.** `describe-flow-logs` gives each flow log's `LogDestinationType`;
+  `collect_flow_log_records` now dispatches to `FLOW_LOG_READERS[type]` — `_read_cloudwatch_records`
+  (`logs filter-log-events`) or `_read_s3_records` (`s3api list-objects-v2` + `get-object`). A type
+  with **no reader** (e.g. `kinesis-data-firehose`, or a missing type) raises
+  `FlowLogDestinationError`, caught in `cli.main` → rc 1. This is the "always pull from the right
+  source, else throw" behaviour.
+- **S3 reader.** Parses the `LogDestination` ARN → `(bucket, prefix)`, lists `.gz` objects modified
+  within the 60-day window, downloads each via a **new read-only runner helper**
+  `runner.download_object` (S3 bodies are gzip, not JSON, so they can't go through `run_aws`),
+  gunzips, and parses. Each S3 object's **first line is the field-name header**, so the field index
+  is read from it (falling back to default layout).
+- **Custom-`LogFormat`-aware parsing.** `_field_index_from_format` derives field positions from a
+  CloudWatch group's `LogFormat` (or an S3 header row); `_parse_flow_log_message(msg, group,
+  field_idx)`. A format missing a required field (`interface-id`/`srcaddr`/`dstaddr`) → skip.
+- **Stderr diagnostic** (`_report_flow_log_records`): `N config(s) [by destination]; fetched E
+  event(s) from cloud-watch-logs, K object(s) from s3; parsed P flow record(s).` Plus a note if data
+  was fetched but nothing parsed.
 
 ## 2. Interface contract / behaviour notes for the next session
 - `collect_flow_log_records` now builds a per-group `field_idx` from `LogFormat` and passes it to
@@ -47,10 +56,14 @@ Follow-up after a real-account test where `--flow-logs` produced **no `connects_
   silently returning nothing — so a *silent* empty result is not a permission problem.
 
 ## 6. Known gaps / follow-ups
-- **S3-destined flow-log records are still not read** (would need `s3api list-objects-v2` +
-  `get-object` + gunzip + parse). This is the single most likely reason a real account sees "zero
-  flows", now called out explicitly in the diagnostic. Strong candidate for the next change.
+- **S3 listing cost.** `_read_s3_records` lists under the destination *prefix* and filters by
+  `LastModified`; a busy bucket over 60 days can be a large list + many `get-object` downloads. A
+  future optimisation could construct date-partitioned prefixes (`.../vpcflowlogs/<region>/<Y>/<M>/<D>/`)
+  to narrow the listing — needs the source account id + region, which we don't currently derive.
+- **`kinesis-data-firehose`** has no reader → raises. Add a reader + `FLOW_LOG_READERS` entry if a
+  user needs it (would read from the Firehose delivery destination, typically S3 again).
 - Diagnostic counts live in the collector; they aren't surfaced in `graph.json`/`meta`.
+- `runner.download_object` is the second AWS mock boundary (besides `run_aws`); tests patch it.
 
 ## 7. How to verify
 ```bash
