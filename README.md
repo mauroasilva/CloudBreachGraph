@@ -157,6 +157,9 @@ cloudbreachgraph --from-cache tests/fixtures --output-dir out/
 --html                     also write an interactive, self-contained HTML view
                              (falls back to .dot when the graph is too large)
 --ringed                   with --html, render the concentric-ringed layout
+--hierarchical             with --html, render the hierarchical layout (VPC-centered
+                             columns fanning left/right; connected nodes share a side,
+                             sides balanced). Takes precedence over --ringed
 --optimize-passes N        with --html, run up to N optimisation passes: overlap-free
                              layout (no node/edge/label overlap), or ringed
                              crossing-reduction with --ringed
@@ -192,7 +195,9 @@ cloudbreachgraph --from-cache tests/fixtures --output-dir out/
   to write the deterministic **overlap-free** layout instead of this in-browser force layout —
   positions are computed in Python so the page opens already settled, with no overlapping
   nodes, no edge crossing a node, no label overlapping another label or node, fewer edge
-  crossings, and independent clusters kept apart.
+  crossings, and independent clusters kept apart. Or pass **`--ringed`** for a VPC-centered
+  concentric-ring layout, or **`--hierarchical`** for a VPC-centered left/right-column tree
+  (both described below).
   For very large graphs an
   in-browser force layout stops being responsive, so if the graph exceeds the render budget
   the tool **warns and skips the HTML**, pointing you at the always-written `.dot` (which
@@ -431,6 +436,46 @@ genuinely sit in three different subnets must fan its spokes across the ring.
 
 ```bash
 cloudbreachgraph-to-html out/graph.json --ringed --optimize-passes 20
+```
+
+### Hierarchical layout (`--hierarchical`)
+
+Pass `--hierarchical` for a **tree-like** view that follows the **same rules** as the ringed
+layout but replaces the concentric circles with **columns fanning left and right**. Each **VPC**
+still sits at the center of its own cluster, and the same layers radiate outward — **subnets**,
+then **ENIs**, then **everything else** (EC2, load balancers, NAT gateways, VPC endpoints), then a
+**security-group** column, then the **IP sources** — except each layer is a pair of vertical
+**columns**, one stepping out to the **left** of the VPC and one to the **right**. Just as in the
+ringed layout the ENI layer is the anchor: ENIs are spread down their column (grouped by subnet so
+a subnet's interfaces stay contiguous), and every other node lines up at the **mean height of the
+ENIs associated with it** (a subnet with the ENIs it contains, an EC2/LB with the ENIs attached to
+it, a source with the ENIs it can reach) — the ringed layout's angle-anchoring, done vertically.
+
+Two extra rules make it a genuine hierarchy:
+
+- **Connected nodes share a side.** A subnet and everything that hangs off it — its ENIs, the
+  EC2/LB/NAT/endpoint fronting them, their security groups and reachability sources, plus any other
+  subnets a shared load balancer / security group / source stitches to it — form one **side-group**
+  (a connected component of the VPC's graph once the VPC center is removed), placed **entirely** on
+  the left or **entirely** on the right. So **no edge is ever drawn across the center** from one
+  side to the other (the only center-crossing edges are subnet → VPC, which end at the center
+  itself).
+- **The two sides are balanced.** Side-groups are dealt out largest-first, each to the side with
+  fewer nodes so far, so roughly the same number of nodes sits on each side of the VPC center.
+
+Multiple VPCs are tiled in a grid, orphans collect into a final cluster with an empty center, and a
+per-cluster VPC label sits above each cluster — exactly like the ringed layout. Positions are
+computed deterministically in Python (no in-browser relaxation); you can drag a node, scroll to
+zoom, and drag the background to pan, with the same **Zoom In / Zoom Out** buttons and **lock
+scroll-zoom** toggle. It obeys the **same size guard** — too large and it warns and writes the
+`.dot` fallback. `--hierarchical` works on the main `cloudbreachgraph` command
+(`cloudbreachgraph --html --hierarchical`) and on `cloudbreachgraph-to-html`, composes with
+`--split-by-vpc` and `--no-security-groups`, and **takes precedence over `--ringed`** when both are
+given.
+
+```bash
+cloudbreachgraph --from-cache tests/fixtures --html --hierarchical --output-dir out/
+cloudbreachgraph-to-html out/graph.json --hierarchical -o topology.html
 ```
 
 ### Overlap-free layout (`--optimize-passes N`)

@@ -281,6 +281,44 @@ def test_html_ringed_writes_ringed_layout(tmp_path):
     assert "overlap-free" not in text
 
 
+def test_html_hierarchical_writes_hierarchical_layout(tmp_path):
+    # --html --hierarchical renders the hierarchical column layout, not the force/ringed/opt one.
+    out = tmp_path / "out"
+    rc = cli.main(
+        ["--from-cache", str(FIXTURES), "--output-dir", str(out), "--html", "--hierarchical"]
+    )
+    assert rc == 0
+    text = (out / "graph.html").read_text()
+    assert "· hierarchical" in text  # hierarchical HUD badge
+    assert "overlap-free" not in text
+    assert "REPULSION" not in text  # not the force layout
+
+
+def test_html_hierarchical_takes_precedence_over_ringed(tmp_path):
+    out = tmp_path / "out"
+    rc = cli.main(
+        [
+            "--from-cache",
+            str(FIXTURES),
+            "--output-dir",
+            str(out),
+            "--html",
+            "--hierarchical",
+            "--ringed",
+        ]
+    )
+    assert rc == 0
+    assert "· hierarchical" in (out / "graph.html").read_text()
+
+
+def test_hierarchical_without_html_warns_and_is_ignored(tmp_path, capsys):
+    out = tmp_path / "out"
+    rc = cli.main(["--from-cache", str(FIXTURES), "--output-dir", str(out), "--hierarchical"])
+    assert rc == 0
+    assert not (out / "graph.html").exists()
+    assert "--hierarchical only affects --html" in capsys.readouterr().err
+
+
 def test_optimize_passes_without_html_warns_and_is_ignored(tmp_path, capsys):
     out = tmp_path / "out"
     rc = cli.main(

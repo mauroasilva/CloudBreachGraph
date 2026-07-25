@@ -141,6 +141,11 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"with --html, {html_export.RINGED_HELP}",
     )
     out.add_argument(
+        "--hierarchical",
+        action="store_true",
+        help=f"with --html, {html_export.HIERARCHICAL_HELP}",
+    )
+    out.add_argument(
         "--optimize-passes",
         type=int,
         default=0,
@@ -239,6 +244,7 @@ def _write_outputs(collected: dict, out_dir: Path, stem: str, args: argparse.Nam
             graph,
             out_dir / f"{stem}.html",
             ringed=args.ringed,
+            hierarchical=args.hierarchical,
             optimize_passes=args.optimize_passes,
         )
         if html_path is None:
@@ -295,6 +301,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.ringed:
             print(
                 "cloudbreachgraph: warning: --ringed only affects --html; ignoring it.",
+                file=sys.stderr,
+            )
+        if args.hierarchical:
+            print(
+                "cloudbreachgraph: warning: --hierarchical only affects --html; ignoring it.",
                 file=sys.stderr,
             )
         if args.optimize_passes:
