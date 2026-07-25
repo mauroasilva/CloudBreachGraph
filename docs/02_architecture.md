@@ -75,7 +75,7 @@ flags. The AWS CLI auto-paginates by default, returning the full result set.
 | NAT Gateways | `aws ec2 describe-nat-gateways --region <r>` | `.NatGateways[]` |
 | VPC Endpoints | `aws ec2 describe-vpc-endpoints --region <r>` | `.VpcEndpoints[]` |
 | VPC Flow Logs config (`flow_logs`) | `aws ec2 describe-flow-logs --region <r>` | `.FlowLogs[]` |
-| IP-allocation history (`flow_logs`) | `aws cloudtrail lookup-events --lookup-attributes=AttributeKey=EventName,AttributeValue=CreateNetworkInterface` | `.Events[].CloudTrailEvent` |
+| IP-allocation history (`flow_logs`) | `aws cloudtrail lookup-events --lookup-attributes=AttributeKey=EventName,AttributeValue=CreateNetworkInterface --start-time=<now-60d>` | `.Events[].CloudTrailEvent` |
 | Flow-log records (`flow_logs`) | `aws logs filter-log-events --log-group-name=<g> --start-time=<ms>` | `.events[].message` |
 | Caller identity (account check) | `aws sts get-caller-identity` | `.Account`, `.Arn` |
 
@@ -292,7 +292,10 @@ to/from each ENI — plus where the logs that record it live. It reads three thi
 into the already-built graph:
 
 1. **IP history.** `cloudtrail lookup-events` for `CreateNetworkInterface` gives *when* each ENI's
-   private IP was allocated. **Every** ENI node gains an `ip_history` attribute — a dict keyed by
+   private IP was allocated. The lookback is bounded **explicitly** by `--start-time = now −
+   FLOW_LOG_MAX_LOOKBACK_DAYS` (60 days), so the IP-history window matches the flow-log-record
+   window rather than relying on CloudTrail's 90-day Event-history default. **Every** ENI node gains
+   an `ip_history` attribute — a dict keyed by
    each IP the ENI has held, valued `{start, end}` (ISO timestamps): `start` is the allocation time
    (`None` if unknown), `end` is `None` while the ENI still holds the IP (its *current* addresses)
    else the allocation time of the IP that superseded it. The **earliest** known allocation is the

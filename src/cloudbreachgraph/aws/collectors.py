@@ -17,6 +17,7 @@ from __future__ import annotations
 import json as _json
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 
 from . import runner
 
@@ -444,13 +445,18 @@ def collect_ip_allocation_events(profile: str | None, region: str | None) -> lis
 
     Each record is ``{NetworkInterfaceId, PrivateIpAddress, AllocatedAt}`` — *when* an ENI's IP was
     allocated (``docs/02_architecture.md §5.7``), which bounds how far back that ENI's flow logs are
-    analysed. CloudTrail retention is 90 days; accounts/events we can't parse simply yield fewer
-    records (never an error)."""
+    analysed. The lookback is set **explicitly** to :data:`FLOW_LOG_MAX_LOOKBACK_DAYS` days via
+    ``--start-time`` so the IP-history window matches the flow-log window (rather than relying on
+    CloudTrail's 90-day Event-history default). An ENI created before the window has no event here,
+    so its ``ip_history`` start is unknown — treated as "held throughout"; accounts/events we can't
+    parse simply yield fewer records (never an error)."""
+    start = datetime.now(UTC) - timedelta(days=FLOW_LOG_MAX_LOOKBACK_DAYS)
     data = runner.run_aws(
         [
             "cloudtrail",
             "lookup-events",
             "--lookup-attributes=AttributeKey=EventName,AttributeValue=CreateNetworkInterface",
+            f"--start-time={start.strftime('%Y-%m-%dT%H:%M:%SZ')}",
         ],
         profile=profile,
         region=region,

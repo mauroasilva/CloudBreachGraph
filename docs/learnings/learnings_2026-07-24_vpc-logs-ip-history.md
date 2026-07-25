@@ -144,10 +144,14 @@ new node/edge types — **no** config-grammar or CLI-resolver change).
 - **`AssignPrivateIpAddresses`** isn't consulted — only `CreateNetworkInterface` (the primary IP's
   allocation). Secondary-IP allocation times are unknown, so the temporal guard treats those IPs as
   "held throughout" (allowed).
+- **IP-history lookback is bounded to 60 days** (`--start-time = now − FLOW_LOG_MAX_LOOKBACK_DAYS`
+  on `cloudtrail lookup-events`), aligned with the flow-log-record window instead of CloudTrail's
+  90-day Event-history default. An ENI created before the window has no event → `ip_history` start
+  unknown → treated as "held throughout".
 - **Temporal guard depends on CloudTrail coverage.** If a reassigned IP's *new* owner ENI has no
-  `CreateNetworkInterface` event in the window (created before it), we can't detect the reuse and the
-  edge is allowed. That's the deliberate "unknown → allowed" call; tightening it would need a fuller
-  IP-history source than 90-day CloudTrail.
+  `CreateNetworkInterface` event in the (now 60-day) window, we can't detect the reuse and the edge
+  is allowed — the deliberate "unknown → allowed" call. Tightening it would need a fuller IP-history
+  source (a longer CloudTrail window — up to its 90-day max — or CloudTrail Lake / an S3 trail).
 
 ## 7. How to verify
 
