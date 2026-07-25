@@ -437,9 +437,10 @@ Requirements:
   and falls back to the always-written `.dot`** (which Graphviz lays out offline at any
   scale). `--html` accepts the same layout selectors as the converter below: `--optimize-passes N`
   swaps this in-browser force layout for the deterministic **overlap-free** layout
-  (`write_optimized_html`), and `--ringed` selects the **ringed** layout (`write_ringed_html`, with
-  `--optimize-passes` as its in-ring crossing-reduction budget). `--from-cache` and
-  `--all-accounts` go through the same `_write_outputs`, so they get all three.
+  (`write_optimized_html`), `--ringed` selects the **ringed** layout (`write_ringed_html`, with
+  `--optimize-passes` as its in-ring crossing-reduction budget), and `--hierarchical` selects the
+  **hierarchical** layout (`write_hierarchical_html`; takes precedence over `--ringed`).
+  `--from-cache` and `--all-accounts` go through the same `_write_outputs`, so they get all four.
 - **Converting existing output → HTML** (`cloudbreachgraph-to-html`, `convert.py`): an
   auxiliary console entry point that re-loads a previously written `graph.json`/`graph.dot`
   and renders the HTML view without re-collecting from AWS. Loading is the inverse of the
@@ -478,7 +479,25 @@ Requirements:
   tiled into a grid whose cells reserve room for the rings and labels. Because labels are then
   separated in world space, the ringed variant sets `SCALE_LABELS` on (scaling label fonts with the
   view) when `N > 0`. Rings preserved, output deterministic; `N=0` (default) is the exact
-  ENI-aligned layout (disk-sized rings, fixed-size labels), byte-for-byte unchanged. Without
+  ENI-aligned layout (disk-sized rings, fixed-size labels), byte-for-byte unchanged. Its
+  `--hierarchical` flag selects a fourth, **hierarchical** layout
+  (`html_export.write_hierarchical_html`/`build_hierarchical_html`, also on the shared draw-only
+  template) that follows the ringed layout's rules but "unrolls" the concentric rings into
+  **left/right columns**: a layer maps to a signed x-distance (the column, via `_hier_column_x`,
+  which collapses empty layers as `_ring_radii` does) instead of a radius, and the ENI anchor maps
+  to a y-position instead of an angle — ENIs spread down their column (grouped by subnet), every
+  other node aligned to the mean y of its ENIs by an L2 isotonic **min-gap** projection
+  (`_place_column`, the linear cousin of `_place_min_gap`). Two rules make it a hierarchy: (1)
+  **connected nodes share a side** — a cluster's nodes are split into the connected components of
+  its VPC-center-removed subgraph (`_partition_sides`) and each component is placed wholly left or
+  wholly right, so no edge is ever drawn across the center between sides (only subnet→VPC center
+  edges cross, terminating at the center); (2) the two sides are **balanced** by a greedy
+  largest-first assignment. It reuses `_eni_anchor_maps` (the ENI-alignment maps, factored out of
+  the ringed layout and shared by both) and `_vpc_group_of`; clusters are tiled into a grid whose
+  cells reserve room for the columns and labels (`_hier_extent`), with a single half-height "ring"
+  in each cluster's metadata so the template floats the VPC label above it. Fixed-size labels
+  (`SCALE_LABELS` off) like the default ringed layout; output deterministic. `--hierarchical` takes
+  precedence over `--ringed` in `write_layout_html`. Without
   `--ringed`, the same
   `--optimize-passes N` flag instead selects a third, **overlap-free** layout
   (`html_export.write_optimized_html`/
@@ -520,8 +539,8 @@ Requirements:
   the same `_vpc_group_of` tracing the ringed layout clusters by: each sub-graph holds the nodes
   that resolve to that VPC plus the edges wholly within it (unassigned nodes and cross-VPC edges are
   dropped). It reuses `write_layout_html` per sub-graph, so the layout flags (`--ringed`/
-  `--optimize-passes`/`--no-security-groups`) and the size guard / per-file `.dot` fallback all
-  apply to every VPC file.
+  `--hierarchical`/`--optimize-passes`/`--no-security-groups`) and the size guard / per-file `.dot`
+  fallback all apply to every VPC file.
 - **Anonymising existing output** (`cloudbreachgraph-anonymize`, `anonymize.py`): an auxiliary
   console entry point that rewrites a previously written `graph.json` into a scrubbed copy safe
   to share as a debugging/example graph. It **keeps every node and edge** but replaces all

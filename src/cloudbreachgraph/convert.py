@@ -68,11 +68,16 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"{html_export.RINGED_HELP} (same size guard / .dot fallback)",
     )
     p.add_argument(
+        "--hierarchical",
+        action="store_true",
+        help=f"{html_export.HIERARCHICAL_HELP} (same size guard / .dot fallback)",
+    )
+    p.add_argument(
         "--split-by-vpc",
         action="store_true",
         help="write one HTML per VPC (graph-<VPC ID>.html) instead of a single file. Output goes "
         "to the -o directory (default: the input's directory); the layout flags (--ringed / "
-        "--optimize-passes / --no-security-groups) apply to every per-VPC file",
+        "--hierarchical / --optimize-passes / --no-security-groups) apply to every per-VPC file",
     )
     p.add_argument(
         "--optimize-passes",
@@ -85,7 +90,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _emit(
-    graph: Graph, out_path: Path, *, ringed: bool, optimize_passes: int, protect: Path | None
+    graph: Graph,
+    out_path: Path,
+    *,
+    ringed: bool,
+    hierarchical: bool,
+    optimize_passes: int,
+    protect: Path | None,
 ) -> None:
     """Write one HTML for *graph*, or fall back to a ``.dot`` when it is too large to render.
 
@@ -95,7 +106,7 @@ def _emit(
     warn. Prints what happened to stdout (success) or stderr (fallback).
     """
     result = html_export.write_layout_html(
-        graph, out_path, ringed=ringed, optimize_passes=optimize_passes
+        graph, out_path, ringed=ringed, hierarchical=hierarchical, optimize_passes=optimize_passes
     )
     if result is not None:
         print(f"wrote {result}")
@@ -150,6 +161,7 @@ def main(argv: list[str] | None = None) -> int:
                 sub,
                 out_dir / f"graph-{vpc_id}.html",
                 ringed=args.ringed,
+                hierarchical=args.hierarchical,
                 optimize_passes=args.optimize_passes,
                 protect=None,  # per-VPC names never collide with the input file
             )
@@ -160,6 +172,7 @@ def main(argv: list[str] | None = None) -> int:
         graph,
         out_path,
         ringed=args.ringed,
+        hierarchical=args.hierarchical,
         optimize_passes=args.optimize_passes,
         protect=in_path,  # don't clobber the input if the fallback .dot would land on it
     )

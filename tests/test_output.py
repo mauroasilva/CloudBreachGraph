@@ -326,6 +326,60 @@ def test_write_ringed_html_falls_back_when_too_many_bytes(graph, tmp_path):
     assert not (tmp_path / "ringed.html").exists()
 
 
+# --------------------------------------------------------------------------- #
+# HTML export — hierarchical layout
+# --------------------------------------------------------------------------- #
+def test_write_hierarchical_html_is_self_contained(graph, tmp_path):
+    path = html_export.write_hierarchical_html(graph, tmp_path / "hier.html")
+    assert path is not None and path.is_file()
+    text = path.read_text()
+    assert text.startswith("<!DOCTYPE html>")
+    assert text.rstrip().endswith("</html>")
+    # Fully self-contained: no external assets / network references at all.
+    assert "http://" not in text and "https://" not in text
+    assert "<script src" not in text and 'link rel="stylesheet"' not in text
+    assert "__GRAPH_DATA__" not in text and "const GRAPH =" in text
+    # Hierarchical page: precomputed positions + per-cluster metadata, NOT a force simulation.
+    assert "GRAPH.clusters" in text
+    assert "REPULSION" not in text and "requestAnimationFrame" not in text
+    assert "· hierarchical" in text  # HUD badge
+    assert "eni-00instance0000001" in text
+
+
+def test_write_hierarchical_html_is_deterministic(graph, tmp_path):
+    a = html_export.write_hierarchical_html(graph, tmp_path / "a.html").read_text()
+    b = html_export.write_hierarchical_html(graph, tmp_path / "b.html").read_text()
+    assert a == b  # positions computed from sorted nodes/edges; no timestamps
+
+
+def test_write_hierarchical_html_has_zoom_controls_and_scroll_lock(graph, tmp_path):
+    text = html_export.write_hierarchical_html(graph, tmp_path / "hier.html").read_text()
+    assert 'id="zoomIn"' in text and 'id="zoomOut"' in text
+    assert "function zoomAround(" in text
+    assert 'getElementById("zoomIn")' in text and "zoomAround(W / 2, H / 2, 1.2)" in text
+    assert 'getElementById("zoomOut")' in text and "zoomAround(W / 2, H / 2, 1 / 1.2)" in text
+    assert 'id="noscroll"' in text
+    assert "let scrollZoomEnabled = true" in text
+    assert "if (!scrollZoomEnabled) return;" in text
+
+
+def test_write_hierarchical_html_embeds_public_exposure(graph, tmp_path):
+    text = html_export.write_hierarchical_html(graph, tmp_path / "hier.html").read_text()
+    assert '"public": true' in text
+
+
+def test_write_hierarchical_html_falls_back_when_too_many_nodes(graph, tmp_path):
+    result = html_export.write_hierarchical_html(graph, tmp_path / "hier.html", max_nodes=0)
+    assert result is None
+    assert not (tmp_path / "hier.html").exists()
+
+
+def test_write_hierarchical_html_falls_back_when_too_many_bytes(graph, tmp_path):
+    result = html_export.write_hierarchical_html(graph, tmp_path / "hier.html", max_bytes=10)
+    assert result is None
+    assert not (tmp_path / "hier.html").exists()
+
+
 # HTML export — overlap-free layout
 
 
@@ -375,10 +429,21 @@ def test_write_layout_html_dispatches_to_each_layout(graph, tmp_path):
     ).read_text()
     assert optimized == html_export.build_optimized_html(graph, 500)
 
+    hierarchical = html_export.write_layout_html(
+        graph, tmp_path / "h.html", hierarchical=True
+    ).read_text()
+    assert hierarchical == html_export.build_hierarchical_html(graph)
+
+    # --hierarchical takes precedence over --ringed / --optimize-passes.
+    precedence = html_export.write_layout_html(
+        graph, tmp_path / "p.html", hierarchical=True, ringed=True, optimize_passes=500
+    ).read_text()
+    assert precedence == html_export.build_hierarchical_html(graph)
+
 
 def test_write_layout_html_falls_back_when_too_large(graph, tmp_path, monkeypatch):
     monkeypatch.setattr(html_export, "MAX_NODES", 0)
-    for kwargs in ({}, {"ringed": True}, {"optimize_passes": 100}):
+    for kwargs in ({}, {"ringed": True}, {"hierarchical": True}, {"optimize_passes": 100}):
         assert html_export.write_layout_html(graph, tmp_path / "x.html", **kwargs) is None
     assert not (tmp_path / "x.html").exists()
 

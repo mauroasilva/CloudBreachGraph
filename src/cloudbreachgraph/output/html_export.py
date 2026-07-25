@@ -43,6 +43,17 @@ readability and, as a **secondary** objective, minimises edge crossings (a bound
 search, ~halving them on the example graph) without giving up the overlap guarantees. It shares
 the same size guard and ``.dot`` fallback as the other two.
 
+A fourth, **hierarchical** layout (:func:`write_hierarchical_html` /
+:func:`build_hierarchical_html`, exposed by ``--hierarchical``) follows the ringed layout's rules
+but "unrolls" the concentric rings
+into **left/right columns**: each VPC is still the center of its own cell, but its layers
+(subnets, ENIs, EC2/LB, security groups, IP sources) fan out horizontally as columns to the left
+*and* right, the ENI column serving as the vertical anchor every other column aligns to (mirroring
+the ringed layout's ENI angular anchor). Connected nodes are kept on the **same side** of the VPC
+(the sides are the connected components of the VPC-center-removed subgraph), so no edge is drawn
+across the center between the two sides, and the sides are **balanced**. It shares the same size
+guard, ``.dot`` fallback and draw-only template as the ringed/overlap-free layouts.
+
 **Size guard / graceful fallback (``docs/02_architecture.md §7``).** An O(n²) force layout
 in the browser only stays responsive up to a point, and the inlined JSON grows with the
 graph. When a graph would exceed :data:`MAX_NODES` nodes or the rendered page would exceed
@@ -902,6 +913,64 @@ def split_by_vpc(graph: Graph) -> dict[str, Graph]:
     return subgraphs
 
 
+def _eni_anchor_maps(
+    graph: Graph, by_id: dict
+) -> tuple[
+    dict[str, list[str]],
+    dict[str, list[str]],
+    dict[str, list[str]],
+    dict[str, str],
+    dict[str, list[str]],
+]:
+    """The ENI-alignment maps shared by the ringed and hierarchical layouts.
+
+    The ENI layer is the **angular** (ringed) / **vertical** (hierarchical) anchor: every other
+    layer aligns to the mean position of the ENIs associated with it. Returns, all built from the
+    already-sorted ``graph.edges`` so each per-node ENI list is deterministic:
+
+    * ``enis_of_subnet`` — subnet -> the ENIs it contains (``in_subnet``).
+    * ``enis_of_lb`` — an outer node (ec2/lb/nat/vpce) -> the ENIs attached to it (``attached_to``).
+    * ``enis_of_sg`` — security group -> the ENIs it secures (``secured_by``).
+    * ``subnet_of_eni`` — ENI -> its subnet, used to keep a subnet's ENIs contiguous on their layer.
+    * ``enis_of_source`` — an IP source (internet/cidr/flow_peer) -> the ENIs it aligns to. A source
+      points at an SG (SGs shown) or an ENI directly (SGs hidden); SG targets are resolved through
+      ``enis_of_sg`` so the alignment always bottoms out at the ENI layer. A flow_peer aligns to the
+      ENI it exchanges flows with (either direction of its ``connects_to`` edge).
+    """
+    enis_of_lb: dict[str, list[str]] = {}
+    enis_of_subnet: dict[str, list[str]] = {}
+    enis_of_sg: dict[str, list[str]] = {}
+    subnet_of_eni: dict[str, str] = {}
+    reach_edges: list[tuple[str, str]] = []
+    for e in graph.edges:
+        if e.relationship == "attached_to":
+            enis_of_lb.setdefault(e.target, []).append(e.source)
+        elif e.relationship == "in_subnet":
+            enis_of_subnet.setdefault(e.target, []).append(e.source)
+            subnet_of_eni.setdefault(e.source, e.target)
+        elif e.relationship == "secured_by":
+            enis_of_sg.setdefault(e.target, []).append(e.source)
+        elif e.relationship in _REACH_RELS:
+            reach_edges.append((e.source, e.target))
+
+    enis_of_source: dict[str, list[str]] = {}
+    for src, tgt in reach_edges:
+        if by_id.get(tgt, {}).get("type") == "security_group":
+            enis_of_source.setdefault(src, []).extend(enis_of_sg.get(tgt, []))
+        else:
+            enis_of_source.setdefault(src, []).append(tgt)
+
+    for e in graph.edges:
+        if e.relationship != "connects_to":
+            continue
+        if by_id.get(e.source, {}).get("type") == "flow_peer":
+            enis_of_source.setdefault(e.source, []).append(e.target)
+        elif by_id.get(e.target, {}).get("type") == "flow_peer":
+            enis_of_source.setdefault(e.target, []).append(e.source)
+
+    return enis_of_subnet, enis_of_lb, enis_of_sg, subnet_of_eni, enis_of_source
+
+
 def _ringed_view_data(graph: Graph, passes: int = 0) -> dict:
     """Build the ringed page payload: nodes with fixed x/y, edges, and per-cluster metadata.
 
@@ -927,48 +996,10 @@ def _ringed_view_data(graph: Graph, passes: int = 0) -> dict:
     by_id = {n["id"]: n for n in base["nodes"]}
     group_of = _vpc_group_of(graph)
 
-    # ENI adjacency used to angle-align the ENI ring's two neighbours. graph.edges is sorted,
-    # so every per-node ENI list is deterministic.
-    #  * enis_of_lb: outer-ring node (ec2/lb) -> the ENIs attached to it (via `attached_to`).
-    #  * enis_of_subnet: subnet -> the ENIs it contains (via `in_subnet`).
-    #  * subnet_of_eni: ENI -> its subnet, used to group ENIs by subnet on ring 2.
-    #  * enis_of_sg: security_group -> the ENIs it secures (via `secured_by`), for ring 4.
-    #  * reach_edges: (source, target) of every reachability edge; target is an SG or an ENI.
-    enis_of_lb: dict[str, list[str]] = {}
-    enis_of_subnet: dict[str, list[str]] = {}
-    enis_of_sg: dict[str, list[str]] = {}
-    subnet_of_eni: dict[str, str] = {}
-    reach_edges: list[tuple[str, str]] = []
-    for e in graph.edges:
-        if e.relationship == "attached_to":
-            enis_of_lb.setdefault(e.target, []).append(e.source)
-        elif e.relationship == "in_subnet":
-            enis_of_subnet.setdefault(e.target, []).append(e.source)
-            subnet_of_eni.setdefault(e.source, e.target)
-        elif e.relationship == "secured_by":
-            enis_of_sg.setdefault(e.target, []).append(e.source)
-        elif e.relationship in _REACH_RELS:
-            reach_edges.append((e.source, e.target))
-
-    # enis_of_source: the ENIs an IP source aligns to. A source points at an SG (SGs shown) or at an
-    # ENI directly (SGs hidden); resolve SG targets through enis_of_sg so the alignment always
-    # bottoms out at the ENI ring (the angular anchor).
-    enis_of_source: dict[str, list[str]] = {}
-    for src, tgt in reach_edges:
-        if by_id.get(tgt, {}).get("type") == "security_group":
-            enis_of_source.setdefault(src, []).extend(enis_of_sg.get(tgt, []))
-        else:
-            enis_of_source.setdefault(src, []).append(tgt)
-
-    # A flow_peer shares the outer IP-source ring (§5.7); align it to the ENI it exchanges flows
-    # with (either direction of the connects_to edge) so it sits radially just outside that ENI.
-    for e in graph.edges:
-        if e.relationship != "connects_to":
-            continue
-        if by_id.get(e.source, {}).get("type") == "flow_peer":
-            enis_of_source.setdefault(e.source, []).append(e.target)
-        elif by_id.get(e.target, {}).get("type") == "flow_peer":
-            enis_of_source.setdefault(e.target, []).append(e.source)
+    # ENI-alignment maps (the ENI ring is the angular anchor). Shared with the hierarchical layout.
+    enis_of_subnet, enis_of_lb, enis_of_sg, subnet_of_eni, enis_of_source = _eni_anchor_maps(
+        graph, by_id
+    )
 
     # Bucket nodes into groups, and within a group into rings, preserving the deterministic
     # (type, id) order the Graph already sorted them into.
@@ -1123,6 +1154,320 @@ def write_ringed_html(
         return None
 
     html = build_ringed_html(graph, passes)
+    if len(html.encode("utf-8")) > byte_cap:
+        return None
+
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(html, encoding="utf-8")
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Hierarchical layout — the ringed layout "unrolled" into left/right columns.
+#
+# A fourth deterministic, Python-computed layout. It follows the **same rules** as the ringed
+# layout (each VPC is the center of its own cell; the same VPC/subnet/ENI/EC2-LB/SG/source layers;
+# the ENI layer is the anchor every other layer aligns to) but replaces the concentric circles
+# with a **hierarchical**, tree-like shape: the layers fan out **horizontally as columns** to the
+# left *and* right of the VPC center. Where the ringed layout maps a layer to a *radius* and its
+# anchor to an *angle*, this layout maps a layer to a signed *x-distance* (the column) and its
+# anchor to a *y-position* (the row).
+#
+# Two extra rules make it a genuine hierarchy rather than a mirrored ring:
+#   * **Connected nodes share a side.** A node and everything it connects to (a subnet, its ENIs,
+#     the EC2/LB/NAT/VPCE fronting them, their SGs and reachability sources — plus any subnets a
+#     shared load balancer / SG / source stitches together) are one *side-group*: the connected
+#     components of the VPC's subgraph with the VPC center removed. A whole side-group is placed
+#     entirely on the left or entirely on the right, so **no edge is ever drawn across the center
+#     between the two sides** (the only center-crossing edges are subnet->VPC, which terminate at
+#     the center itself, not on the far side).
+#   * **The two sides are balanced.** Side-groups are assigned left/right by a greedy
+#     largest-first bin-packing (each group joins the currently-smaller side), so roughly the same
+#     number of nodes sits on each side of the VPC center.
+#
+# Within a side, the ENI column is placed first (evenly spread in y, ordered by subnet so a
+# subnet's ENIs are contiguous) and every other column aligns each node to the **mean y of the
+# ENIs associated with it** (a subnet to the ENIs it contains, an EC2/LB to the ENIs attached to
+# it, an SG to the ENIs it secures, a source to the ENIs it can reach) — the exact ENI-anchoring
+# the ringed layout uses, just along y instead of angle. An L2 isotonic **min-gap** projection
+# (`_place_column`, the linear cousin of the ring's `_place_min_gap`) keeps a column's nodes from
+# overlapping while staying as close to their anchor as possible. Clusters are tiled into a grid
+# like the ringed layout. Positions are computed here in Python from the already-sorted
+# nodes/edges, so the page is byte-stable and needs no in-browser relaxation.
+# --------------------------------------------------------------------------- #
+
+# Column / row geometry (pixels). Columns step out from the center; rows stack within a column.
+_HIER_COL1 = 170.0  # x-distance from the VPC center to the first (innermost) column
+_HIER_COL_GAP = 200.0  # x-gap between one column and the next further out
+_HIER_ROW = 52.0  # min vertical center-to-center gap between two nodes in the same column
+
+
+def _hier_column_x(layers_present: set[int]) -> dict[int, float]:
+    """Signed-distance magnitude of each layer's column, collapsing empty layers.
+
+    ``layers_present`` is the set of layers (1..5, see :func:`_ring_of`) that carry at least one
+    node anywhere in the cluster. Present layers step outward by :data:`_HIER_COL_GAP` from the
+    first at :data:`_HIER_COL1`; absent layers consume no horizontal space so later columns nest
+    tighter (mirroring how :func:`_ring_radii` collapses an empty ring). The magnitude is shared by
+    both sides so the VPC stays centered and the columns line up symmetrically left and right.
+    """
+    xs: dict[int, float] = {}
+    dist = 0.0
+    for layer in range(1, _RING_COUNT):
+        if layer not in layers_present:
+            continue
+        dist = _HIER_COL1 if not xs else dist + _HIER_COL_GAP
+        xs[layer] = dist
+    return xs
+
+
+def _partition_sides(bucket: dict[int, list], adj: dict[str, list[str]]) -> tuple[set, set]:
+    """Split a cluster's non-center nodes into a balanced left/right, keeping components whole.
+
+    The units are the connected components of the cluster's subgraph **with the VPC center
+    removed** (so a subnet and everything reachable from it without passing through the VPC land in
+    one unit — this is what keeps connected nodes on the same side and every left/right edge off the
+    picture). Components are assigned greedily, largest first, each to the side with fewer nodes so
+    far, so the two sides end up roughly balanced. Deterministic: components are discovered in the
+    buckets' already-sorted id order and the largest-first sort breaks ties by first id.
+    """
+    ids = [m["id"] for r in range(1, _RING_COUNT) for m in bucket[r]]
+    idset = set(ids)
+    seen: set[str] = set()
+    comps: list[list[str]] = []
+    for start in ids:
+        if start in seen:
+            continue
+        comp: list[str] = []
+        stack = [start]
+        seen.add(start)
+        while stack:
+            cur = stack.pop()
+            comp.append(cur)
+            for nb in adj.get(cur, ()):  # only edges within the cluster, never to the VPC center
+                if nb in idset and nb not in seen:
+                    seen.add(nb)
+                    stack.append(nb)
+        comps.append(comp)
+
+    comps.sort(key=lambda c: (-len(c), c[0]))
+    left: set[str] = set()
+    right: set[str] = set()
+    ln = rn = 0
+    for comp in comps:
+        if ln <= rn:
+            left.update(comp)
+            ln += len(comp)
+        else:
+            right.update(comp)
+            rn += len(comp)
+    return left, right
+
+
+def _place_column(members: list, x: float, target_y: dict[str, float], gap: float) -> None:
+    """Place ``members`` in a vertical column at ``x``, near their ``target_y``, min-gap apart.
+
+    The linear counterpart of the ring's :func:`_place_min_gap`: sort by target y, then find the
+    positions closest to the targets subject to ``p_{i+1} - p_i >= gap`` via a gap-shifted L2
+    isotonic regression (:func:`_isotonic_l2`) — so nodes sit as near their ENI-anchored target as
+    possible while never overlapping. Members with no anchor arrive with ``target_y`` 0 and are
+    stacked around the column's middle. Assigns raw (unrounded) ``x``/``y``; the caller rounds after
+    translating the cluster into its grid cell.
+    """
+    n = len(members)
+    if n == 0:
+        return
+    members.sort(key=lambda m: (target_y[m["id"]], m["id"]))
+    ts = [target_y[m["id"]] for m in members]  # ascending
+    shifted = _isotonic_l2([t - i * gap for i, t in enumerate(ts)])
+    for i, m in enumerate(members):
+        m["x"] = x
+        m["y"] = shifted[i] + i * gap
+
+
+def _mean_target(
+    members: list, anchor_y: dict[str, float], enis_by_member: dict[str, list]
+) -> dict:
+    """Target y per member = mean y of its associated ENIs (0.0 when it has none)."""
+    target: dict[str, float] = {}
+    for m in members:
+        ys = [anchor_y[e] for e in enis_by_member.get(m["id"], []) if e in anchor_y]
+        target[m["id"]] = math.fsum(ys) / len(ys) if ys else 0.0
+    return target
+
+
+def _place_hier_cluster(
+    bucket: dict[int, list],
+    enis_of_subnet: dict[str, list],
+    enis_of_lb: dict[str, list],
+    enis_of_sg: dict[str, list],
+    subnet_of_eni: dict[str, str],
+    enis_of_source: dict[str, list],
+    adj: dict[str, list[str]],
+) -> None:
+    """Lay a single VPC cluster out about the origin as left/right hierarchical columns.
+
+    The VPC center goes at (0, 0); the rest of the cluster is split into a balanced left/right
+    (:func:`_partition_sides`) and, on each side, placed column by column with the ENI column as the
+    y-anchor (:func:`_place_column` / :func:`_mean_target`), exactly mirroring the ringed layout's
+    ENI-anchored ring placement. Coordinates are left unrounded for the caller to translate + round.
+    """
+    for m in bucket[0]:  # VPC center (0..1 nodes)
+        m["x"] = 0.0
+        m["y"] = 0.0
+
+    left, right = _partition_sides(bucket, adj)
+    layers_present = {r for r in range(1, _RING_COUNT) if bucket[r]}
+    col_x = _hier_column_x(layers_present)
+
+    for sign, side in ((-1.0, left), (1.0, right)):
+        side_bucket = {r: [m for m in bucket[r] if m["id"] in side] for r in range(1, _RING_COUNT)}
+
+        # ENI column (layer 2): ordered by subnet so a subnet's ENIs are contiguous, spread evenly
+        # in y, and used as the anchor every other column on this side aligns to.
+        enis = sorted(side_bucket[2], key=lambda m: (subnet_of_eni.get(m["id"], ""), m["id"]))
+        count = len(enis)
+        eni_target = {m["id"]: (i - (count - 1) / 2.0) * _HIER_ROW for i, m in enumerate(enis)}
+        if 2 in col_x:
+            _place_column(enis, sign * col_x[2], eni_target, _HIER_ROW)
+        anchor_y = {m["id"]: m["y"] for m in enis}
+
+        for layer, enis_by_member in (
+            (1, enis_of_subnet),  # subnets align to the ENIs they contain
+            (3, enis_of_lb),  # EC2/LB/NAT/VPCE align to the ENIs attached to them
+            (4, enis_of_sg),  # security groups align to the ENIs they secure
+            (5, enis_of_source),  # IP sources align to the ENIs they can reach
+        ):
+            if layer in col_x:
+                target = _mean_target(side_bucket[layer], anchor_y, enis_by_member)
+                _place_column(side_bucket[layer], sign * col_x[layer], target, _HIER_ROW)
+
+
+def _hier_extent(members: list) -> tuple[float, float]:
+    """Half-width and half-height (px) of a cluster laid out about the origin.
+
+    Covers every node disk **and its label rectangle** (labels hang below a node, so they extend the
+    height), so the grid cell sized from it reserves room for the columns and their labels — the
+    hierarchical counterpart of :func:`_cluster_label_extent`.
+    """
+    hw = hh = 0.0
+    for m in members:
+        r = _node_radius(m)
+        lhw, lh = _label_dims(m)
+        x0, y0, x1, y1 = _label_rect(m["x"], m["y"], r, lhw, lh)
+        hw = max(hw, abs(m["x"]) + r, abs(x0), abs(x1))
+        hh = max(hh, abs(m["y"]) + r, abs(y0), abs(y1))
+    return hw, hh
+
+
+def _hierarchical_view_data(graph: Graph) -> dict:
+    """Build the hierarchical page payload: nodes with fixed x/y, edges, and per-cluster metadata.
+
+    Reuses :func:`_view_data`'s per-node fields and adds computed ``x``/``y``. Each VPC cluster is
+    laid out about the origin as balanced left/right columns (:func:`_place_hier_cluster`), then the
+    clusters are tiled into a grid whose cells reserve room for every column and its labels. Orphan
+    resources (no VPC) collect into a final cluster with an empty center, exactly like the ringed
+    layout. ``clusters`` carries each cluster's center, a single half-height "ring" (so the shared
+    draw-only template floats the VPC label above the cluster), and the label.
+    """
+    base = _view_data(graph)
+    by_id = {n["id"]: n for n in base["nodes"]}
+    group_of = _vpc_group_of(graph)
+    enis_of_subnet, enis_of_lb, enis_of_sg, subnet_of_eni, enis_of_source = _eni_anchor_maps(
+        graph, by_id
+    )
+    adj = _adjacency(graph)
+
+    # Bucket nodes into groups, then layers (0=VPC center, 1..5 the columns), preserving the
+    # deterministic (type, id) order the Graph already sorted them into.
+    groups: dict[str, dict[int, list]] = {}
+    labels: dict[str, str] = {}
+    for n in graph.nodes:
+        g = group_of[n.id]
+        bucket = groups.setdefault(g, {r: [] for r in range(_RING_COUNT)})
+        bucket[_ring_of(n.type)].append(by_id[n.id])
+        if n.type == "vpc":
+            labels[g] = n.label
+
+    order = sorted(k for k in groups if k != _UNASSIGNED)
+    if _UNASSIGNED in groups:
+        order.append(_UNASSIGNED)
+
+    # Lay each cluster out about the origin first, so its extent is known, then tile.
+    extents: dict[str, tuple[float, float]] = {}
+    for g in order:
+        _place_hier_cluster(
+            groups[g],
+            enis_of_subnet,
+            enis_of_lb,
+            enis_of_sg,
+            subnet_of_eni,
+            enis_of_source,
+            adj,
+        )
+        extents[g] = _hier_extent([m for r in range(_RING_COUNT) for m in groups[g][r]])
+
+    max_hw = max((hw for hw, _ in extents.values()), default=0.0)
+    max_hh = max((hh for _, hh in extents.values()), default=0.0)
+    cell_w = 2 * max_hw + _CLUSTER_PAD
+    cell_h = 2 * max_hh + _CLUSTER_PAD
+    cols = max(1, math.ceil(math.sqrt(len(order))))
+
+    clusters = []
+    for i, g in enumerate(order):
+        cx = (i % cols) * cell_w
+        cy = (i // cols) * cell_h
+        for r in range(_RING_COUNT):
+            for m in groups[g][r]:
+                m["x"] = round(m["x"] + cx, 2)
+                m["y"] = round(m["y"] + cy, 2)
+        clusters.append(
+            {
+                "cx": round(cx, 2),
+                "cy": round(cy, 2),
+                # A single "ring" = the cluster's half-height, so the draw-only template floats the
+                # VPC label just above the topmost node (it draws the label at cy - max(rings) - 6).
+                "rings": [round(extents[g][1], 2)],
+                "label": labels.get(g, "unassigned"),
+            }
+        )
+
+    base["clusters"] = clusters
+    return base
+
+
+def build_hierarchical_html(graph: Graph) -> str:
+    """Return the complete, self-contained hierarchical HTML document for ``graph`` as a string."""
+    data_json = json.dumps(_hierarchical_view_data(graph), ensure_ascii=False, default=str)
+    return (
+        _render_static_layout(data_json, "hierarchical", _HIERARCHICAL_HINT, scale_labels=False)
+        .replace("__NODE_COUNT__", str(len(graph.nodes)))
+        .replace("__EDGE_COUNT__", str(len(graph.edges)))
+    )
+
+
+def write_hierarchical_html(
+    graph: Graph,
+    path: str | Path,
+    *,
+    max_nodes: int | None = None,
+    max_bytes: int | None = None,
+) -> Path | None:
+    """Write ``graph`` to ``path`` as the self-contained **hierarchical** HTML page.
+
+    Same contract and size guard as :func:`write_html` (VPC-centered left/right columns instead of
+    a force layout): returns the :class:`~pathlib.Path` written, or ``None`` when the graph is too
+    large (more than ``max_nodes`` nodes, or a rendered page over ``max_bytes`` bytes), in which
+    case **no file is written** so the caller can fall back to the ``.dot`` output.
+    """
+    node_cap = MAX_NODES if max_nodes is None else max_nodes
+    byte_cap = MAX_HTML_BYTES if max_bytes is None else max_bytes
+
+    if len(graph.nodes) > node_cap:
+        return None
+
+    html = build_hierarchical_html(graph)
     if len(html.encode("utf-8")) > byte_cap:
         return None
 
@@ -1950,6 +2295,12 @@ RINGED_HELP = (
     "render the concentric-ringed layout instead of the force one: each VPC is the center of a "
     "cluster, ringed by its subnets, then its ENIs, then everything else"
 )
+HIERARCHICAL_HELP = (
+    "render the hierarchical layout instead of the force one: each VPC is the center of a cluster "
+    "and its subnets, ENIs and everything else fan out as columns to the left and right, with "
+    "connected nodes kept on the same side and the two sides balanced (takes precedence over "
+    "--ringed)"
+)
 OPTIMIZE_PASSES_HELP = (
     "run up to N graph-optimisation passes (stops early once it converges). Without --ringed this "
     "renders the deterministic overlap-free layout (no overlapping nodes, no edge drawn across a "
@@ -1965,16 +2316,20 @@ def write_layout_html(
     path: str | Path,
     *,
     ringed: bool = False,
+    hierarchical: bool = False,
     optimize_passes: int = 0,
 ) -> Path | None:
     """Write the ``--html`` layout selected by the CLI flags, returning the path or ``None``.
 
-    Three-way selection shared by both CLIs: ``--ringed`` → the ringed layout (``optimize_passes``
-    is its in-ring crossing-reduction budget); otherwise ``optimize_passes > 0`` → the overlap-free
-    layout; otherwise the in-browser force layout. Returns ``None`` (writing nothing) when the graph
-    is too large for a browser layout, exactly like the underlying writers, so the caller can fall
-    back to the ``.dot``.
+    Selection shared by both CLIs, in precedence order: ``--hierarchical`` → the hierarchical
+    left/right-column layout; else ``--ringed`` → the ringed layout (``optimize_passes`` is its
+    in-ring crossing-reduction budget); else ``optimize_passes > 0`` → the overlap-free layout;
+    else the in-browser force layout. Returns ``None`` (writing nothing) when the graph is too large
+    for a browser layout, exactly like the underlying writers, so the caller falls back to the
+    ``.dot``.
     """
+    if hierarchical:
+        return write_hierarchical_html(graph, path)
     if ringed:
         return write_ringed_html(graph, path, passes=optimize_passes)
     if optimize_passes > 0:
@@ -2382,6 +2737,11 @@ _RINGED_HINT = (
 _OPTIMIZED_HINT = (
     "overlap-free layout: no node covers another and no edge crosses a node · "
     "drag a node · scroll to zoom (or lock it and use + / −) · drag to pan"
+)
+_HIERARCHICAL_HINT = (
+    "columns from each center: VPC · subnets · ENIs · EC2/LB · security groups · source IPs, "
+    "fanned left and right · connected nodes share a side · drag a node · scroll to zoom "
+    "(or lock it and use + / −) · drag to pan"
 )
 
 

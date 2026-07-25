@@ -512,6 +512,179 @@ def test_convert_ringed_falls_back_to_dot_when_too_large(graph, tmp_path, monkey
 
 
 # --------------------------------------------------------------------------- #
+# Hierarchical layout (--hierarchical)
+# --------------------------------------------------------------------------- #
+def _hier_cluster_of(node, clusters):
+    return min(
+        range(len(clusters)),
+        key=lambda i: (node["x"] - clusters[i]["cx"]) ** 2 + (node["y"] - clusters[i]["cy"]) ** 2,
+    )
+
+
+def test_hierarchical_view_data_puts_vpc_at_each_center(graph):
+    # Every node resolves under one VPC; the VPC node sits exactly at the cluster center.
+    data = html_export._hierarchical_view_data(graph)
+    assert len(data["clusters"]) == 1
+    cluster = data["clusters"][0]
+    vpc = next(n for n in graph.nodes if n.type == "vpc")
+    assert cluster["label"] == vpc.label
+    pos = {n["id"]: n for n in data["nodes"]}
+    assert (pos[vpc.id]["x"], pos[vpc.id]["y"]) == (cluster["cx"], cluster["cy"])
+
+
+def test_hierarchical_columns_increase_outward_by_layer(graph):
+    # The layers fan out as columns: |x - center| grows with the layer index (subnet < ENI <
+    # EC2/LB < security group < source) on each side of every cluster.
+    data = html_export._hierarchical_view_data(graph)
+    clusters = data["clusters"]
+    layer_of = {"vpc": 0, "subnet": 1, "eni": 2, "security_group": 4, "internet": 5, "cidr": 5}
+    seen: dict[tuple, dict] = {}
+    for n in data["nodes"]:
+        ci = _hier_cluster_of(n, clusters)
+        cx = clusters[ci]["cx"]
+        dx = n["x"] - cx
+        side = "L" if dx < 0 else "R"
+        layer = layer_of.get(n["type"], 3)
+        seen.setdefault((ci, side), {}).setdefault(layer, round(abs(dx), 1))
+    for cols in seen.values():
+        dists = [d for _, d in sorted(cols.items())]
+        assert dists == sorted(dists)  # deeper layer -> column further from center
+
+
+def test_hierarchical_has_no_left_right_edges(graph):
+    # The defining rule: connected nodes share a side, so no non-center edge is ever drawn across
+    # the center from one side to the other (edges to the VPC center itself are exempt).
+    data = html_export._hierarchical_view_data(graph)
+    clusters = data["clusters"]
+    pos = {n["id"]: n for n in data["nodes"]}
+    typ = {n["id"]: n["type"] for n in data["nodes"]}
+    ci = {nid: _hier_cluster_of(n, clusters) for nid, n in pos.items()}
+    for e in data["edges"]:
+        s, t = e["source"], e["target"]
+        if s not in pos or t not in pos or ci[s] != ci[t]:
+            continue
+        if typ[s] == "vpc" or typ[t] == "vpc":
+            continue  # subnet -> VPC center is allowed (it terminates at the center)
+        cx = clusters[ci[s]]["cx"]
+        assert (pos[s]["x"] < cx) == (pos[t]["x"] < cx)  # same side of the center
+
+
+def test_hierarchical_balances_the_two_sides():
+    # Two independent subnet chains of equal size must end up one per side (perfectly balanced),
+    # never both stacked on the same side.
+    def eni(name, subnet):
+        return {
+            "NetworkInterfaceId": name,
+            "SubnetId": subnet,
+            "VpcId": "vpc-1",
+            "InterfaceType": "interface",
+            "Description": "",
+            "Attachment": {"InstanceId": None},
+            "PrivateIpAddresses": [],
+            "Groups": [],
+        }
+
+    collected = {
+        "meta": {},
+        "network_interfaces": [eni("eni-a", "subnet-1"), eni("eni-b", "subnet-2")],
+    }
+    g = build_graph(collected)
+    data = html_export._hierarchical_view_data(g)
+    cx = data["clusters"][0]["cx"]
+    pos = {n["id"]: n for n in data["nodes"]}
+    # subnet-1's chain on one side, subnet-2's on the other.
+    assert (pos["subnet-1"]["x"] < cx) != (pos["subnet-2"]["x"] < cx)
+    assert (pos["eni-a"]["x"] < cx) == (pos["subnet-1"]["x"] < cx)  # ENI stays with its subnet
+    assert (pos["eni-b"]["x"] < cx) == (pos["subnet-2"]["x"] < cx)
+
+
+def test_hierarchical_subnet_shares_side_with_its_shared_load_balancer():
+    # Two subnets stitched together by a shared instance (its ENIs span both) are one side-group,
+    # so they must land on the *same* side — the connected-nodes-share-a-side rule.
+    def eni(name, subnet, instance):
+        return {
+            "NetworkInterfaceId": name,
+            "SubnetId": subnet,
+            "VpcId": "vpc-1",
+            "InterfaceType": "interface",
+            "Description": "",
+            "Attachment": {"InstanceId": instance},
+            "PrivateIpAddresses": [],
+            "Groups": [],
+        }
+
+    g = build_graph(
+        {
+            "meta": {},
+            "network_interfaces": [
+                eni("eni-1", "subnet-1", "i-shared"),
+                eni("eni-2", "subnet-2", "i-shared"),
+            ],
+        }
+    )
+    data = html_export._hierarchical_view_data(g)
+    cx = data["clusters"][0]["cx"]
+    pos = {n["id"]: n for n in data["nodes"]}
+    assert (pos["subnet-1"]["x"] < cx) == (pos["subnet-2"]["x"] < cx)  # same side
+    assert (pos["i-shared"]["x"] < cx) == (pos["subnet-1"]["x"] < cx)
+
+
+def test_hierarchical_unassigned_nodes_form_their_own_cluster():
+    collected = {
+        "meta": {},
+        "network_interfaces": [
+            {
+                "NetworkInterfaceId": "eni-lonely",
+                "SubnetId": None,
+                "VpcId": None,
+                "InterfaceType": "interface",
+                "Description": "",
+                "Attachment": {"InstanceId": None},
+                "PrivateIpAddresses": [],
+                "Groups": [],
+            }
+        ],
+    }
+    g = build_graph(collected)
+    data = html_export._hierarchical_view_data(g)
+    assert data["clusters"][-1]["label"] == "unassigned"
+
+
+def test_hierarchical_build_is_deterministic(graph):
+    assert html_export.build_hierarchical_html(graph) == html_export.build_hierarchical_html(graph)
+
+
+def test_hierarchical_keeps_fixed_size_labels(graph):
+    # Like the default ringed layout, the hierarchical layout keeps fixed-size labels (the reader
+    # zooms in to read them), so it does not scale label fonts with the view.
+    assert "const SCALE_LABELS = false;" in html_export.build_hierarchical_html(graph)
+
+
+def test_convert_hierarchical_json_to_html(graph, tmp_path):
+    jp = json_export.write_json(graph, tmp_path / "graph.json")
+    rc = convert.main([str(jp), "--hierarchical", "-o", str(tmp_path / "hier.html")])
+    assert rc == 0
+    text = (tmp_path / "hier.html").read_text()
+    assert text.startswith("<!DOCTYPE html>")
+    assert "hierarchical" in text  # hierarchical title/HUD
+    # Reproduces exactly what the hierarchical writer produces directly.
+    assert text == html_export.build_hierarchical_html(graph)
+
+
+def test_convert_hierarchical_falls_back_to_dot_when_too_large(
+    graph, tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setattr(html_export, "MAX_NODES", 0)
+    jp = json_export.write_json(graph, tmp_path / "graph.json")
+    out = tmp_path / "big.html"
+    rc = convert.main([str(jp), "--hierarchical", "-o", str(out)])
+    assert rc == 0
+    assert not out.exists()  # HTML skipped
+    assert (tmp_path / "big.dot").is_file()  # fallback .dot written
+    assert "too large" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- #
 # Ringed layout — crossing-reduction / overlap-nudge optimizer (--optimize-passes)
 # --------------------------------------------------------------------------- #
 def _crossing_graph():
@@ -1031,6 +1204,18 @@ def test_convert_split_by_vpc_ringed_layout(tmp_path):
     convert.main([str(jp), "--split-by-vpc", "--ringed", "-o", str(out_dir)])
     for vpc_id, sub in html_export.split_by_vpc(g).items():
         assert (out_dir / f"graph-{vpc_id}.html").read_text() == html_export.build_ringed_html(sub)
+
+
+def test_convert_split_by_vpc_hierarchical_layout(tmp_path):
+    # --hierarchical applies to every per-VPC file.
+    g = load_graph(_EXAMPLE_GRAPH_4VPC)
+    jp = json_export.write_json(g, tmp_path / "graph.json")
+    out_dir = tmp_path / "split"
+    convert.main([str(jp), "--split-by-vpc", "--hierarchical", "-o", str(out_dir)])
+    for vpc_id, sub in html_export.split_by_vpc(g).items():
+        assert (out_dir / f"graph-{vpc_id}.html").read_text() == (
+            html_export.build_hierarchical_html(sub)
+        )
 
 
 def test_convert_split_by_vpc_optimize_passes_layout(tmp_path):
