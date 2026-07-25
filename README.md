@@ -141,12 +141,14 @@ cloudbreachgraph --from-cache tests/fixtures --output-dir out/
 --from-cache DIR           build from cached AWS JSON in DIR, no live calls
 --include-orphans          also emit collected resources no ENI references
 --flow-logs                also gather IP-allocation history and analyse VPC flow
-                             logs (last 60 days): record flow-log config on the VPC
-                             and, per observed connection, add a connects_to edge to
-                             the peer (ENI->ENI when the peer IP is another ENI that
-                             held it at the time, else a flow_peer node). Needs extra
-                             read-only IAM (ec2:DescribeFlowLogs,
-                             cloudtrail:LookupEvents, logs:FilterLogEvents)
+                             logs (last 60 days), reading records from CloudWatch
+                             Logs or S3 per the flow log's destination type: record
+                             flow-log config on the VPC and, per observed connection,
+                             add a connects_to edge to the peer (ENI->ENI when the
+                             peer IP is another ENI that held it at the time, else a
+                             flow_peer node). Needs extra read-only IAM
+                             (ec2:DescribeFlowLogs, cloudtrail:LookupEvents,
+                             logs:FilterLogEvents, s3:ListBucket + s3:GetObject)
 --security-groups /        show security groups as nodes between ENIs and their
   --no-security-groups       sources (default: on); --no-security-groups connects the
                              source IPs directly to the ENIs with routability
@@ -287,9 +289,12 @@ read-only permissions and reads recent log data) to add, all read-only:
   status) — VPC-, subnet- and ENI-scoped flow logs all roll up to their VPC. There are no separate
   flow-log nodes, and this config is written to **`graph.json` only** — it is not drawn in the DOT or
   HTML views.
-- **What connected to what.** It reads up to **60 days** of CloudWatch-Logs flow records
-  (`logs filter-log-events`) — from each ENI's IP-allocation moment until now — and, for every
-  observed connection, adds a directed **`connects_to`** edge to the peer:
+- **What connected to what.** It reads up to **60 days** of flow records from wherever each flow log
+  delivers — **CloudWatch Logs** (`logs filter-log-events`) or **S3** (`s3api list-objects-v2` +
+  `get-object` on the gzipped objects), dispatched by the flow log's `LogDestinationType`. A
+  destination type with no reader implemented (e.g. `kinesis-data-firehose`) raises an error rather
+  than silently skipping. For every observed connection it adds a directed **`connects_to`** edge to
+  the peer:
   - if the peer IP belongs to **another ENI in the account**, the edge runs **ENI → ENI** directly
     (no new node — so the map shows which interfaces actually talk to each other). This only happens
     when that ENI **already held the IP at the time of the flow**: if the IP was allocated to it
@@ -305,10 +310,12 @@ cloudbreachgraph --account prod --flow-logs --output-dir out/
 cloudbreachgraph --from-cache tests/fixtures --flow-logs --output-dir out/   # offline demo
 ```
 
-Only the **CloudWatch-Logs** flow-record path is read for connection analysis; an **S3** destination
-is shown as a `log_bucket` node but its object contents aren't parsed. All flow-log data is read
-from the account bound to the `flow_logs` role — which defaults to the same account as `network`, so
-in the common single-account case `--flow-logs` "just works" (see `docs/02_architecture.md §5.7`).
+Both **CloudWatch-Logs** and **S3** flow-record paths are read (chosen per flow log's destination
+type). All flow-log data is read from the account bound to the `flow_logs` role — which defaults to
+the same account as `network`, so in the common single-account case `--flow-logs` "just works" (see
+`docs/02_architecture.md §5.7`). Reading S3 records needs `s3:ListBucket` + `s3:GetObject` on the
+destination bucket, in addition to `ec2:DescribeFlowLogs`, `cloudtrail:LookupEvents` and
+`logs:FilterLogEvents`.
 
 ## Converting an existing graph to HTML
 

@@ -29,6 +29,7 @@ _COMMAND_FIXTURES = {
     ("ec2", "describe-flow-logs"): "ec2_describe-flow-logs.json",
     ("cloudtrail", "lookup-events"): "cloudtrail_lookup-events.json",
     ("logs", "filter-log-events"): "logs_filter-log-events.json",
+    ("s3api", "list-objects-v2"): "s3api_list-objects-v2.json",
 }
 
 

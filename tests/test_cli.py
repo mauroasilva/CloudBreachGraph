@@ -33,6 +33,7 @@ _COMMAND_FIXTURES = {
     ("ec2", "describe-flow-logs"): "ec2_describe-flow-logs.json",
     ("cloudtrail", "lookup-events"): "cloudtrail_lookup-events.json",
     ("logs", "filter-log-events"): "logs_filter-log-events.json",
+    ("s3api", "list-objects-v2"): "s3api_list-objects-v2.json",
 }
 
 _CONFIG = """
@@ -368,6 +369,36 @@ def test_flow_log_config_and_ip_history_are_json_only(tmp_path):
         assert "2026-06-01" not in text  # an allocation timestamp
     # ...but the ENI's current private IP is still shown in the DOT.
     assert "10.0.1.10" in dot_text
+
+
+def test_unsupported_flow_log_destination_exits_cleanly(tmp_path, monkeypatch, capsys):
+    # A flow log delivering to an unimplemented destination type fails loudly (rc 1), not silently.
+    def _run(args, *, profile=None, region=None, cache_dir=None):
+        key = tuple(args[:2])
+        if key == ("ec2", "describe-flow-logs"):
+            return {
+                "FlowLogs": [{"FlowLogId": "fl-fh", "LogDestinationType": "kinesis-data-firehose"}]
+            }
+        if key == ("sts", "get-caller-identity"):
+            return {"Account": "111111111111"}
+        return load_fixture(_COMMAND_FIXTURES[key])
+
+    monkeypatch.setattr(runner, "run_aws", _run)
+    cfg = _write_config(tmp_path)
+    rc = cli.main(
+        [
+            "--account",
+            "workload_prod",
+            "--flow-logs",
+            "--config",
+            cfg,
+            "--no-verify-account",
+            "--output-dir",
+            str(tmp_path / "out"),
+        ]
+    )
+    assert rc == 1
+    assert "kinesis-data-firehose" in capsys.readouterr().err
 
 
 def test_flow_logs_live_run_uses_role_collectors(tmp_path, fake_aws):

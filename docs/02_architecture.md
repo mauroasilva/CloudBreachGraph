@@ -76,7 +76,9 @@ flags. The AWS CLI auto-paginates by default, returning the full result set.
 | VPC Endpoints | `aws ec2 describe-vpc-endpoints --region <r>` | `.VpcEndpoints[]` |
 | VPC Flow Logs config (`flow_logs`) | `aws ec2 describe-flow-logs --region <r>` | `.FlowLogs[]` |
 | IP-allocation history (`flow_logs`) | `aws cloudtrail lookup-events --lookup-attributes=AttributeKey=EventName,AttributeValue=CreateNetworkInterface --start-time=<now-60d>` | `.Events[].CloudTrailEvent` |
-| Flow-log records (`flow_logs`) | `aws logs filter-log-events --log-group-name=<g> --start-time=<ms>` | `.events[].message` |
+| Flow-log records — CloudWatch (`flow_logs`) | `aws logs filter-log-events --log-group-name=<g> --start-time=<ms>` | `.events[].message` |
+| Flow-log records — S3 list (`flow_logs`) | `aws s3api list-objects-v2 --bucket=<b> --prefix=<p>` | `.Contents[].{Key,LastModified}` |
+| Flow-log records — S3 object (`flow_logs`) | `aws s3api get-object --bucket=<b> --key=<k> <file>` | gzip body → lines |
 | Caller identity (account check) | `aws sts get-caller-identity` | `.Account`, `.Arn` |
 
 The three `flow_logs`-role commands are opt-in (`--flow-logs`, §5.7). They are **read-only**
@@ -311,8 +313,21 @@ into the already-built graph:
    collect on that one VPC. A flow log whose VPC isn't in the (ENI-anchored) graph is skipped. Like
    `ip_history`, this config is **JSON-only** — it is never drawn in the DOT or HTML output.
 
-3. **Observed connections** (`logs filter-log-events`, up to `FLOW_LOG_MAX_LOOKBACK_DAYS = 60` days
-   of default-format records from each CloudWatch flow-log group). For each record captured on a
+3. **Observed connections** (up to `FLOW_LOG_MAX_LOOKBACK_DAYS = 60` days of records). `describe-flow-logs`
+   says *where* each flow log delivers (`LogDestinationType`), and the collector **dispatches to the
+   reader for that type** (`FLOW_LOG_READERS`) so it always pulls from the right source:
+   - **CloudWatch Logs** (`cloud-watch-logs`): `logs filter-log-events` per log group.
+   - **S3** (`s3`): `s3api list-objects-v2` under the destination ARN's bucket/prefix (filtered to
+     `.gz` objects modified within the window), then `s3api get-object` on each, gunzipped and parsed.
+   A destination type with **no implemented reader** (e.g. `kinesis-data-firehose`) raises
+   `FlowLogDestinationError` — the run fails loudly rather than silently omitting those flows.
+   Records are parsed by **field position derived from the format** — a CloudWatch group's own
+   `LogFormat`, or (for S3) the **header row** each flow-log object carries; an absent/unrecognised
+   format falls back to the default v2 layout, and a format missing a required field
+   (`interface-id`/`srcaddr`/`dstaddr`) is skipped rather than misread. The collector prints a
+   one-line **stderr diagnostic** — config counts by destination, items fetched per source, records
+   parsed — so an empty result is explainable (usual remaining cause: a scope/permission mismatch).
+   For each record captured on a
    collected ENI `A`, the *peer* end (the address that isn't one of `A`'s private IPs) becomes the
    other node of a directed **`connects_to`** edge — `peer → A` when `A` is the destination (*what
    connected to it*), `A → peer` when `A` is the source (*what it connects to*):
@@ -337,11 +352,13 @@ HTML layout it sits on the **outermost IP-source ring** alongside `internet`/`ci
 into the VPC of the ENI it exchanges flows with (traced via its `connects_to` edge). It has a
 distinct fill colour from the other IP-source nodes in every HTML/DOT view.
 
-**Scope & simplifications.** Only the **CloudWatch-Logs** record path is analysed for connections;
-an S3 destination is recorded in the VPC's `flow_logs` attribute but its objects are not fetched
-(that would need per-object `s3api get-object`). All three commands run against the account bound to
-the `flow_logs` role (§11) — which defaults to the same account as `network`, so the common
-single-account case needs no config. Reading flow-log *records* (not just their config/destination)
+**Scope & simplifications.** Both the **CloudWatch-Logs** and **S3** record paths are analysed
+(destination type dispatched, above); a `kinesis-data-firehose` destination isn't implemented and
+raises. All flow-log commands run against the account bound to the `flow_logs` role (§11) — which
+defaults to the same account as `network`, so the common single-account case needs no config. The S3
+reader lists under the destination prefix and filters by `LastModified`; for a very large bucket
+that listing/download can be heavy (a future optimisation could narrow to date-partitioned prefixes).
+Required read-only IAM adds `s3:ListBucket` + `s3:GetObject` on the destination bucket. Reading flow-log *records* (not just their config/destination)
 goes beyond the original roadmap's "show the destination, don't parse traffic" line — a deliberate
 extension for this feature. Determinism holds: allocation times and record timestamps come from the
 data, and the 60-day bound is applied at the *collection* query (not from wall-clock in the output),

@@ -110,3 +110,29 @@ def run_aws(
         (target_dir / f"{_cache_key(args)}.json").write_text(proc.stdout, encoding="utf-8")
 
     return data
+
+
+def download_object(
+    args: list[str],
+    dest: str | Path,
+    *,
+    profile: str | None = None,
+    region: str | None = None,
+) -> Path:
+    """Run a **read-only** ``aws`` command that writes a binary body to ``dest``.
+
+    Used for ``s3api get-object`` (VPC flow-log objects are gzipped, so their body can't go
+    through the JSON-parsing :func:`run_aws`). ``dest`` is appended as the output-file positional
+    argument; stdout (the object metadata) is ignored. Raises :class:`AwsCliError` on a non-zero
+    exit. This is the same mock boundary as :func:`run_aws` — tests patch it, so no network.
+    """
+    cmd = ["aws", *args, str(dest), "--no-cli-pager"]
+    if region:
+        cmd += ["--region", region]
+    if profile:
+        cmd += ["--profile", profile]
+
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise AwsCliError(args, proc.returncode, proc.stderr)
+    return Path(dest)

@@ -14,7 +14,11 @@ collectors — no change to the driver loop, the config grammar, or the CLI.
 
 from __future__ import annotations
 
+import gzip
 import json as _json
+import os
+import sys
+import tempfile
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -286,7 +290,8 @@ def _normalize_allocation_event(raw: dict) -> dict | None:
     }
 
 
-# VPC Flow Log default (version 2) record fields, space-separated. We only depend on a handful.
+# VPC Flow Log **default** (version 2) record field positions, space-separated. Used when a flow log
+# has no explicit ``LogFormat`` (the standard layout).
 _FLOW_FIELD_IDX = {
     "interface_id": 2,
     "srcaddr": 3,
@@ -298,30 +303,75 @@ _FLOW_FIELD_IDX = {
     "action": 12,
 }
 
+# Map a ``LogFormat`` token name (as it appears inside ``${...}``) to our internal field key, so a
+# **custom** flow-log format is parsed by *position derived from its own format string* rather than
+# assuming the default order. Only the fields the analysis needs are mapped.
+_FLOW_TOKEN_TO_KEY = {
+    "interface-id": "interface_id",
+    "srcaddr": "srcaddr",
+    "dstaddr": "dstaddr",
+    "srcport": "srcport",
+    "dstport": "dstport",
+    "protocol": "protocol",
+    "start": "start",
+    "action": "action",
+}
 
-def _parse_flow_log_message(message: str, log_group: str | None) -> dict | None:
-    """Parse one default-format VPC flow-log record line into a normalized dict.
+# The fields we must be able to locate to use a record at all (the ENI + the two ends).
+_FLOW_REQUIRED = ("interface_id", "srcaddr", "dstaddr")
 
-    Fields we keep (``docs/02_architecture.md §5.7``): ``interface_id`` (the ENI the flow was
-    captured on), ``srcaddr``/``dstaddr`` (the two ends), ``srcport``/``dstport``, ``protocol``,
+
+def _field_index_from_format(log_format: str | None) -> dict[str, int] | None:
+    """Build a field-name -> position map from a flow log's ``LogFormat`` string.
+
+    ``LogFormat`` looks like ``"${version} ${account-id} ${interface-id} ${srcaddr} ..."``; each
+    ``${token}`` occupies one space-separated position. An empty/absent format means the **default**
+    layout (:data:`_FLOW_FIELD_IDX`). Returns ``None`` if the format omits a required field
+    (:data:`_FLOW_REQUIRED`), so the caller can skip that group instead of misreading every line."""
+    if not log_format or not log_format.strip():
+        return dict(_FLOW_FIELD_IDX)
+    idx: dict[str, int] = {}
+    for pos, token in enumerate(log_format.split()):
+        name = token.strip()
+        if name.startswith("${") and name.endswith("}"):
+            name = name[2:-1]
+        key = _FLOW_TOKEN_TO_KEY.get(name)
+        if key is not None:
+            idx[key] = pos
+    if any(k not in idx for k in _FLOW_REQUIRED):
+        return None
+    return idx
+
+
+def _parse_flow_log_message(
+    message: str, log_group: str | None, field_idx: dict[str, int] | None = None
+) -> dict | None:
+    """Parse one VPC flow-log record line into a normalized dict, per ``field_idx``.
+
+    ``field_idx`` maps field name -> position (from the flow log's ``LogFormat``, or the default
+    layout). Fields we keep (``docs/02_architecture.md §5.7``): ``interface_id`` (the ENI the flow
+    was captured on), ``srcaddr``/``dstaddr`` (the two ends), ``srcport``/``dstport``, ``protocol``,
     the capture-window ``start`` (epoch seconds, used to clamp to the IP-allocation window) and the
     ``action`` (ACCEPT/REJECT). A missing address (``-``, common for skipped/NODATA records) makes
     the line unusable, so we drop it — never guess."""
+    idx = field_idx if field_idx is not None else _FLOW_FIELD_IDX
     parts = message.split()
-    if len(parts) <= _FLOW_FIELD_IDX["action"]:
+    needed = max((idx[k] for k in _FLOW_REQUIRED), default=0)
+    if len(parts) <= needed:
         return None
 
-    def _field(name: str) -> str:
-        return parts[_FLOW_FIELD_IDX[name]]
+    def _field(name: str) -> str | None:
+        pos = idx.get(name)
+        return parts[pos] if pos is not None and pos < len(parts) else None
 
     srcaddr, dstaddr = _field("srcaddr"), _field("dstaddr")
-    if srcaddr in ("", "-") or dstaddr in ("", "-"):
+    if srcaddr in (None, "", "-") or dstaddr in (None, "", "-"):
         return None
 
-    def _int(value: str) -> int | None:
+    def _int(value: str | None) -> int | None:
         try:
-            return int(value)
-        except ValueError:
+            return int(value)  # type: ignore[arg-type]
+        except (ValueError, TypeError):
             return None
 
     return {
@@ -470,42 +520,240 @@ def collect_ip_allocation_events(profile: str | None, region: str | None) -> lis
     return out
 
 
+class FlowLogDestinationError(RuntimeError):
+    """A flow log delivers to a destination type we have **no record collector** for.
+
+    VPC Flow Logs can deliver to ``cloud-watch-logs``, ``s3`` or ``kinesis-data-firehose``. We read
+    records from the first two; any other (or a missing) type raises this so the run fails loudly
+    rather than silently omitting those flows (``docs/02_architecture.md §5.7``)."""
+
+    def __init__(self, dest_type: str | None, flow_log_id: str | None = None) -> None:
+        self.dest_type = dest_type
+        self.flow_log_id = flow_log_id
+        fid = f" (flow log {flow_log_id})" if flow_log_id else ""
+        super().__init__(
+            f"unsupported VPC flow-log destination type {dest_type!r}{fid}: no record collector is "
+            f"implemented for it. Implemented: {sorted(FLOW_LOG_READERS)}."
+        )
+
+
 def collect_flow_log_records(profile: str | None, region: str | None) -> list[dict]:
-    """Fetch and parse the CloudWatch-Logs flow-log *records* for the account's flow logs.
+    """Fetch and parse the flow-log *records* for the account's flow logs, per destination type.
 
-    Discovers which CloudWatch log groups receive flow logs (``describe-flow-logs``), then reads up
-    to :data:`FLOW_LOG_MAX_LOOKBACK_DAYS` days of records from each with ``aws logs
-    filter-log-events`` and parses every line (``docs/02_architecture.md §5.7``). S3-destined flow
-    logs are shown as a destination node but their object contents are **not** read here (that would
-    need per-object S3 ``get-object`` calls); this collector covers the CloudWatch path. Read-only:
-    ``filter-log-events`` only retrieves. Returns a flat list of normalized flow records."""
+    ``describe-flow-logs`` says *where* each flow log delivers (``LogDestinationType``); this
+    dispatches to the reader for that type (:data:`FLOW_LOG_READERS`) so it always pulls from the
+    right source — CloudWatch Logs (``logs filter-log-events``) or S3 (``s3api list-objects-v2`` +
+    ``get-object`` on the gzipped objects). A flow log whose destination type has **no** implemented
+    reader raises :class:`FlowLogDestinationError` (``docs/02_architecture.md §5.7``). Each reader
+    reads up to :data:`FLOW_LOG_MAX_LOOKBACK_DAYS` days back and is read-only. Returns a flat list
+    of normalized flow records; emits a one-line stderr diagnostic so an empty result is
+    explainable."""
     config = runner.run_aws(["ec2", "describe-flow-logs"], profile=profile, region=region)
-    log_groups = sorted(
-        {
-            fl.get("LogGroupName")
-            for fl in config.get("FlowLogs", [])
-            if fl.get("LogDestinationType") == "cloud-watch-logs" and fl.get("LogGroupName")
-        }
-    )
+    flow_logs = config.get("FlowLogs", [])
 
-    start_ms = int((time.time() - FLOW_LOG_MAX_LOOKBACK_DAYS * 86400) * 1000)
+    by_type: dict[str | None, list[dict]] = {}
+    dest_counts: dict[str, int] = {}
+    for fl in flow_logs:
+        dest = fl.get("LogDestinationType")
+        dest_counts[dest or "unknown"] = dest_counts.get(dest or "unknown", 0) + 1
+        by_type.setdefault(dest, []).append(fl)
+
+    # Fail loudly on any destination type we can't read — before doing partial work.
+    for dest, fls in by_type.items():
+        if dest not in FLOW_LOG_READERS:
+            raise FlowLogDestinationError(dest, fls[0].get("FlowLogId"))
+
+    since_epoch = time.time() - FLOW_LOG_MAX_LOOKBACK_DAYS * 86400
     records: list[dict] = []
-    for group in log_groups:
+    fetched_by_type: dict[str, int] = {}
+    for dest, fls in by_type.items():
+        recs, fetched = FLOW_LOG_READERS[dest](fls, profile, region, since_epoch)
+        records.extend(recs)
+        fetched_by_type[dest] = fetched
+
+    _report_flow_log_records(flow_logs, dest_counts, fetched_by_type, len(records))
+    return records
+
+
+def _read_cloudwatch_records(
+    flow_logs: list[dict], profile: str | None, region: str | None, since_epoch: float
+) -> tuple[list[dict], int]:
+    """Read records from each CloudWatch log group (``logs filter-log-events``). Returns
+    ``(records, events_fetched)``. Each group's fields come from its own ``LogFormat``."""
+    group_fields: dict[str, dict[str, int]] = {}
+    for fl in flow_logs:
+        group = fl.get("LogGroupName")
+        if group and group not in group_fields:
+            fields = _field_index_from_format(fl.get("LogFormat"))
+            if fields is not None:
+                group_fields[group] = fields
+
+    start_ms = int(since_epoch * 1000)
+    records: list[dict] = []
+    fetched = 0
+    for group in sorted(group_fields):
         data = runner.run_aws(
-            [
-                "logs",
-                "filter-log-events",
-                f"--log-group-name={group}",
-                f"--start-time={start_ms}",
-            ],
+            ["logs", "filter-log-events", f"--log-group-name={group}", f"--start-time={start_ms}"],
             profile=profile,
             region=region,
         )
-        for event in data.get("events", []):
-            rec = _parse_flow_log_message(event.get("message", ""), group)
+        events = data.get("events", [])
+        fetched += len(events)
+        for event in events:
+            rec = _parse_flow_log_message(event.get("message", ""), group, group_fields[group])
             if rec is not None:
                 records.append(rec)
-    return records
+    return records, fetched
+
+
+def _parse_s3_arn(arn: str | None) -> tuple[str, str] | None:
+    """Split an S3 ``LogDestination`` ARN (``arn:aws:s3:::bucket/prefix``) into ``bucket, prefix``.
+
+    ``prefix`` may be empty (the bucket root). Returns ``None`` for a malformed ARN.
+    """
+    if not arn or ":::" not in arn:
+        return None
+    bucket, _, prefix = arn.split(":::", 1)[1].partition("/")
+    return (bucket, prefix) if bucket else None
+
+
+def _read_s3_records(
+    flow_logs: list[dict], profile: str | None, region: str | None, since_epoch: float
+) -> tuple[list[dict], int]:
+    """Read records from each S3 destination: list the gzipped objects modified within the window
+    (``s3api list-objects-v2``), download and parse each (``s3api get-object`` + gunzip). Returns
+    ``(records, objects_read)``. Distinct ``(bucket, prefix)`` sources are read once."""
+    sources: dict[tuple[str, str], None] = {}
+    for fl in flow_logs:
+        bp = _parse_s3_arn(fl.get("LogDestination"))
+        if bp is not None:
+            sources.setdefault(bp, None)
+
+    records: list[dict] = []
+    objects_read = 0
+    for bucket, prefix in sorted(sources):
+        for key in _list_s3_flow_log_keys(bucket, prefix, since_epoch, profile, region):
+            objects_read += 1
+            records.extend(_read_s3_object_records(bucket, key, profile, region))
+    return records, objects_read
+
+
+def _list_s3_flow_log_keys(
+    bucket: str, prefix: str, since_epoch: float, profile: str | None, region: str | None
+) -> list[str]:
+    """The ``.gz`` object keys under ``bucket``/``prefix`` last modified within the window."""
+    args = ["s3api", "list-objects-v2", f"--bucket={bucket}"]
+    if prefix:
+        args.append(f"--prefix={prefix}")
+    data = runner.run_aws(args, profile=profile, region=region)
+    keys: list[str] = []
+    for obj in data.get("Contents", []):
+        key = obj.get("Key")
+        if not key or not key.endswith(".gz"):
+            continue
+        modified = _epoch_from_iso(obj.get("LastModified"))
+        if modified is not None and modified < since_epoch:
+            continue  # older than the lookback window — skip (keep it if the timestamp is unknown)
+        keys.append(key)
+    return sorted(keys)
+
+
+def _read_s3_object_records(
+    bucket: str, key: str, profile: str | None, region: str | None
+) -> list[dict]:
+    """Download one gzipped flow-log object and parse its records. The object's **first line is the
+    field-name header** (VPC flow-log S3 files always carry one), so the field index is read from it
+    (falling back to the default layout if it isn't a header). A corrupt/unreadable object is
+    skipped, never fatal."""
+    lines = _download_gz_lines(bucket, key, profile, region)
+    if not lines:
+        return []
+    header_idx = _field_index_from_format(lines[0])
+    if header_idx is not None:
+        field_idx, data_lines = header_idx, lines[1:]
+    else:
+        field_idx, data_lines = dict(_FLOW_FIELD_IDX), lines
+    source = f"s3://{bucket}/{key}"
+    out: list[dict] = []
+    for line in data_lines:
+        rec = _parse_flow_log_message(line, source, field_idx)
+        if rec is not None:
+            out.append(rec)
+    return out
+
+
+def _download_gz_lines(bucket: str, key: str, profile: str | None, region: str | None) -> list[str]:
+    """``s3api get-object`` the key to a temp file, gunzip it, return its text lines (or ``[]``)."""
+    fd, dest = tempfile.mkstemp(suffix=".gz")
+    os.close(fd)
+    try:
+        runner.download_object(
+            ["s3api", "get-object", f"--bucket={bucket}", f"--key={key}"],
+            dest,
+            profile=profile,
+            region=region,
+        )
+        with gzip.open(dest, "rt", encoding="utf-8", errors="replace") as fh:
+            return fh.read().splitlines()
+    except (OSError, EOFError, gzip.BadGzipFile):
+        return []  # unreadable/corrupt object — skip it, don't abort the whole run
+    finally:
+        try:
+            os.unlink(dest)
+        except OSError:
+            pass
+
+
+def _epoch_from_iso(value: str | None) -> float | None:
+    """Epoch seconds from an ISO-8601 timestamp (S3 ``LastModified``), or ``None``."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+# Registry: LogDestinationType -> the reader that pulls its records. Adding a new destination type
+# (e.g. kinesis-data-firehose) is one entry here + its reader; until then such a type raises
+# FlowLogDestinationError, so the tool always pulls from the right source or fails loudly (§5.7).
+FLOW_LOG_READERS: dict[
+    str, Callable[[list[dict], str | None, str | None, float], tuple[list[dict], int]]
+] = {
+    "cloud-watch-logs": _read_cloudwatch_records,
+    "s3": _read_s3_records,
+}
+
+
+def _report_flow_log_records(
+    flow_logs: list[dict],
+    dest_counts: dict[str, int],
+    fetched_by_type: dict[str, int],
+    parsed: int,
+) -> None:
+    """Emit a concise stderr diagnostic for the flow-log record fetch (``docs/02_architecture.md
+    §5.7``) so an empty result points at its cause rather than failing silently. ``fetched`` counts
+    are CloudWatch **events** and S3 **objects** — enough to localise where the pipeline drops."""
+    dest = ", ".join(f"{n} {d}" for d, n in sorted(dest_counts.items())) or "none"
+    unit = {"cloud-watch-logs": "event(s)", "s3": "object(s)"}
+    fetched = (
+        ", ".join(
+            f"{fetched_by_type[d]} {unit.get(d, 'item(s)')} from {d}"
+            for d in sorted(fetched_by_type)
+        )
+        or "nothing"
+    )
+    print(
+        f"cloudbreachgraph: flow logs: {len(flow_logs)} config(s) [{dest}]; "
+        f"fetched {fetched}; parsed {parsed} flow record(s).",
+        file=sys.stderr,
+    )
+    if sum(fetched_by_type.values()) and not parsed:
+        print(
+            "cloudbreachgraph: note: fetched log data but parsed no flow records — the source may "
+            "hold a non-flow-log or unrecognised format.",
+            file=sys.stderr,
+        )
 
 
 # --------------------------------------------------------------------------- #
