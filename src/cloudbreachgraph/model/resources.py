@@ -365,6 +365,97 @@ class RouteTable:
 
 
 @dataclass
+class FlowLog:
+    """A VPC Flow Log *configuration* — which resource logs, and where to (``§5.7``).
+
+    ``resource_id`` is a ``vpc-``/``subnet-``/``eni-`` id. Delivery is either CloudWatch Logs
+    (``destination_type == "cloud-watch-logs"``, ``log_group_name`` set) or S3
+    (``destination_type == "s3"``, ``log_destination`` an S3 ARN).
+    """
+
+    id: str
+    resource_id: str | None
+    destination_type: str | None
+    log_group_name: str | None
+    log_destination: str | None
+    status: str | None
+    traffic_type: str | None
+
+    @classmethod
+    def from_collected(cls, d: dict[str, Any]) -> FlowLog:
+        return cls(
+            id=d.get("FlowLogId"),
+            resource_id=d.get("ResourceId"),
+            destination_type=d.get("LogDestinationType"),
+            log_group_name=d.get("LogGroupName"),
+            log_destination=d.get("LogDestination"),
+            status=d.get("DeliverLogsStatus") or d.get("FlowLogStatus"),
+            traffic_type=d.get("TrafficType"),
+        )
+
+    @property
+    def destination_id(self) -> str | None:
+        """Graph node id of this flow log's destination (log group name or S3 ARN)."""
+        return self.log_group_name or self.log_destination
+
+    @property
+    def destination_node_type(self) -> str:
+        """``log_group`` for a CloudWatch destination, else ``log_bucket`` (S3)."""
+        return "log_group" if self.destination_type == "cloud-watch-logs" else "log_bucket"
+
+
+@dataclass
+class IpAllocation:
+    """When an ENI's private IP was allocated, from a CloudTrail event (``§5.7``)."""
+
+    eni_id: str
+    private_ip: str | None
+    allocated_at: str | None
+
+    @classmethod
+    def from_collected(cls, d: dict[str, Any]) -> IpAllocation:
+        return cls(
+            eni_id=d.get("NetworkInterfaceId"),
+            private_ip=d.get("PrivateIpAddress"),
+            allocated_at=d.get("AllocatedAt"),
+        )
+
+
+@dataclass
+class FlowLogRecord:
+    """One parsed VPC flow-log record — a single observed connection (``§5.7``).
+
+    ``interface_id`` is the ENI the flow was captured on; ``srcaddr``/``dstaddr`` are its two ends.
+    ``start`` is the capture-window start (epoch seconds), used to keep only records at or after the
+    ENI's IP-allocation time.
+    """
+
+    interface_id: str | None
+    srcaddr: str | None
+    dstaddr: str | None
+    srcport: int | None
+    dstport: int | None
+    protocol: str | None
+    action: str | None
+    start: int | None
+    log_group: str | None
+
+    @classmethod
+    def from_collected(cls, d: dict[str, Any]) -> FlowLogRecord:
+        return cls(
+            interface_id=d.get("InterfaceId"),
+            srcaddr=d.get("SrcAddr"),
+            dstaddr=d.get("DstAddr"),
+            srcport=d.get("SrcPort"),
+            dstport=d.get("DstPort"),
+            protocol=d.get("Protocol"),
+            action=d.get("Action"),
+            start=d.get("Start"),
+            log_group=d.get("LogGroup"),
+        )
+
+
+@dataclass
 class Subnet:
     """A subnet an ENI lives in (``docs/02_architecture.md §5.1``)."""
 

@@ -23,6 +23,9 @@ _COMMAND_FIXTURES = {
     ("ec2", "describe-route-tables"): "ec2_describe-route-tables.json",
     ("ec2", "describe-nat-gateways"): "ec2_describe-nat-gateways.json",
     ("ec2", "describe-vpc-endpoints"): "ec2_describe-vpc-endpoints.json",
+    ("ec2", "describe-flow-logs"): "ec2_describe-flow-logs.json",
+    ("cloudtrail", "lookup-events"): "cloudtrail_lookup-events.json",
+    ("logs", "filter-log-events"): "logs_filter-log-events.json",
 }
 
 
@@ -173,6 +176,61 @@ def test_collect_vpc_endpoints_normalizes(fake_aws):
     # The interface endpoint's ENIs are its authoritative ownership signal.
     assert vpce["NetworkInterfaceIds"] == ["eni-00vpce00000000006"]
     assert vpce["ServiceName"].endswith("secretsmanager")
+
+
+# --------------------------------------------------------------------------- #
+# flow_logs role (§5.7)
+# --------------------------------------------------------------------------- #
+def test_collect_flow_logs_normalizes(fake_aws):
+    fls = collectors.collect_flow_logs("prod-audit", "us-east-1")
+    by_id = {f["FlowLogId"]: f for f in fls}
+    assert set(by_id) == {"fl-0abc00000000001", "fl-0abc00000000002"}
+    cw = by_id["fl-0abc00000000001"]
+    assert cw["ResourceId"] == "vpc-0aaaaaaaaaaaaaaaa"
+    assert cw["LogDestinationType"] == "cloud-watch-logs"
+    assert cw["LogGroupName"] == "/vpc/flowlogs/prod"
+    s3 = by_id["fl-0abc00000000002"]
+    assert s3["LogDestinationType"] == "s3"
+    assert s3["LogDestination"].startswith("arn:aws:s3:::")
+
+
+def test_collect_ip_allocation_events_parses_cloudtrail(fake_aws):
+    allocs = collectors.collect_ip_allocation_events("prod-audit", "us-east-1")
+    by_eni = {a["NetworkInterfaceId"]: a for a in allocs}
+    assert set(by_eni) == {"eni-00instance0000001", "eni-00alb00000000002"}
+    inst = by_eni["eni-00instance0000001"]
+    assert inst["PrivateIpAddress"] == "10.0.1.10"
+    assert inst["AllocatedAt"].startswith("2026-06-01")
+    # The lookup was scoped to CreateNetworkInterface via --lookup-attributes.
+    call = next(c for c in fake_aws if tuple(c["args"][:2]) == ("cloudtrail", "lookup-events"))
+    assert any("CreateNetworkInterface" in a for a in call["args"])
+
+
+def test_collect_flow_log_records_parses_and_skips_nodata(fake_aws):
+    records = collectors.collect_flow_log_records("prod-audit", "us-east-1")
+    # The fixture has 5 events; the NODATA line with a "-" address is dropped -> 4 usable records.
+    assert len(records) == 4
+    assert all(r["SrcAddr"] not in (None, "-") and r["DstAddr"] not in (None, "-") for r in records)
+    outbound = next(
+        r for r in records if r["SrcAddr"] == "10.0.1.10" and r["DstAddr"] == "10.0.2.30"
+    )
+    assert outbound["InterfaceId"] == "eni-00instance0000001"
+    assert outbound["DstPort"] == 443
+    assert outbound["Protocol"] == "6"
+    assert outbound["Action"] == "ACCEPT"
+    assert isinstance(outbound["Start"], int)
+    # It discovered the CloudWatch log group from describe-flow-logs and filtered that group.
+    filt = next(c for c in fake_aws if tuple(c["args"][:2]) == ("logs", "filter-log-events"))
+    assert any("--log-group-name=/vpc/flowlogs/prod" == a for a in filt["args"])
+
+
+def test_flow_logs_role_registered():
+    assert "flow_logs" in collectors.ROLE_COLLECTORS
+    assert collectors.ROLE_RESULT_KEYS["flow_logs"] == [
+        "flow_logs",
+        "ip_allocations",
+        "flow_log_records",
+    ]
 
 
 def test_role_registry_is_consistent():

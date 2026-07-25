@@ -38,15 +38,20 @@ region     = "us-east-1"
 
 # ---------------------------------------------------------------------------
 # Targets: bind resource roles to accounts.
-#   role "network"   -> ENIs, EC2, load balancers, subnets, VPCs   (implemented in v1)
-#   role "flow_logs" -> VPC Flow Logs + their destinations         (future; see docs/05_roadmap.md)
+#   role "network"   -> ENIs, EC2, load balancers, subnets, VPCs   (always active)
+#   role "flow_logs" -> VPC Flow Log config + IP history + analysed records (opt-in: --flow-logs)
 # Any role not listed under [targets.<name>.roles] uses default_account.
 # ---------------------------------------------------------------------------
 [targets.prod]
 default_account = "workload_prod"     # network resources come from the workload account
 [targets.prod.roles]
-flow_logs = "log_archive"             # ...but flow logs live in the central logging account
-                                      # (no effect until the flow_logs feature ships; safe to set now)
+flow_logs = "log_archive"             # ...bind flow logs to the central logging account.
+                                      # NOTE: the current --flow-logs implementation reads ALL of
+                                      # the flow_logs role's data (config, CloudTrail, log records)
+                                      # from this ONE bound account, so for now bind it to the
+                                      # account that owns the flow-log *config* (usually the workload
+                                      # account) — or leave it unset to inherit default_account.
+                                      # Full cross-account splitting is future (docs/05_roadmap.md).
 
 # A simple, single-account target: everything comes from one account, no role overrides needed.
 [targets.sandbox]

@@ -1,0 +1,24 @@
+{
+  "Events": [
+    {
+      "EventId": "aaaaaaaa-0000-0000-0000-000000000001",
+      "EventName": "CreateNetworkInterface",
+      "EventTime": "2026-06-01T00:00:00+00:00",
+      "Username": "prod-audit",
+      "Resources": [
+        {"ResourceType": "AWS::EC2::NetworkInterface", "ResourceName": "eni-00instance0000001"}
+      ],
+      "CloudTrailEvent": "{\"eventTime\":\"2026-06-01T00:00:00+00:00\",\"eventName\":\"CreateNetworkInterface\",\"responseElements\":{\"networkInterface\":{\"networkInterfaceId\":\"eni-00instance0000001\",\"privateIpAddress\":\"10.0.1.10\"}}}"
+    },
+    {
+      "EventId": "aaaaaaaa-0000-0000-0000-000000000002",
+      "EventName": "CreateNetworkInterface",
+      "EventTime": "2026-05-20T00:00:00+00:00",
+      "Username": "prod-audit",
+      "Resources": [
+        {"ResourceType": "AWS::EC2::NetworkInterface", "ResourceName": "eni-00alb00000000002"}
+      ],
+      "CloudTrailEvent": "{\"eventTime\":\"2026-05-20T00:00:00+00:00\",\"eventName\":\"CreateNetworkInterface\",\"responseElements\":{\"networkInterface\":{\"networkInterfaceId\":\"eni-00alb00000000002\",\"privateIpAddress\":\"10.0.1.20\"}}}"
+    }
+  ]
+}

@@ -49,6 +49,11 @@ _TYPE_STYLE: dict[str, tuple[str, str]] = {
     "internet": ("#FFEBEE", "doubleoctagon"),  # the whole internet (0.0.0.0/0 / ::/0), per-ENI
     "cidr": ("#FFF8E1", "note"),  # a specific source CIDR
     "security_group": ("#FCE4EC", "tab"),  # a referencing security group
+    # Flow logs (docs/02_architecture.md §5.7) — config, destinations, observed connection peers.
+    "flow_log": ("#E1F5FE", "cds"),  # a VPC flow-log configuration
+    "log_group": ("#E0F7FA", "cylinder"),  # CloudWatch Logs destination
+    "log_bucket": ("#FFF3E0", "folder"),  # S3 destination
+    "flow_peer": ("#ECEFF1", "hexagon"),  # an external address observed in the flow logs
 }
 _DEFAULT_STYLE = ("#FFFFFF", "box")
 
@@ -118,6 +123,12 @@ def _node_lines(node: Node) -> list[str]:
             lines.append("Private IP: " + ", ".join(attrs["private_ips"]))
         if attrs.get("public_ips"):
             lines.append("Public IP: " + ", ".join(attrs["public_ips"]))
+        if attrs.get("ip_allocations"):  # IP history (§5.7) — earliest allocation time
+            allocated = [
+                a["allocated_at"] for a in attrs["ip_allocations"] if a.get("allocated_at")
+            ]
+            if allocated:
+                lines.append("IP since: " + min(allocated))
     elif node.type == "load_balancer" and attrs.get("lb_type"):
         lines.append(str(attrs["lb_type"]))
     elif node.type == "nat_gateway":
@@ -133,6 +144,12 @@ def _node_lines(node: Node) -> list[str]:
         lines.append(str(attrs["cidr"]))
     elif node.type == "ec2_instance" and attrs.get("state"):
         lines.append(str(attrs["state"]))
+    elif node.type == "flow_log":
+        detail = ", ".join(
+            str(attrs[k]) for k in ("traffic_type", "destination_type") if attrs.get(k)
+        )
+        if detail:
+            lines.append(detail)
     if attrs.get("synthetic"):
         lines.append("(unresolved)")
     return lines
@@ -175,6 +192,10 @@ def _edge_extra(edge: Edge) -> str:
         return ', color="#E53935", penwidth=1.5'
     if rel == "not_routable_can_reach":  # allowed but no route -> muted, dashed
         return ', style="dashed", color="#9E9E9E"'
+    if rel == "connects_to":  # an observed flow-log connection (§5.7) -> solid blue
+        return ', color="#1E88E5", penwidth=1.3'
+    if rel in ("logs_to", "delivers_to"):  # flow-log config plumbing -> dotted
+        return ', style="dotted", color="#00838F"'
     return ""
 
 

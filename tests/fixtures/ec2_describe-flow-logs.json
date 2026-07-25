@@ -1,0 +1,24 @@
+{
+  "FlowLogs": [
+    {
+      "FlowLogId": "fl-0abc00000000001",
+      "ResourceId": "vpc-0aaaaaaaaaaaaaaaa",
+      "LogDestinationType": "cloud-watch-logs",
+      "LogGroupName": "/vpc/flowlogs/prod",
+      "LogDestination": null,
+      "DeliverLogsStatus": "SUCCESS",
+      "FlowLogStatus": "ACTIVE",
+      "TrafficType": "ALL"
+    },
+    {
+      "FlowLogId": "fl-0abc00000000002",
+      "ResourceId": "subnet-022222222222222",
+      "LogDestinationType": "s3",
+      "LogGroupName": null,
+      "LogDestination": "arn:aws:s3:::prod-flow-logs-bucket/AWSLogs/",
+      "DeliverLogsStatus": "SUCCESS",
+      "FlowLogStatus": "ACTIVE",
+      "TrafficType": "ALL"
+    }
+  ]
+}
