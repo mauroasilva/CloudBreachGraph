@@ -62,6 +62,14 @@ def build_parser() -> argparse.ArgumentParser:
         "using the AWS CLI. Read-only.",
     )
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    p.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="echo every aws command actually run (incl. every get-object, retries and any "
+        "aws sso login) to stderr with a short OK/NOT OK result; stdout and the graph files "
+        "stay clean. With --from-cache, echoes which cached response each command is served from",
+    )
 
     # Targeting (precedence: --profile > --target > --account > config default > CLI default).
     tgt = p.add_argument_group("targeting")
@@ -180,6 +188,11 @@ def _make_cache_reader(cache_dir: str | Path):
         for name in candidates:
             fp = base / name
             if fp.is_file():
+                if runner.is_verbose():
+                    print(
+                        f"cloudbreachgraph: + [cache] aws {' '.join(positional)} -> {fp}",
+                        file=sys.stderr,
+                    )
                 return json.loads(fp.read_text(encoding="utf-8"))
         print(
             f"cloudbreachgraph: warning: no cached response for 'aws {' '.join(positional)}' "
@@ -272,6 +285,86 @@ def _write_outputs(collected: dict, out_dir: Path, stem: str, args: argparse.Nam
 
 
 # --------------------------------------------------------------------------- #
+# SSO re-login (the sole error-gated non-read command) + retry-once
+# --------------------------------------------------------------------------- #
+def _config_profiles(cfg: AccountConfig) -> list[str]:
+    """Every distinct named profile in the loaded config (the profiles to re-login)."""
+    return sorted({acct.profile for acct in cfg.accounts.values() if acct.profile})
+
+
+def _sso_login_all(cfg: AccountConfig) -> None:
+    """Run ``aws sso login`` for **every** distinct profile in the config, tolerating per-profile
+    failures (e.g. a non-SSO profile errors — warn and continue). This is the tool's only non-read
+    command; it runs strictly in reaction to an expired-token error (``docs/02_architecture.md``
+    §9)."""
+    profiles = _config_profiles(cfg)
+    if not profiles:
+        print(
+            "cloudbreachgraph: warning: credentials expired but the config names no profiles to "
+            "`aws sso login` — authenticate manually and re-run.",
+            file=sys.stderr,
+        )
+        return
+    for profile in profiles:
+        try:
+            runner.sso_login(profile)
+        except runner.AwsCliError as exc:
+            print(
+                f"cloudbreachgraph: warning: `aws sso login --profile {profile}` failed "
+                f"(a non-SSO profile is expected to); continuing. ({exc})",
+                file=sys.stderr,
+            )
+
+
+def _run_live(
+    cfg: AccountConfig, args: argparse.Namespace, out_dir: Path, roles: tuple[str, ...]
+) -> int:
+    """Resolve the target and run collect → build → write for the live (non-cache) path."""
+    if args.all_accounts:
+        return _run_all_accounts(cfg, out_dir, args)
+    resolved = resolve_target(
+        cfg,
+        target=args.target,
+        account=args.account,
+        profile_override=args.profile,
+        region=args.region,
+        roles=roles,
+    )
+    collected = _collect_live(resolved, args, roles)
+    _write_outputs(collected, out_dir, "graph", args)
+    return 0
+
+
+def _run_live_with_sso_retry(
+    cfg: AccountConfig, args: argparse.Namespace, out_dir: Path, roles: tuple[str, ...]
+) -> int:
+    """Run the live pipeline; on an expired-token error, `aws sso login` for every configured
+    profile and retry the whole run **once** (``docs/02_architecture.md §9``)."""
+    try:
+        return _run_live(cfg, args, out_dir, roles)
+    except (collectors.CredentialsExpiredError, runner.AwsCliError) as exc:
+        if not collectors.is_expired_error(exc):
+            raise  # not an expiry — let main()'s handlers classify it
+        print(
+            "cloudbreachgraph: credentials expired; running `aws sso login` for every configured "
+            "profile, then retrying the run once...",
+            file=sys.stderr,
+        )
+        _sso_login_all(cfg)
+        try:
+            return _run_live(cfg, args, out_dir, roles)
+        except (collectors.CredentialsExpiredError, runner.AwsCliError) as exc2:
+            if collectors.is_expired_error(exc2):
+                print(
+                    "cloudbreachgraph: credentials are still expired after `aws sso login`. "
+                    "Authenticate and re-run.",
+                    file=sys.stderr,
+                )
+                return 1
+            raise
+
+
+# --------------------------------------------------------------------------- #
 # --all-accounts
 # --------------------------------------------------------------------------- #
 def _run_all_accounts(cfg: AccountConfig, out_dir: Path, args: argparse.Namespace) -> int:
@@ -293,6 +386,7 @@ def _run_all_accounts(cfg: AccountConfig, out_dir: Path, args: argparse.Namespac
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     out_dir = Path(args.output_dir)
+    runner.set_verbose(bool(args.verbose))
 
     if args.optimize_passes < 0:
         print("cloudbreachgraph: --optimize-passes must be >= 0", file=sys.stderr)
@@ -317,33 +411,22 @@ def main(argv: list[str] | None = None) -> int:
     try:
         roles = _active_roles(args)
 
-        # Offline: build from cached JSON, no config/credentials needed.
+        # Offline: build from cached JSON, no config/credentials needed (so no SSO path here).
         if args.from_cache:
             collected = _collect_from_cache(args.from_cache, args.region, roles)
             _write_outputs(collected, out_dir, "graph", args)
             return 0
 
         cfg = load_config(args.config)
-
-        if args.all_accounts:
-            return _run_all_accounts(cfg, out_dir, args)
-
-        resolved = resolve_target(
-            cfg,
-            target=args.target,
-            account=args.account,
-            profile_override=args.profile,
-            region=args.region,
-            roles=roles,
-        )
-        collected = _collect_live(resolved, args, roles)
-        _write_outputs(collected, out_dir, "graph", args)
-        return 0
+        return _run_live_with_sso_retry(cfg, args, out_dir, roles)
 
     except ConfigError as exc:
         print(f"cloudbreachgraph: config error: {exc}", file=sys.stderr)
         return 2
     except collectors.FlowLogDestinationError as exc:
+        print(f"cloudbreachgraph: {exc}", file=sys.stderr)
+        return 1
+    except collectors.FlowLogFetchError as exc:
         print(f"cloudbreachgraph: {exc}", file=sys.stderr)
         return 1
     except runner.AwsCliError as exc:
