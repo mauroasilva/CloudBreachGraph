@@ -1195,12 +1195,34 @@ def write_ringed_html(
 # overlapping while staying as close to their anchor as possible. Clusters are tiled into a grid
 # like the ringed layout. Positions are computed here in Python from the already-sorted
 # nodes/edges, so the page is byte-stable and needs no in-browser relaxation.
+#
+# `--optimize-passes N` (N > 0) refines this layout, mirroring the ringed layout's
+# `--optimize-passes` but exploiting the column structure to make the three guarantees *by
+# construction* rather than by iterative projection:
+#   * **Zero node overlap and zero label overlap.** The columns are spaced label-aware
+#     (`_hier_column_x_labeled`, so no two columns' label rectangles can overlap horizontally) and
+#     the rows label-aware (`_hier_row_gap`, so a node's label clears the disk below it). No two
+#     label rectangles can then overlap — so no disk can sit on a label either — and no two disks
+#     can overlap. These hold no matter how the barycenter step reorders the nodes.
+#   * **Fewer edge crossings.** `_optimize_hier_cluster` runs up to N cooled barycenter sweeps that
+#     aim each node at the mean height of its neighbours (the layered-graph crossing-reduction
+#     heuristic), pulling connected nodes to the same row so their edges stop slanting across the
+#     columns. The cooling freezes the layout so a big N converges rather than drifting.
+# Because the labels are separated in world space, the optimised page scales its label fonts with
+# the view (`SCALE_LABELS` on) so the clearance holds at every zoom; `--optimize-passes 0` (the
+# default) keeps the disk-sized columns and fixed-size labels, byte-for-byte unchanged. (Unlike the
+# ringed and overlap-free layouts it does not also guarantee zero *edge-over-node* overlap: a
+# source->ENI edge that skips the intervening columns can still pass over a node there — see the
+# change learnings.)
 # --------------------------------------------------------------------------- #
 
 # Column / row geometry (pixels). Columns step out from the center; rows stack within a column.
 _HIER_COL1 = 170.0  # x-distance from the VPC center to the first (innermost) column
 _HIER_COL_GAP = 200.0  # x-gap between one column and the next further out
 _HIER_ROW = 52.0  # min vertical center-to-center gap between two nodes in the same column
+# Clear gap (px) kept between adjacent label rectangles on the ``--optimize-passes`` refinement, so
+# the label-aware column x-spacing and row gap leave the labels provably non-overlapping.
+_HIER_LABEL_PAD = 12.0
 
 
 def _hier_column_x(layers_present: set[int]) -> dict[int, float]:
@@ -1220,6 +1242,54 @@ def _hier_column_x(layers_present: set[int]) -> dict[int, float]:
         dist = _HIER_COL1 if not xs else dist + _HIER_COL_GAP
         xs[layer] = dist
     return xs
+
+
+def _hier_eff_hw(node: dict) -> float:
+    """A node's horizontal half-extent — the wider of its label rectangle and its disk."""
+    return max(_label_dims(node)[0], _node_radius(node))
+
+
+def _hier_column_x_labeled(
+    layers_present: set[int], eff_hw: dict[int, float], vpc_hw: float
+) -> dict[int, float]:
+    """Label-aware :func:`_hier_column_x` for the ``--optimize-passes`` refinement.
+
+    Sizes the gap out to each column so an inner column's **labels** can't reach the next column's
+    nodes: the step to a column is at least the two columns' widest half-extents plus
+    :data:`_HIER_LABEL_PAD` (the first column measured from the VPC center's half-extent). Because a
+    column's magnitude is shared by both sides, this also guarantees the two innermost columns —
+    which face each other across the center — clear each other. Together with a label-aware row gap
+    (:func:`_hier_row_gap`) this makes the layout **provably free of node and label overlap** by
+    construction: no two label rectangles can overlap, so no disk can sit on a label either.
+    """
+    xs: dict[int, float] = {}
+    prev = 0.0
+    prev_hw = vpc_hw
+    for layer in sorted(layers_present):
+        hw = eff_hw.get(layer, 0.0)
+        if not xs:
+            dist = max(_HIER_COL1, vpc_hw + hw + _HIER_LABEL_PAD)
+        else:
+            dist = prev + max(_HIER_COL_GAP, prev_hw + hw + _HIER_LABEL_PAD)
+        xs[layer] = dist
+        prev = dist
+        prev_hw = hw
+    return xs
+
+
+def _hier_row_gap(members: list) -> float:
+    """Label-aware minimum vertical gap between two nodes stacked in the same column.
+
+    Sized so a node's disk **and the label hanging under it** clear the disk of the node below it:
+    the widest ``radius + label gap + label height`` above plus the widest ``radius`` below (plus
+    :data:`_HIER_LABEL_PAD`). Used on the ``--optimize-passes`` refinement so a column's nodes and
+    labels never overlap; the default path keeps the disk-sized :data:`_HIER_ROW`.
+    """
+    if not members:
+        return _HIER_ROW
+    top = max(_node_radius(m) + _LABEL_GAP + _label_dims(m)[1] for m in members)
+    bot = max(_node_radius(m) for m in members)
+    return max(_HIER_ROW, top + bot + _HIER_LABEL_PAD)
 
 
 def _partition_sides(bucket: dict[int, list], adj: dict[str, list[str]]) -> tuple[set, set]:
@@ -1305,21 +1375,23 @@ def _place_hier_cluster(
     subnet_of_eni: dict[str, str],
     enis_of_source: dict[str, list],
     adj: dict[str, list[str]],
+    col_x: dict[int, float],
+    row_gap: float,
 ) -> None:
     """Lay a single VPC cluster out about the origin as left/right hierarchical columns.
 
     The VPC center goes at (0, 0); the rest of the cluster is split into a balanced left/right
     (:func:`_partition_sides`) and, on each side, placed column by column with the ENI column as the
     y-anchor (:func:`_place_column` / :func:`_mean_target`), exactly mirroring the ringed layout's
-    ENI-anchored ring placement. Coordinates are left unrounded for the caller to translate + round.
+    ENI-anchored ring placement. ``col_x`` gives each layer's column magnitude and ``row_gap`` the
+    minimum vertical spacing (disk-sized by default, label-sized under ``--optimize-passes``).
+    Coordinates are left unrounded for the caller to translate + round.
     """
     for m in bucket[0]:  # VPC center (0..1 nodes)
         m["x"] = 0.0
         m["y"] = 0.0
 
     left, right = _partition_sides(bucket, adj)
-    layers_present = {r for r in range(1, _RING_COUNT) if bucket[r]}
-    col_x = _hier_column_x(layers_present)
 
     for sign, side in ((-1.0, left), (1.0, right)):
         side_bucket = {r: [m for m in bucket[r] if m["id"] in side] for r in range(1, _RING_COUNT)}
@@ -1328,9 +1400,9 @@ def _place_hier_cluster(
         # in y, and used as the anchor every other column on this side aligns to.
         enis = sorted(side_bucket[2], key=lambda m: (subnet_of_eni.get(m["id"], ""), m["id"]))
         count = len(enis)
-        eni_target = {m["id"]: (i - (count - 1) / 2.0) * _HIER_ROW for i, m in enumerate(enis)}
+        eni_target = {m["id"]: (i - (count - 1) / 2.0) * row_gap for i, m in enumerate(enis)}
         if 2 in col_x:
-            _place_column(enis, sign * col_x[2], eni_target, _HIER_ROW)
+            _place_column(enis, sign * col_x[2], eni_target, row_gap)
         anchor_y = {m["id"]: m["y"] for m in enis}
 
         for layer, enis_by_member in (
@@ -1341,7 +1413,67 @@ def _place_hier_cluster(
         ):
             if layer in col_x:
                 target = _mean_target(side_bucket[layer], anchor_y, enis_by_member)
-                _place_column(side_bucket[layer], sign * col_x[layer], target, _HIER_ROW)
+                _place_column(side_bucket[layer], sign * col_x[layer], target, row_gap)
+
+
+def _optimize_hier_cluster(
+    bucket: dict[int, list],
+    col_x: dict[int, float],
+    adj: dict[str, list[str]],
+    passes: int,
+    row_gap: float,
+) -> None:
+    """Reduce edge crossings within a placed hierarchical cluster by iterated barycenter sweeps.
+
+    The linear counterpart of the ringed layout's :func:`_optimize_cluster`. Each column's nodes are
+    aimed at the **mean y of their neighbours** (in the *other* columns; the VPC center has no row
+    and is skipped) and re-placed there as close as the min-gap allows (:func:`_place_column`). The
+    sweep runs column by column, outward then back inward, up to ``passes`` times so positions
+    propagate across all the columns — pulling two subnets that share a load balancer to the same
+    height, so its edges stop slanting across the column and crossing their neighbours. The two
+    sides are optimised independently (no edge ever spans them). A geometric cooling schedule
+    (:data:`_OPT_COOLING`) shrinks each pass's movement so the layout **freezes** to a stable state
+    (a large ``passes`` converges to the same result rather than drifting), and the sweep stops
+    early once a full pass moves every node less than a small epsilon.
+
+    Because every placement uses the label-aware ``row_gap`` and the columns keep their label-aware
+    ``col_x``, the layout stays **overlap-free by construction** through and after every pass — this
+    reorders nodes to cut crossings, it never introduces a node or label overlap.
+    """
+    layer_of = {m["id"]: r for r in range(_RING_COUNT) for m in bucket[r]}
+    y = {m["id"]: m["y"] for r in range(_RING_COUNT) for m in bucket[r]}
+    present = sorted(col_x)
+    sweep = present + present[-2:0:-1]  # outward then back inward, e.g. 1,2,3,4,5,4,3,2
+    side_cols = {
+        -1.0: {layer: [m for m in bucket[layer] if m["x"] < 0] for layer in present},
+        1.0: {layer: [m for m in bucket[layer] if m["x"] > 0] for layer in present},
+    }
+
+    alpha = 1.0
+    for _ in range(passes):
+        max_move = 0.0
+        for layer in sweep:
+            for sign in (-1.0, 1.0):
+                members = side_cols[sign][layer]
+                if not members:
+                    continue
+                target: dict[str, float] = {}
+                for m in members:
+                    neigh = [
+                        y[nid]
+                        for nid in adj.get(m["id"], ())
+                        if nid in y and layer_of.get(nid, 0) != 0
+                    ]
+                    cur = y[m["id"]]
+                    bary = math.fsum(neigh) / len(neigh) if neigh else cur
+                    target[m["id"]] = cur + alpha * (bary - cur)  # damped step toward barycenter
+                _place_column(members, sign * col_x[layer], target, row_gap)
+                for m in members:
+                    max_move = max(max_move, abs(m["y"] - y[m["id"]]))
+                    y[m["id"]] = m["y"]
+        alpha *= _OPT_COOLING
+        if max_move < 1e-4:  # frozen — further passes would not change anything
+            break
 
 
 def _hier_extent(members: list) -> tuple[float, float]:
@@ -1361,7 +1493,7 @@ def _hier_extent(members: list) -> tuple[float, float]:
     return hw, hh
 
 
-def _hierarchical_view_data(graph: Graph) -> dict:
+def _hierarchical_view_data(graph: Graph, passes: int = 0) -> dict:
     """Build the hierarchical page payload: nodes with fixed x/y, edges, and per-cluster metadata.
 
     Reuses :func:`_view_data`'s per-node fields and adds computed ``x``/``y``. Each VPC cluster is
@@ -1370,6 +1502,14 @@ def _hierarchical_view_data(graph: Graph) -> dict:
     resources (no VPC) collect into a final cluster with an empty center, exactly like the ringed
     layout. ``clusters`` carries each cluster's center, a single half-height "ring" (so the shared
     draw-only template floats the VPC label above the cluster), and the label.
+
+    With ``passes > 0`` each cluster is sized with **label-aware** column x-spacing
+    (:func:`_hier_column_x_labeled`) and row gap (:func:`_hier_row_gap`) — big enough that no two
+    label rectangles can overlap, so the layout is **provably free of node-node and label overlap by
+    construction** — then post-processed by :func:`_optimize_hier_cluster`: up to that many
+    barycenter sweeps reorder nodes within their columns to pull connected nodes to the same height
+    and **cut edge crossings**. ``passes == 0`` (the default) keeps the deterministic ENI-anchored
+    placement on the disk-sized columns, byte-for-byte unchanged.
     """
     base = _view_data(graph)
     by_id = {n["id"]: n for n in base["nodes"]}
@@ -1397,16 +1537,35 @@ def _hierarchical_view_data(graph: Graph) -> dict:
     # Lay each cluster out about the origin first, so its extent is known, then tile.
     extents: dict[str, tuple[float, float]] = {}
     for g in order:
+        bucket = groups[g]
+        layers_present = {r for r in range(1, _RING_COUNT) if bucket[r]}
+        if passes > 0:
+            # Label-aware column x + row gap => no two label rectangles can overlap (so no disk can
+            # sit on a label either): node-node and label overlap are eliminated by construction.
+            eff_hw = {
+                layer: max((_hier_eff_hw(m) for m in bucket[layer]), default=0.0)
+                for layer in layers_present
+            }
+            vpc_hw = max((_hier_eff_hw(m) for m in bucket[0]), default=0.0)
+            col_x = _hier_column_x_labeled(layers_present, eff_hw, vpc_hw)
+            row_gap = _hier_row_gap([m for r in range(_RING_COUNT) for m in bucket[r]])
+        else:
+            col_x = _hier_column_x(layers_present)
+            row_gap = _HIER_ROW
         _place_hier_cluster(
-            groups[g],
+            bucket,
             enis_of_subnet,
             enis_of_lb,
             enis_of_sg,
             subnet_of_eni,
             enis_of_source,
             adj,
+            col_x,
+            row_gap,
         )
-        extents[g] = _hier_extent([m for r in range(_RING_COUNT) for m in groups[g][r]])
+        if passes > 0:
+            _optimize_hier_cluster(bucket, col_x, adj, passes, row_gap)
+        extents[g] = _hier_extent([m for r in range(_RING_COUNT) for m in bucket[r]])
 
     max_hw = max((hw for hw, _ in extents.values()), default=0.0)
     max_hh = max((hh for _, hh in extents.values()), default=0.0)
@@ -1437,11 +1596,19 @@ def _hierarchical_view_data(graph: Graph) -> dict:
     return base
 
 
-def build_hierarchical_html(graph: Graph) -> str:
-    """Return the complete, self-contained hierarchical HTML document for ``graph`` as a string."""
-    data_json = json.dumps(_hierarchical_view_data(graph), ensure_ascii=False, default=str)
+def build_hierarchical_html(graph: Graph, passes: int = 0) -> str:
+    """Return the complete, self-contained hierarchical HTML document for ``graph`` as a string.
+
+    ``passes`` (default 0) is the max number of barycenter crossing-reduction sweeps; see
+    :func:`_hierarchical_view_data`. With ``passes > 0`` the columns are sized for the nodes' whole
+    labels so the layout is overlap-free, and the page scales its label fonts with the view
+    (``SCALE_LABELS``) so that clearance holds at every zoom.
+    """
+    data_json = json.dumps(_hierarchical_view_data(graph, passes), ensure_ascii=False, default=str)
     return (
-        _render_static_layout(data_json, "hierarchical", _HIERARCHICAL_HINT, scale_labels=False)
+        _render_static_layout(
+            data_json, "hierarchical", _HIERARCHICAL_HINT, scale_labels=passes > 0
+        )
         .replace("__NODE_COUNT__", str(len(graph.nodes)))
         .replace("__EDGE_COUNT__", str(len(graph.edges)))
     )
@@ -1453,13 +1620,16 @@ def write_hierarchical_html(
     *,
     max_nodes: int | None = None,
     max_bytes: int | None = None,
+    passes: int = 0,
 ) -> Path | None:
     """Write ``graph`` to ``path`` as the self-contained **hierarchical** HTML page.
 
     Same contract and size guard as :func:`write_html` (VPC-centered left/right columns instead of
     a force layout): returns the :class:`~pathlib.Path` written, or ``None`` when the graph is too
     large (more than ``max_nodes`` nodes, or a rendered page over ``max_bytes`` bytes), in which
-    case **no file is written** so the caller can fall back to the ``.dot`` output.
+    case **no file is written** so the caller can fall back to the ``.dot`` output. ``passes``
+    (default 0) is the max number of barycenter crossing-reduction sweeps; see
+    :func:`_hierarchical_view_data`.
     """
     node_cap = MAX_NODES if max_nodes is None else max_nodes
     byte_cap = MAX_HTML_BYTES if max_bytes is None else max_bytes
@@ -1467,7 +1637,7 @@ def write_hierarchical_html(
     if len(graph.nodes) > node_cap:
         return None
 
-    html = build_hierarchical_html(graph)
+    html = build_hierarchical_html(graph, passes)
     if len(html.encode("utf-8")) > byte_cap:
         return None
 
@@ -2302,12 +2472,15 @@ HIERARCHICAL_HELP = (
     "--ringed)"
 )
 OPTIMIZE_PASSES_HELP = (
-    "run up to N graph-optimisation passes (stops early once it converges). Without --ringed this "
-    "renders the deterministic overlap-free layout (no overlapping nodes, no edge drawn across a "
-    "node, no label overlapping another label or node, fewer edge crossings, independent clusters "
-    "kept apart); with --ringed it reorders nodes within their rings to reduce crossings and sizes "
-    "the rings so labels don't overlap either, keeping the concentric-ring shape. 0 (default) "
-    "keeps the base layout (force-directed, or plain ringed)."
+    "run up to N graph-optimisation passes (stops early once it converges). Without --ringed or "
+    "--hierarchical this renders the deterministic overlap-free layout (no overlapping nodes, no "
+    "edge drawn across a node, no label overlapping another label or node, fewer edge crossings, "
+    "independent clusters kept apart); with --ringed it reorders nodes within their rings to "
+    "reduce crossings and sizes the rings so labels don't overlap either, keeping the "
+    "concentric-ring shape; with --hierarchical it reorders nodes within their columns to reduce "
+    "crossings and sizes the columns/rows so nodes and labels don't overlap either, keeping the "
+    "left/right-column shape. 0 (default) keeps the base layout (force-directed, or plain "
+    "ringed/hierarchical)."
 )
 
 
@@ -2322,14 +2495,14 @@ def write_layout_html(
     """Write the ``--html`` layout selected by the CLI flags, returning the path or ``None``.
 
     Selection shared by both CLIs, in precedence order: ``--hierarchical`` → the hierarchical
-    left/right-column layout; else ``--ringed`` → the ringed layout (``optimize_passes`` is its
-    in-ring crossing-reduction budget); else ``optimize_passes > 0`` → the overlap-free layout;
-    else the in-browser force layout. Returns ``None`` (writing nothing) when the graph is too large
-    for a browser layout, exactly like the underlying writers, so the caller falls back to the
-    ``.dot``.
+    left/right-column layout (``optimize_passes`` is its barycenter crossing-reduction budget); else
+    ``--ringed`` → the ringed layout (``optimize_passes`` is its in-ring crossing-reduction budget);
+    else ``optimize_passes > 0`` → the overlap-free layout; else the in-browser force layout.
+    Returns ``None`` (writing nothing) when the graph is too large for a browser layout, exactly
+    like the underlying writers, so the caller falls back to the ``.dot``.
     """
     if hierarchical:
-        return write_hierarchical_html(graph, path)
+        return write_hierarchical_html(graph, path, passes=optimize_passes)
     if ringed:
         return write_ringed_html(graph, path, passes=optimize_passes)
     if optimize_passes > 0:

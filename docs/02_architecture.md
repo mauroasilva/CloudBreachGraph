@@ -495,9 +495,18 @@ Requirements:
   largest-first assignment. It reuses `_eni_anchor_maps` (the ENI-alignment maps, factored out of
   the ringed layout and shared by both) and `_vpc_group_of`; clusters are tiled into a grid whose
   cells reserve room for the columns and labels (`_hier_extent`), with a single half-height "ring"
-  in each cluster's metadata so the template floats the VPC label above it. Fixed-size labels
-  (`SCALE_LABELS` off) like the default ringed layout; output deterministic. `--hierarchical` takes
-  precedence over `--ringed` in `write_layout_html`. Without
+  in each cluster's metadata so the template floats the VPC label above it. Its `--optimize-passes N`
+  (N > 0) refinement mirrors the ringed reduction but exploits the column structure to make the
+  guarantees *by construction*: the columns are spaced label-aware (`_hier_column_x_labeled`) and the
+  rows label-aware (`_hier_row_gap`) so no two label rectangles can overlap — hence **zero node-node
+  and zero label overlap** — and `_optimize_hier_cluster` runs up to N cooled barycenter sweeps (the
+  layered-graph crossing-reduction heuristic; each node aimed at the mean y of its neighbours,
+  re-placed via `_place_column`, the two sides optimised independently) to **cut edge crossings**,
+  frozen by the same `_OPT_COOLING` schedule so a big N converges. When N > 0 the labels are
+  separated in world space so `SCALE_LABELS` is set on; N = 0 (default) keeps the disk-sized columns
+  and fixed-size labels, byte-for-byte unchanged. Unlike the ringed/overlap-free layouts it does not
+  guarantee zero *edge-over-node* overlap (a column-skipping edge can pass over a node). Output
+  deterministic. `--hierarchical` takes precedence over `--ringed` in `write_layout_html`. Without
   `--ringed`, the same
   `--optimize-passes N` flag instead selects a third, **overlap-free** layout
   (`html_export.write_optimized_html`/
