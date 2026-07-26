@@ -87,6 +87,11 @@ though their verbs aren't the usual `describe`/`list`/`get`/`head` (the read-onl
 *not mutating*, §9). Value-carrying flags are passed in `--flag=value` form so the cache-key /
 `--from-cache` file naming (which keys on the positional sub-command) stays stable.
 
+The **only** non-read command the tool can issue is `aws sso login --profile <p>`, run **strictly in
+reaction to an expired-token error** to refresh local credentials before retrying the run once
+(§5.7, §9). It never mutates AWS resources and runs via a dedicated *interactive* runner entry
+(`runner.sso_login`, stdio inherited, not captured).
+
 Notes for the collection layer (Phase 1):
 
 - Add `--no-cli-pager` to avoid the interactive pager blocking a subprocess.
@@ -352,6 +357,47 @@ HTML layout it sits on the **outermost IP-source ring** alongside `internet`/`ci
 into the VPC of the ENI it exchanges flows with (traced via its `connects_to` edge). It has a
 distinct fill colour from the other IP-source nodes in every HTML/DOT view.
 
+**Resilient fetch (best-effort, both sources).** An account can hold thousands of flow-log
+objects/groups, so a single failed AWS call must not abort the whole run. **Both** record readers
+(`_read_s3_records` per S3 object, `_read_cloudwatch_records` per CloudWatch group) route every
+failed **unit** through one shared classifier + retry wrapper in `aws/collectors.py`
+(`_classify_aws_error` → `_ErrorTier`, `_run_unit`):
+
+- **`RequestTimeTooSkewed` — clock vs network.** Fetch a **trusted external time** (stdlib only: an
+  HTTPS `Date` header via `urllib`, falling back to an SNTP/NTP UDP query; `_trusted_time_offset`,
+  ~5s timeout) and compare to the local UTC clock. If the offset exceeds the SigV4 tolerance
+  (`_CLOCK_SKEW_TOLERANCE_S` = 900s) it's a **genuine clock problem** → abort with an actionable
+  "sync your clock (macOS: System Settings → General → Date & Time)" message, no retry. Within
+  tolerance, **or if the trusted time can't be fetched**, it's a likely **network stall** → retry.
+- **Exponential backoff** (`_RETRY_BACKOFF`) for the skew-network case and for other **transient**
+  errors (`RequestTimeout`/`SlowDown`/`Throttling`/5xx/`ServiceUnavailable`/connection resets): up
+  to **3 retries, 30s → 60s → 120s**, each re-invoking a fresh `aws` subprocess so it re-signs with a
+  current timestamp. Exhausted → warn + skip the unit.
+- **`ExpiredToken`/`InvalidToken`/`TokenRefreshRequired`** → raise `CredentialsExpiredError`, which
+  propagates to `cli.main`; the CLI (which holds the config) runs **`aws sso login --profile <p>`
+  for every distinct profile** in the loaded `AccountConfig` (tolerating a non-SSO profile's error)
+  and **retries the whole run once**. Still expired → exit non-zero with an "authenticate and re-run"
+  message. `cli.is_expired_error` also converts an expired-token `AwsCliError` raised **anywhere**
+  (e.g. a network collector) into the same re-login flow.
+- **Systemic** (`AccessDenied`/`Forbidden`/`AuthorizationHeaderMalformed`, `SignatureDoesNotMatch`,
+  a real clock skew) → raise `FlowLogFetchError` with a **source-aware** message (S3: needs
+  `s3:ListBucket` + `s3:GetObject` on the bucket; CloudWatch: `logs:FilterLogEvents` on the group)
+  and exit non-zero.
+- **Skippable** (S3 `NoSuchKey`, CloudWatch `ResourceNotFoundException`, corrupt gzip, anything
+  unclassified) → warn (naming the object/group) and skip.
+- **Failure-rate safeguard** (`_FailureTracker`, both sources) tracks attempted vs failed units and
+  aborts (`FlowLogFetchError`) if the first `_FAILURE_STREAK_ABORT` in a row fail or > 50% of a
+  large-enough sample fail — so the tool never returns a silent near-empty graph. Skipped counts are
+  reported in the stderr diagnostic.
+
+Because skipping unreachable units makes the output depend on reachability, best-effort fetch is a
+documented determinism caveat (consistent with §9's partial-graph stance). All timing
+(`time.sleep`, the backoff, the trusted-time fetch) is mockable so the tests are fast and offline;
+retries/backoff/re-login and all logging are **off** the graph path, so JSON/DOT/HTML stay
+deterministic. `--verbose` (`runner.set_verbose`, mirroring the `configure_cache` pattern) echoes
+every `aws` command actually run — including every `get-object`, each retry, and the `aws sso login`
+calls — to **stderr** with a short OK/NOT OK, keeping stdout and the graph files clean.
+
 **Scope & simplifications.** Both the **CloudWatch-Logs** and **S3** record paths are analysed
 (destination type dispatched, above); a `kinesis-data-firehose` destination isn't implemented and
 raises. All flow-log commands run against the account bound to the `flow_logs` role (§11) — which
@@ -580,12 +626,25 @@ Requirements:
 
 ## 9. Error handling & safety
 
-- Read-only: the app must never call a mutating AWS API. Collectors only run `describe-*` and
-  the read-only `sts get-caller-identity`.
-- Fail loudly on auth/permission errors with the AWS CLI's stderr shown to the user.
-- Partial data: if one collector fails but others succeed, prefer building a partial graph
-  and clearly flagging what's missing over aborting — but make that behavior explicit and
-  documented in learnings.
+- Read-only: the app must never call a mutating AWS API. Collectors only run `describe-*`/`list-*`/
+  `get-*`/`lookup-*`/`filter-*` retrievals and the read-only `sts get-caller-identity`.
+  - **The one exception is `aws sso login`** — the *only* non-read command the tool ever issues. It
+    runs **strictly in reaction to an expired-token error** (`ExpiredToken`/`InvalidToken`/…), never
+    speculatively, for every profile in the loaded config, and then the run is retried once (§5.7).
+    It **refreshes local credentials only** — it does not mutate any AWS resource — so the read-only
+    guarantee ("never mutate") holds. It runs via a dedicated *interactive* runner entry
+    (`runner.sso_login`) that inherits the terminal's stdio (it may print a device code / open a
+    browser) rather than capturing it, unlike every other `aws` call.
+- Fail loudly on auth/permission errors with the AWS CLI's stderr shown to the user. For flow-log
+  fetch these are the **systemic** tier (`AccessDenied`/`SignatureDoesNotMatch`/genuine clock skew):
+  abort with a source-aware, actionable message and a non-zero exit (§5.7).
+- Partial data: if one collector — or one flow-log **unit** (an S3 object, a CloudWatch group) —
+  fails but others succeed, prefer building a partial graph and clearly flagging what's missing
+  (a stderr warning naming the object/group, plus skipped counts in the flow-log diagnostic) over
+  aborting. This best-effort fetch is mandatory for **both** flow-log record readers and is bounded
+  by a **failure-rate safeguard** that aborts rather than emit a silent near-empty graph (§5.7).
+  Because skipping unreachable units makes output depend on reachability, this is a documented
+  determinism caveat — the retries/backoff/re-login/logging themselves never affect the JSON/DOT/HTML.
 
 ## 10. Account → profile mapping (how to target an account)
 

@@ -152,6 +152,9 @@ cloudbreachgraph --from-cache tests/fixtures --output-dir out/
 --security-groups /        show security groups as nodes between ENIs and their
   --no-security-groups       sources (default: on); --no-security-groups connects the
                              source IPs directly to the ENIs with routability
+--verbose / -v             echo every aws command actually run (incl. every get-object,
+                             retries, and any aws sso login) to stderr with a short
+                             OK/NOT OK result; stdout and the graph files stay clean
 --output-dir DIR           where to write outputs (default: .)
 --render {png,svg}         also rasterize the .dot with Graphviz (needs `dot`)
 --html                     also write an interactive, self-contained HTML view
@@ -322,6 +325,40 @@ the same account as `network`, so in the common single-account case `--flow-logs
 `docs/02_architecture.md §5.7`). Reading S3 records needs `s3:ListBucket` + `s3:GetObject` on the
 destination bucket, in addition to `ec2:DescribeFlowLogs`, `cloudtrail:LookupEvents` and
 `logs:FilterLogEvents`.
+
+### Resilient fetch (best-effort, with smart recovery)
+
+Because an account can hold **thousands** of flow-log objects/groups, a single failed AWS call must
+not abort the whole run. Both record readers (S3 per object, CloudWatch per log group) route every
+failed **unit** through one shared policy (`docs/02_architecture.md §5.7`, §9):
+
+- **Corrupt / missing / absent unit** (S3 `NoSuchKey` or a bad gzip; CloudWatch
+  `ResourceNotFoundException`) → **warned on stderr and skipped**; the run finishes and builds the
+  graph from the rest.
+- **Clock-skew (`RequestTimeTooSkewed`)** → the tool asks a **trusted external clock** (an HTTPS
+  `Date` header, falling back to an SNTP/NTP query — both stdlib) whether your clock is really off.
+  Beyond ~15 min it's a **genuine clock problem**: it aborts with an actionable "sync your clock"
+  message (no retry). Within tolerance, or if the trusted time can't be fetched, it's treated as a
+  **network stall** and **retried with exponential backoff** (up to 3 retries: 30s → 60s → 120s,
+  each re-signing a fresh request); still failing → skip that unit.
+- **Other transient errors** (`RequestTimeout`, `SlowDown`, `Throttling`, 5xx / `ServiceUnavailable`,
+  connection resets) → the same **3× exponential backoff**, then skip on exhaustion.
+- **Expired credentials** (`ExpiredToken` / `InvalidToken` / …) → the tool runs **`aws sso login`
+  for every profile in your config** (the *only* non-read command it ever issues, gated strictly on
+  an expired-token error; it refreshes local credentials, never touches AWS resources) and then
+  **retries the whole run once**. A non-SSO profile whose login errors is tolerated (warned).
+- **Systemic errors** (`AccessDenied`, `SignatureDoesNotMatch`, a real clock skew) → **abort** with
+  a clear, source-aware message (e.g. "the profile needs `s3:ListBucket` + `s3:GetObject` on bucket
+  X" / "`logs:FilterLogEvents` on group Y") and a non-zero exit.
+- **Failure-rate safeguard** — if too many units fail (the first several in a row, or a majority
+  overall), the run **aborts** rather than silently produce a near-empty graph. Skip counts are
+  reported in the flow-log stderr diagnostic.
+
+Skipping unreachable units makes the output depend on reachability — inherent to best-effort, and
+consistent with the tool's "partial graph over aborting" stance (`docs/02_architecture.md §9`). All
+retry/backoff, re-login and stderr logging happen **off** the graph path, so JSON/DOT/HTML output
+stays byte-for-byte deterministic. Add **`--verbose`** to watch every command, retry and login as it
+happens.
 
 ## Converting an existing graph to HTML
 

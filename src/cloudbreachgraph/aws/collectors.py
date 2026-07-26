@@ -14,14 +14,21 @@ collectors — no change to the driver loop, the config grammar, or the CLI.
 
 from __future__ import annotations
 
+import email.utils
 import gzip
 import json as _json
 import os
+import socket
+import struct
 import sys
 import tempfile
 import time
+import urllib.request
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import Enum
+from typing import Any
 
 from . import runner
 
@@ -537,6 +544,299 @@ class FlowLogDestinationError(RuntimeError):
         )
 
 
+# --------------------------------------------------------------------------- #
+# Resilient flow-log fetch (§5.7, §9) — a shared classifier + retry wrapper + trusted-time
+# clock check + failure-rate safeguard, applied MANDATORILY to BOTH record readers so a single
+# failed AWS call (a corrupt S3 object, a missing CloudWatch group, a transient network stall)
+# degrades to a best-effort partial graph instead of aborting the whole run.
+# --------------------------------------------------------------------------- #
+
+# Retry backoff for transient failures (tier 1's network case + tier 3): up to 3 retries after the
+# initial attempt, sleeping this many seconds before each. Kept as data so tests assert the order.
+_RETRY_BACKOFF: tuple[int, ...] = (30, 60, 120)
+
+# SigV4 rejects a request whose timestamp is more than ~15 min from AWS's clock
+# (``RequestTimeTooSkewed``). Beyond this offset from a *trusted* external clock we call it a real
+# local-clock problem and abort; within it (or if the trusted time can't be fetched) we treat the
+# skew error as a transient network stall and retry.
+_CLOCK_SKEW_TOLERANCE_S: float = 900.0
+_TRUSTED_TIME_TIMEOUT_S: float = 5.0
+_TRUSTED_TIME_URL = "https://www.google.com/"
+_NTP_HOST = "pool.ntp.org"
+_NTP_PORT = 123
+_NTP_UNIX_EPOCH_DELTA = 2208988800  # seconds between the NTP (1900) and Unix (1970) epochs
+
+# Failure-rate safeguard thresholds (both sources): abort rather than return a silent near-empty
+# graph. Trips on the first N units failing in a row, or on > threshold of a large-enough sample.
+_FAILURE_STREAK_ABORT = 5
+_FAILURE_MIN_SAMPLE = 4
+_FAILURE_RATE_THRESHOLD = 0.5
+
+
+class CredentialsExpiredError(RuntimeError):
+    """Credentials / session token expired mid-fetch (``ExpiredToken``/``InvalidToken``/…).
+
+    Propagates to :func:`cloudbreachgraph.cli.main`, which re-runs ``aws sso login`` for **every**
+    configured profile and retries the whole run once (``docs/02_architecture.md §9``). Raising a
+    dedicated type (rather than a bare :class:`~cloudbreachgraph.aws.runner.AwsCliError`) keeps the
+    error-gated ``aws sso login`` reaction strictly tied to an expired-token cause."""
+
+
+class FlowLogFetchError(RuntimeError):
+    """A flow-log fetch aborts the run: a **systemic** AWS error (auth / clock skew / bad signature)
+    or **too many** per-unit failures (the failure-rate safeguard). Caught in
+    :func:`cloudbreachgraph.cli.main` → non-zero exit. Distinct from
+    :class:`FlowLogDestinationError` (an unsupported destination *type*): this is a fetch that
+    *should* have worked failing in a way that makes a partial graph misleading, not incomplete."""
+
+
+class _SkippableUnitError(RuntimeError):
+    """A single unit is unreadable in a way that is safe to skip (corrupt gzip, decode error).
+
+    Raised by the per-object reader so :func:`_run_unit` warns + skips it and counts it toward the
+    failure-rate safeguard — the same best-effort path as a skippable AWS error (tier 5)."""
+
+
+class _ErrorTier(Enum):
+    """How a failed AWS unit is routed (``docs/02_architecture.md §5.7`` design guidance A)."""
+
+    CLOCK_SKEW = "clock_skew"  # RequestTimeTooSkewed — decide clock-vs-network, maybe retry
+    EXPIRED = "expired"  # ExpiredToken/InvalidToken/… — re-login + retry the run once
+    TRANSIENT = "transient"  # timeout/throttle/5xx/reset — retry with backoff, then skip
+    SYSTEMIC = "systemic"  # AccessDenied/SignatureDoesNotMatch/… — abort with an actionable message
+    SKIPPABLE = "skippable"  # NoSuchKey/ResourceNotFoundException/unclassified — warn + skip
+
+
+_EXPIRED_TOKENS = ("ExpiredToken", "ExpiredTokenException", "InvalidToken", "TokenRefreshRequired")
+_SYSTEMIC_TOKENS = (
+    "AccessDenied",
+    "Forbidden",
+    "AuthorizationHeaderMalformed",
+    "SignatureDoesNotMatch",
+)
+_TRANSIENT_TOKENS = (
+    "RequestTimeout",
+    "SlowDown",
+    "Throttling",  # also matches ThrottlingException
+    "InternalError",
+    "InternalFailure",
+    "ServiceUnavailable",
+    "Connection reset",
+    "connection reset",
+    "Could not connect",
+    "ConnectionError",
+    "EndpointConnectionError",
+    "Read timeout",
+    "timed out",
+)
+
+
+def _classify_aws_error(stderr: str | None) -> _ErrorTier:
+    """Route one AwsCliError stderr into an :class:`_ErrorTier`.
+
+    Order matters: skew and expiry are decided before the systemic/transient buckets so an
+    ``ExpiredToken`` never falls through to "unclassified → skip"."""
+    s = stderr or ""
+    if "RequestTimeTooSkewed" in s:
+        return _ErrorTier.CLOCK_SKEW
+    if any(tok in s for tok in _EXPIRED_TOKENS):
+        return _ErrorTier.EXPIRED
+    if any(tok in s for tok in _SYSTEMIC_TOKENS):
+        return _ErrorTier.SYSTEMIC
+    if any(tok in s for tok in _TRANSIENT_TOKENS):
+        return _ErrorTier.TRANSIENT
+    return _ErrorTier.SKIPPABLE
+
+
+def is_expired_error(exc: BaseException) -> bool:
+    """Whether ``exc`` means "credentials expired" — either the dedicated
+    :class:`CredentialsExpiredError` or an :class:`~cloudbreachgraph.aws.runner.AwsCliError` whose
+    stderr classifies as :attr:`_ErrorTier.EXPIRED`. Used by ``cli.main`` to gate the SSO re-login
+    for expired tokens raised **anywhere** in the run, not only from the flow-log readers."""
+    if isinstance(exc, CredentialsExpiredError):
+        return True
+    if isinstance(exc, runner.AwsCliError):
+        return _classify_aws_error(exc.stderr) is _ErrorTier.EXPIRED
+    return False
+
+
+# --- Trusted external time (stdlib only), for the clock-vs-network decision -------------------- #
+def _http_date_epoch() -> float | None:
+    """Trusted epoch seconds from an HTTPS ``Date`` response header, or ``None`` on any failure."""
+    req = urllib.request.Request(_TRUSTED_TIME_URL, method="HEAD")
+    with urllib.request.urlopen(req, timeout=_TRUSTED_TIME_TIMEOUT_S) as resp:  # noqa: S310 (https)
+        date_hdr = resp.headers.get("Date")
+    if not date_hdr:
+        return None
+    return email.utils.parsedate_to_datetime(date_hdr).timestamp()
+
+
+def _sntp_epoch() -> float | None:
+    """Trusted epoch seconds from a minimal SNTP (NTP) UDP query, or ``None`` on any failure."""
+    packet = b"\x1b" + 47 * b"\x00"  # LI=0, VN=3, Mode=3 (client); rest zero
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.settimeout(_TRUSTED_TIME_TIMEOUT_S)
+        sock.sendto(packet, (_NTP_HOST, _NTP_PORT))
+        data, _ = sock.recvfrom(48)
+    finally:
+        sock.close()
+    if len(data) < 44:
+        return None
+    seconds = struct.unpack("!I", data[40:44])[0]
+    return float(seconds - _NTP_UNIX_EPOCH_DELTA)
+
+
+def _trusted_time_offset() -> float | None:
+    """Offset in seconds between a **trusted external clock** and the local UTC clock, or ``None``.
+
+    Positive ⇒ the local clock is *behind* true time; negative ⇒ *ahead*. Tries an HTTPS ``Date``
+    header first, then an SNTP query; returns ``None`` if neither can be reached (so the caller
+    treats an unverifiable skew as transient, not a clock problem). Uses ``time.time()`` for the
+    local reference — mockable, like ``time.sleep``, so tests stay offline and fast."""
+    for fetch in (_http_date_epoch, _sntp_epoch):
+        try:
+            remote = fetch()
+        except Exception:  # noqa: BLE001 — any network/parse failure ⇒ "can't fetch trusted time"
+            remote = None
+        if remote is not None:
+            return remote - time.time()
+    return None
+
+
+def _clock_skew_message(offset: float) -> str:
+    direction = "ahead of" if offset < 0 else "behind"
+    return (
+        f"aborting flow-log fetch: the system clock is ~{abs(offset) / 60:.1f} min {direction} the "
+        f"true time (AWS rejected the request as RequestTimeTooSkewed and a trusted external time "
+        f"source confirms the skew). Sync your clock and re-run (macOS: System Settings → "
+        f"General → Date & Time, 'Set time automatically')."
+    )
+
+
+# --- Per-unit outcome, the retry wrapper, and the failure-rate tracker ------------------------- #
+@dataclass
+class _FetchOutcome:
+    """The result of running one unit through :func:`_run_unit`."""
+
+    value: Any  # the fetch's return on success, else None
+    ok: bool  # succeeded (possibly after retries)?
+    error: str = ""  # short cause when skipped, for the diagnostic's "last error"
+
+
+def _short_cause(exc: BaseException) -> str:
+    """A one-line cause for a warning/diagnostic, from an AwsCliError stderr or an exception str."""
+    if isinstance(exc, runner.AwsCliError):
+        line = (exc.stderr or "").strip().splitlines()
+        return line[0] if line else f"exit {exc.returncode}"
+    text = str(exc).strip().splitlines()
+    return text[0] if text else exc.__class__.__name__
+
+
+def _run_unit(fetch: Callable[[], Any], *, source: str, unit: str, iam_hint: str) -> _FetchOutcome:
+    """Run one unit fetch (an S3 object, or a CloudWatch group) under the shared resilience rules.
+
+    ``fetch`` performs the AWS call(s) and returns the unit's value; it is re-invoked from scratch
+    on each retry so a retried request re-signs with a current timestamp. ``source`` is
+    ``"s3"``/``"cloud-watch-logs"`` and ``iam_hint`` names the IAM a systemic auth failure would
+    need — both only for messages. Returns a :class:`_FetchOutcome`; raises
+    :class:`CredentialsExpiredError` (tier 2) or :class:`FlowLogFetchError` (tier 1 real-clock /
+    tier 4 systemic) to abort/propagate."""
+    attempt = 0
+    while True:
+        try:
+            return _FetchOutcome(fetch(), True)
+        except _SkippableUnitError as exc:
+            _warn_skip(source, unit, _short_cause(exc))
+            return _FetchOutcome(None, False, _short_cause(exc))
+        except runner.AwsCliError as exc:
+            tier = _classify_aws_error(exc.stderr)
+            if tier is _ErrorTier.EXPIRED:
+                raise CredentialsExpiredError(
+                    f"credentials expired while fetching {source} unit {unit}: {_short_cause(exc)}"
+                ) from exc
+            if tier is _ErrorTier.SYSTEMIC:
+                raise FlowLogFetchError(_systemic_message(source, unit, iam_hint, exc)) from exc
+            if tier is _ErrorTier.CLOCK_SKEW:
+                offset = _trusted_time_offset()
+                if offset is not None and abs(offset) > _CLOCK_SKEW_TOLERANCE_S:
+                    raise FlowLogFetchError(_clock_skew_message(offset)) from exc
+                # within tolerance, or trusted time unfetchable ⇒ treat as transient ⇒ back off.
+            elif tier is _ErrorTier.SKIPPABLE:
+                _warn_skip(source, unit, _short_cause(exc))
+                return _FetchOutcome(None, False, _short_cause(exc))
+
+            # TRANSIENT, or a CLOCK_SKEW judged to be a network stall: retry with backoff.
+            if attempt >= len(_RETRY_BACKOFF):
+                _warn_skip(source, unit, _short_cause(exc), exhausted=True)
+                return _FetchOutcome(None, False, _short_cause(exc))
+            delay = _RETRY_BACKOFF[attempt]
+            if runner.is_verbose():
+                print(
+                    f"cloudbreachgraph: {source} unit {unit}: transient error "
+                    f"({_short_cause(exc)}); retry {attempt + 1}/{len(_RETRY_BACKOFF)} in {delay}s",
+                    file=sys.stderr,
+                )
+            time.sleep(delay)
+            attempt += 1
+
+
+def _systemic_message(source: str, unit: str, iam_hint: str, exc: runner.AwsCliError) -> str:
+    stderr = exc.stderr or ""
+    if "SignatureDoesNotMatch" in stderr:
+        detail = (
+            "SignatureDoesNotMatch — the request signature did not validate, usually a corrupted "
+            "secret key or a badly-skewed clock. Check the profile's credentials and system clock."
+        )
+    else:
+        detail = f"access denied — the profile needs {iam_hint}."
+    return f"aborting flow-log fetch: {source} unit {unit}: {detail}\n{exc}"
+
+
+def _warn_skip(source: str, unit: str, cause: str, *, exhausted: bool = False) -> None:
+    """Warn (stderr) that one best-effort unit was skipped, naming the object/group and cause."""
+    why = "retries exhausted" if exhausted else "skipped"
+    print(
+        f"cloudbreachgraph: warning: flow-log {source} unit {unit} {why}: {cause}",
+        file=sys.stderr,
+    )
+
+
+@dataclass
+class _FailureTracker:
+    """Track attempted vs failed units for one source; abort (raise) if too many fail (§5.7 A.6)."""
+
+    source: str
+    attempted: int = 0
+    failed: int = 0
+    streak: int = 0
+    last_error: str = ""
+
+    def record(self, outcome: _FetchOutcome) -> None:
+        self.attempted += 1
+        if outcome.ok:
+            self.streak = 0
+        else:
+            self.failed += 1
+            self.streak += 1
+            if outcome.error:
+                self.last_error = outcome.error
+            self._check()
+
+    def _check(self) -> None:
+        streak_trip = self.streak >= _FAILURE_STREAK_ABORT
+        rate_trip = (
+            self.attempted >= _FAILURE_MIN_SAMPLE
+            and self.failed / self.attempted > _FAILURE_RATE_THRESHOLD
+        )
+        if streak_trip or rate_trip:
+            raise FlowLogFetchError(
+                f"aborting flow-log fetch: too many {self.source} fetches failed "
+                f"({self.failed}/{self.attempted}); last error: {self.last_error or 'unknown'}. "
+                f"Refusing to build a graph from a near-empty flow-log set."
+            )
+
+
 def collect_flow_log_records(profile: str | None, region: str | None) -> list[dict]:
     """Fetch and parse the flow-log *records* for the account's flow logs, per destination type.
 
@@ -566,20 +866,25 @@ def collect_flow_log_records(profile: str | None, region: str | None) -> list[di
     since_epoch = time.time() - FLOW_LOG_MAX_LOOKBACK_DAYS * 86400
     records: list[dict] = []
     fetched_by_type: dict[str, int] = {}
+    skipped_by_type: dict[str, int] = {}
     for dest, fls in by_type.items():
-        recs, fetched = FLOW_LOG_READERS[dest](fls, profile, region, since_epoch)
+        recs, fetched, skipped = FLOW_LOG_READERS[dest](fls, profile, region, since_epoch)
         records.extend(recs)
         fetched_by_type[dest] = fetched
+        skipped_by_type[dest] = skipped
 
-    _report_flow_log_records(flow_logs, dest_counts, fetched_by_type, len(records))
+    _report_flow_log_records(flow_logs, dest_counts, fetched_by_type, skipped_by_type, len(records))
     return records
 
 
 def _read_cloudwatch_records(
     flow_logs: list[dict], profile: str | None, region: str | None, since_epoch: float
-) -> tuple[list[dict], int]:
+) -> tuple[list[dict], int, int]:
     """Read records from each CloudWatch log group (``logs filter-log-events``). Returns
-    ``(records, events_fetched)``. Each group's fields come from its own ``LogFormat``."""
+    ``(records, events_fetched, groups_skipped)``. Each group's fields come from its own
+    ``LogFormat``. Each group is one **unit** run through :func:`_run_unit`, so a missing group
+    (``ResourceNotFoundException``) or a transient stall on one group is warned + skipped (with
+    backoff/retry) while the others are read — a systemic error (``AccessDenied``) still aborts."""
     group_fields: dict[str, dict[str, int]] = {}
     for fl in flow_logs:
         group = fl.get("LogGroupName")
@@ -591,19 +896,33 @@ def _read_cloudwatch_records(
     start_ms = int(since_epoch * 1000)
     records: list[dict] = []
     fetched = 0
+    tracker = _FailureTracker("cloud-watch-logs")
     for group in sorted(group_fields):
-        data = runner.run_aws(
-            ["logs", "filter-log-events", f"--log-group-name={group}", f"--start-time={start_ms}"],
-            profile=profile,
-            region=region,
+
+        def _fetch(g: str = group) -> list[dict]:
+            data = runner.run_aws(
+                ["logs", "filter-log-events", f"--log-group-name={g}", f"--start-time={start_ms}"],
+                profile=profile,
+                region=region,
+            )
+            return data.get("events", [])
+
+        outcome = _run_unit(
+            _fetch,
+            source="cloud-watch-logs",
+            unit=group,
+            iam_hint=f"logs:FilterLogEvents on log group '{group}'",
         )
-        events = data.get("events", [])
+        tracker.record(outcome)
+        if not outcome.ok:
+            continue
+        events = outcome.value
         fetched += len(events)
         for event in events:
             rec = _parse_flow_log_message(event.get("message", ""), group, group_fields[group])
             if rec is not None:
                 records.append(rec)
-    return records, fetched
+    return records, fetched, tracker.failed
 
 
 def _parse_s3_arn(arn: str | None) -> tuple[str, str] | None:
@@ -619,10 +938,13 @@ def _parse_s3_arn(arn: str | None) -> tuple[str, str] | None:
 
 def _read_s3_records(
     flow_logs: list[dict], profile: str | None, region: str | None, since_epoch: float
-) -> tuple[list[dict], int]:
+) -> tuple[list[dict], int, int]:
     """Read records from each S3 destination: list the gzipped objects modified within the window
     (``s3api list-objects-v2``), download and parse each (``s3api get-object`` + gunzip). Returns
-    ``(records, objects_read)``. Distinct ``(bucket, prefix)`` sources are read once."""
+    ``(records, objects_read, objects_skipped)``. Distinct ``(bucket, prefix)`` sources are read
+    once. The per-source *list* and each per-object *get* are units run through :func:`_run_unit`,
+    so a corrupt/missing object (``NoSuchKey``/bad gzip) or a transient stall is warned + skipped
+    (with backoff) while the rest are read — a systemic error (``AccessDenied``) still aborts."""
     sources: dict[tuple[str, str], None] = {}
     for fl in flow_logs:
         bp = _parse_s3_arn(fl.get("LogDestination"))
@@ -631,11 +953,29 @@ def _read_s3_records(
 
     records: list[dict] = []
     objects_read = 0
+    tracker = _FailureTracker("s3")
     for bucket, prefix in sorted(sources):
-        for key in _list_s3_flow_log_keys(bucket, prefix, since_epoch, profile, region):
-            objects_read += 1
-            records.extend(_read_s3_object_records(bucket, key, profile, region))
-    return records, objects_read
+        iam = f"s3:ListBucket and s3:GetObject on bucket '{bucket}'"
+        keys_outcome = _run_unit(
+            lambda b=bucket, p=prefix: _list_s3_flow_log_keys(b, p, since_epoch, profile, region),
+            source="s3",
+            unit=f"s3://{bucket}/{prefix} (list)",
+            iam_hint=iam,
+        )
+        if not keys_outcome.ok:
+            continue  # couldn't list this source (skippable/transient-exhausted) — move on
+        for key in keys_outcome.value:
+            outcome = _run_unit(
+                lambda b=bucket, k=key: _read_s3_object_records(b, k, profile, region),
+                source="s3",
+                unit=f"s3://{bucket}/{key}",
+                iam_hint=iam,
+            )
+            tracker.record(outcome)
+            if outcome.ok:
+                objects_read += 1
+                records.extend(outcome.value)
+    return records, objects_read, tracker.failed
 
 
 def _list_s3_flow_log_keys(
@@ -683,7 +1023,11 @@ def _read_s3_object_records(
 
 
 def _download_gz_lines(bucket: str, key: str, profile: str | None, region: str | None) -> list[str]:
-    """``s3api get-object`` the key to a temp file, gunzip it, return its text lines (or ``[]``)."""
+    """``s3api get-object`` the key to a temp file, gunzip it, return its text lines.
+
+    A failed ``get-object`` raises :class:`~cloudbreachgraph.aws.runner.AwsCliError` (classified and
+    handled by :func:`_run_unit`); a corrupt/undecodable body raises :class:`_SkippableUnitError`
+    (warned + skipped + counted toward the failure-rate safeguard) rather than silently vanish."""
     fd, dest = tempfile.mkstemp(suffix=".gz")
     os.close(fd)
     try:
@@ -695,8 +1039,8 @@ def _download_gz_lines(bucket: str, key: str, profile: str | None, region: str |
         )
         with gzip.open(dest, "rt", encoding="utf-8", errors="replace") as fh:
             return fh.read().splitlines()
-    except (OSError, EOFError, gzip.BadGzipFile):
-        return []  # unreadable/corrupt object — skip it, don't abort the whole run
+    except (OSError, EOFError, gzip.BadGzipFile) as exc:
+        raise _SkippableUnitError(f"corrupt/unreadable gzip object: {exc}") from exc
     finally:
         try:
             os.unlink(dest)
@@ -718,7 +1062,7 @@ def _epoch_from_iso(value: str | None) -> float | None:
 # (e.g. kinesis-data-firehose) is one entry here + its reader; until then such a type raises
 # FlowLogDestinationError, so the tool always pulls from the right source or fails loudly (§5.7).
 FLOW_LOG_READERS: dict[
-    str, Callable[[list[dict], str | None, str | None, float], tuple[list[dict], int]]
+    str, Callable[[list[dict], str | None, str | None, float], tuple[list[dict], int, int]]
 ] = {
     "cloud-watch-logs": _read_cloudwatch_records,
     "s3": _read_s3_records,
@@ -729,11 +1073,13 @@ def _report_flow_log_records(
     flow_logs: list[dict],
     dest_counts: dict[str, int],
     fetched_by_type: dict[str, int],
+    skipped_by_type: dict[str, int],
     parsed: int,
 ) -> None:
     """Emit a concise stderr diagnostic for the flow-log record fetch (``docs/02_architecture.md
     §5.7``) so an empty result points at its cause rather than failing silently. ``fetched`` counts
-    are CloudWatch **events** and S3 **objects** — enough to localise where the pipeline drops."""
+    are CloudWatch **events** and S3 **objects**; skipped counts are best-effort **units** that were
+    warned + skipped — enough to localise where the pipeline drops."""
     dest = ", ".join(f"{n} {d}" for d, n in sorted(dest_counts.items())) or "none"
     unit = {"cloud-watch-logs": "event(s)", "s3": "object(s)"}
     fetched = (
@@ -743,9 +1089,16 @@ def _report_flow_log_records(
         )
         or "nothing"
     )
+    total_skipped = sum(skipped_by_type.values())
+    skipped_note = ""
+    if total_skipped:
+        by_src = ", ".join(
+            f"{skipped_by_type[d]} from {d}" for d in sorted(skipped_by_type) if skipped_by_type[d]
+        )
+        skipped_note = f" skipped {total_skipped} unit(s) [{by_src}];"
     print(
         f"cloudbreachgraph: flow logs: {len(flow_logs)} config(s) [{dest}]; "
-        f"fetched {fetched}; parsed {parsed} flow record(s).",
+        f"fetched {fetched};{skipped_note} parsed {parsed} flow record(s).",
         file=sys.stderr,
     )
     if sum(fetched_by_type.values()) and not parsed:
