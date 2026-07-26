@@ -482,6 +482,122 @@ def test_flow_logs_live_run_uses_role_collectors(tmp_path, fake_aws):
     assert ("logs", "filter-log-events") in ran
 
 
+# --------------------------------------------------------------------------- #
+# Expired token -> aws sso login for every configured profile, then retry once
+# --------------------------------------------------------------------------- #
+def _expired(args) -> runner.AwsCliError:
+    return runner.AwsCliError(list(args), 255, "An error occurred (ExpiredToken) when calling")
+
+
+def test_expired_token_triggers_sso_login_for_all_profiles_and_retries(tmp_path, monkeypatch):
+    cfg = _write_config(tmp_path)
+    state = {"expired": True}
+    sso_calls: list[str] = []
+
+    def _run(args, *, profile=None, region=None, cache_dir=None):
+        key = tuple(args[:2])
+        if key == ("ec2", "describe-network-interfaces") and state["expired"]:
+            state["expired"] = False  # expired only on the first attempt
+            raise _expired(args)
+        return load_fixture(_COMMAND_FIXTURES[key])
+
+    monkeypatch.setattr(runner, "run_aws", _run)
+    monkeypatch.setattr(runner, "sso_login", lambda p: sso_calls.append(p))
+    rc = cli.main(
+        [
+            "--account",
+            "workload_prod",
+            "--config",
+            cfg,
+            "--no-verify-account",
+            "--output-dir",
+            str(tmp_path / "out"),
+        ]
+    )
+    assert rc == 0
+    # aws sso login ran for EVERY distinct profile in the config, not just the selected account's.
+    assert sorted(sso_calls) == ["prod-audit", "sandbox-ro"]
+    assert (tmp_path / "out" / "graph.json").is_file()  # the retried run succeeded
+
+
+def test_still_expired_after_sso_exits_nonzero(tmp_path, monkeypatch, capsys):
+    cfg = _write_config(tmp_path)
+
+    def _run(args, *, profile=None, region=None, cache_dir=None):
+        key = tuple(args[:2])
+        if key == ("ec2", "describe-network-interfaces"):
+            raise _expired(args)  # still expired on the retry too
+        return load_fixture(_COMMAND_FIXTURES[key])
+
+    monkeypatch.setattr(runner, "run_aws", _run)
+    monkeypatch.setattr(runner, "sso_login", lambda p: None)
+    rc = cli.main(
+        [
+            "--account",
+            "workload_prod",
+            "--config",
+            cfg,
+            "--no-verify-account",
+            "--output-dir",
+            str(tmp_path / "out"),
+        ]
+    )
+    assert rc == 1
+    assert "still expired" in capsys.readouterr().err.lower()
+
+
+def test_non_sso_profile_login_error_is_tolerated(tmp_path, monkeypatch, capsys):
+    cfg = _write_config(tmp_path)
+    state = {"expired": True}
+
+    def _run(args, *, profile=None, region=None, cache_dir=None):
+        key = tuple(args[:2])
+        if key == ("ec2", "describe-network-interfaces") and state["expired"]:
+            state["expired"] = False
+            raise _expired(args)
+        return load_fixture(_COMMAND_FIXTURES[key])
+
+    def _sso(profile):
+        if profile == "sandbox-ro":  # a non-SSO profile errors — must be tolerated
+            raise runner.AwsCliError(["sso", "login", "--profile", profile], 1, "")
+
+    monkeypatch.setattr(runner, "run_aws", _run)
+    monkeypatch.setattr(runner, "sso_login", _sso)
+    rc = cli.main(
+        [
+            "--account",
+            "workload_prod",
+            "--config",
+            cfg,
+            "--no-verify-account",
+            "--output-dir",
+            str(tmp_path / "out"),
+        ]
+    )
+    assert rc == 0  # the run still recovered despite one profile's login failing
+    assert "sandbox-ro" in capsys.readouterr().err  # warned, not fatal
+
+
+# --------------------------------------------------------------------------- #
+# --verbose
+# --------------------------------------------------------------------------- #
+def test_from_cache_verbose_echoes_served_commands(tmp_path, capsys):
+    out = tmp_path / "out"
+    rc = cli.main(["--from-cache", str(FIXTURES), "--verbose", "--output-dir", str(out)])
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "[cache]" in err
+    assert "aws ec2 describe-network-interfaces" in err
+    runner.set_verbose(False)
+
+
+def test_from_cache_without_verbose_is_quiet(tmp_path, capsys):
+    out = tmp_path / "out"
+    rc = cli.main(["--from-cache", str(FIXTURES), "--output-dir", str(out)])
+    assert rc == 0
+    assert "[cache]" not in capsys.readouterr().err
+
+
 def test_all_accounts_writes_one_graph_each(tmp_path, fake_aws):
     cfg = _write_config(tmp_path)
     out = tmp_path / "out"
