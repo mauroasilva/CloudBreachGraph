@@ -311,6 +311,28 @@ def test_html_hierarchical_takes_precedence_over_ringed(tmp_path):
     assert "· hierarchical" in (out / "graph.html").read_text()
 
 
+def test_html_hierarchical_optimize_passes_scales_labels(tmp_path):
+    # --html --hierarchical --optimize-passes N renders the optimised hierarchical layout, which
+    # separates labels in world space and so scales label fonts with the view.
+    out = tmp_path / "out"
+    rc = cli.main(
+        [
+            "--from-cache",
+            str(FIXTURES),
+            "--output-dir",
+            str(out),
+            "--html",
+            "--hierarchical",
+            "--optimize-passes",
+            "50",
+        ]
+    )
+    assert rc == 0
+    text = (out / "graph.html").read_text()
+    assert "· hierarchical" in text
+    assert "const SCALE_LABELS = true;" in text
+
+
 def test_hierarchical_without_html_warns_and_is_ignored(tmp_path, capsys):
     out = tmp_path / "out"
     rc = cli.main(["--from-cache", str(FIXTURES), "--output-dir", str(out), "--hierarchical"])

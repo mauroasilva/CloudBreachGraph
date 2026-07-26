@@ -434,11 +434,11 @@ def test_write_layout_html_dispatches_to_each_layout(graph, tmp_path):
     ).read_text()
     assert hierarchical == html_export.build_hierarchical_html(graph)
 
-    # --hierarchical takes precedence over --ringed / --optimize-passes.
+    # --hierarchical takes precedence over --ringed; optimize_passes drives its crossing reduction.
     precedence = html_export.write_layout_html(
-        graph, tmp_path / "p.html", hierarchical=True, ringed=True, optimize_passes=500
+        graph, tmp_path / "p.html", hierarchical=True, ringed=True, optimize_passes=50
     ).read_text()
-    assert precedence == html_export.build_hierarchical_html(graph)
+    assert precedence == html_export.build_hierarchical_html(graph, 50)
 
 
 def test_write_layout_html_falls_back_when_too_large(graph, tmp_path, monkeypatch):

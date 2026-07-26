@@ -161,9 +161,10 @@ cloudbreachgraph --from-cache tests/fixtures --output-dir out/
                              columns fanning left/right; connected nodes share a side,
                              sides balanced). Takes precedence over --ringed
 --optimize-passes N        with --html, run up to N optimisation passes: overlap-free
-                             layout (no node/edge/label overlap), or ringed
-                             crossing-reduction with --ringed
-                             (default 0 = base force/ringed layout)
+                             layout (no node/edge/label overlap), or ringed /
+                             hierarchical crossing-reduction with --ringed /
+                             --hierarchical (default 0 = base force/ringed/
+                             hierarchical layout)
 ```
 
 ## Outputs
@@ -476,6 +477,37 @@ given.
 ```bash
 cloudbreachgraph --from-cache tests/fixtures --html --hierarchical --output-dir out/
 cloudbreachgraph-to-html out/graph.json --hierarchical -o topology.html
+```
+
+#### Reducing crossings (`--optimize-passes N`)
+
+By default each node sits at the *mean height* of its ENIs, which already keeps things tidy, but
+an instance or load balancer whose ENIs span subnets at very different heights can leave edges
+slanting across a column. Add `--optimize-passes N` (with `--hierarchical`) to run up to **N
+barycenter sweeps** that repeatedly move each node toward the mean height of its neighbours — the
+standard layered-graph crossing-reduction heuristic — pulling connected nodes to the same row so
+their edges straighten out and stop crossing. A **cooling schedule** freezes the layout so a large
+`N` converges to the same result rather than drifting, and `--optimize-passes 0` (the default)
+keeps the base placement byte-for-byte unchanged.
+
+Optimising also makes the picture **free of node overlap and label overlap** — *by construction*,
+not by iterative nudging: the columns are spaced for the nodes' whole **labels** (not just their
+disks) and the rows likewise, so no two label rectangles can overlap horizontally or vertically,
+which means no two node disks overlap and no disk ever sits on another node's label either. Because
+the labels are then separated in *world* space, the page **scales the label fonts with the view**
+(zoom out to see the shape, zoom in to read the labels — like the overlap-free layout). Throughout,
+the left/right-column shape and the connected-nodes-share-a-side / balanced rules are preserved —
+only the row order and the spacing change. (Unlike the ringed and overlap-free layouts it does not
+also guarantee zero *edge-over-node* overlap: an edge that skips a column — e.g. a source reaching
+an ENI directly with `--no-security-groups` — can still pass over a node in the skipped column.)
+
+On the shipped 124-node/4-VPC example graph, `--optimize-passes 200` cuts edge crossings from
+**45** to **27** and reaches **zero** node and label overlap — whole-graph and per-VPC
+(`--split-by-vpc`) alike.
+
+```bash
+cloudbreachgraph-to-html out/graph.json --hierarchical --optimize-passes 200
+cloudbreachgraph --from-cache tests/fixtures --html --hierarchical --optimize-passes 200
 ```
 
 ### Overlap-free layout (`--optimize-passes N`)

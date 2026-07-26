@@ -685,6 +685,102 @@ def test_convert_hierarchical_falls_back_to_dot_when_too_large(
 
 
 # --------------------------------------------------------------------------- #
+# Hierarchical layout — crossing-reduction / overlap-free optimizer (--optimize-passes)
+# --------------------------------------------------------------------------- #
+def test_hierarchical_passes_zero_is_unchanged(graph):
+    # The default (0 passes) must be byte-identical to the pre-optimizer placement.
+    assert html_export.build_hierarchical_html(graph, 0) == html_export.build_hierarchical_html(
+        graph
+    )
+    assert html_export._hierarchical_view_data(graph, 0) == html_export._hierarchical_view_data(
+        graph
+    )
+
+
+def test_hierarchical_optimize_reaches_zero_node_and_label_overlap_on_example():
+    # The change request's acceptance criteria: the optimised hierarchical layout has zero node
+    # overlap and zero label overlap (both label-on-label and disk-on-another-node's-label).
+    g = load_graph(_EXAMPLE_GRAPH)
+    data = html_export._hierarchical_view_data(g, 200)
+    node_node, _edge_node = html_export._count_overlaps(data["nodes"], data["edges"])
+    assert node_node == 0  # zero node overlap
+    assert html_export._count_label_overlaps(data["nodes"], data["edges"]) == (0, 0)  # zero label
+
+
+def test_hierarchical_optimize_reaches_zero_overlap_on_each_split_vpc():
+    # Same guarantee on every per-VPC sub-graph (--hierarchical --split-by-vpc).
+    g = load_graph(_EXAMPLE_GRAPH)
+    subs = html_export.split_by_vpc(g)
+    assert subs  # the example has VPCs to split
+    for sub in subs.values():
+        data = html_export._hierarchical_view_data(sub, 200)
+        node_node, _ = html_export._count_overlaps(data["nodes"], data["edges"])
+        assert node_node == 0
+        assert html_export._count_label_overlaps(data["nodes"], data["edges"]) == (0, 0)
+
+
+def test_hierarchical_optimize_reduces_crossings():
+    # The barycenter sweeps cut edge crossings versus the unoptimised (0-pass) placement.
+    g = load_graph(_EXAMPLE_GRAPH)
+    base = html_export._hierarchical_view_data(g, 0)
+    opt = html_export._hierarchical_view_data(g, 200)
+    base_crossings = html_export._count_crossings(base["nodes"], base["edges"])
+    opt_crossings = html_export._count_crossings(opt["nodes"], opt["edges"])
+    assert opt_crossings < base_crossings
+
+
+def test_hierarchical_optimize_keeps_nodes_on_one_side():
+    # Optimising reorders nodes within their columns but must never move a node across the center:
+    # connected nodes still share a side, so there are still no left-right (non-center) edges.
+    g = load_graph(_EXAMPLE_GRAPH)
+    data = html_export._hierarchical_view_data(g, 200)
+    clusters = data["clusters"]
+    pos = {n["id"]: n for n in data["nodes"]}
+    typ = {n["id"]: n["type"] for n in data["nodes"]}
+    ci = {nid: _hier_cluster_of(n, clusters) for nid, n in pos.items()}
+    for e in data["edges"]:
+        s, t = e["source"], e["target"]
+        if s not in pos or t not in pos or ci[s] != ci[t]:
+            continue
+        if typ[s] == "vpc" or typ[t] == "vpc":
+            continue
+        cx = clusters[ci[s]]["cx"]
+        assert (pos[s]["x"] < cx) == (pos[t]["x"] < cx)
+
+
+def test_hierarchical_optimize_is_deterministic():
+    g = load_graph(_EXAMPLE_GRAPH)
+    assert html_export.build_hierarchical_html(g, 200) == html_export.build_hierarchical_html(
+        g, 200
+    )
+
+
+def test_hierarchical_optimize_converges():
+    # Asking for many passes must not change the result once it has converged (the cooling schedule
+    # freezes it, so a big pass count is byte-stable).
+    g = load_graph(_EXAMPLE_GRAPH)
+    assert html_export.build_hierarchical_html(g, 200) == html_export.build_hierarchical_html(
+        g, 600
+    )
+
+
+def test_hierarchical_optimize_scales_label_fonts_but_default_does_not():
+    # Optimising separates labels in world space, so the page scales label fonts with the view; the
+    # default (0-pass) layout keeps fixed-size labels (the reader zooms in to read them).
+    g = load_graph(_EXAMPLE_GRAPH)
+    assert "const SCALE_LABELS = true;" in html_export.build_hierarchical_html(g, 200)
+    assert "const SCALE_LABELS = false;" in html_export.build_hierarchical_html(g, 0)
+
+
+def test_convert_hierarchical_optimize_passes(graph, tmp_path):
+    jp = json_export.write_json(graph, tmp_path / "graph.json")
+    out = tmp_path / "opt.html"
+    rc = convert.main([str(jp), "--hierarchical", "--optimize-passes", "50", "-o", str(out)])
+    assert rc == 0
+    assert out.read_text() == html_export.build_hierarchical_html(graph, 50)
+
+
+# --------------------------------------------------------------------------- #
 # Ringed layout — crossing-reduction / overlap-nudge optimizer (--optimize-passes)
 # --------------------------------------------------------------------------- #
 def _crossing_graph():
@@ -1215,6 +1311,20 @@ def test_convert_split_by_vpc_hierarchical_layout(tmp_path):
     for vpc_id, sub in html_export.split_by_vpc(g).items():
         assert (out_dir / f"graph-{vpc_id}.html").read_text() == (
             html_export.build_hierarchical_html(sub)
+        )
+
+
+def test_convert_split_by_vpc_hierarchical_optimize_passes(tmp_path):
+    # --hierarchical --optimize-passes N applies the optimised layout to every per-VPC file.
+    g = load_graph(_EXAMPLE_GRAPH_4VPC)
+    jp = json_export.write_json(g, tmp_path / "graph.json")
+    out_dir = tmp_path / "split"
+    convert.main(
+        [str(jp), "--split-by-vpc", "--hierarchical", "--optimize-passes", "50", "-o", str(out_dir)]
+    )
+    for vpc_id, sub in html_export.split_by_vpc(g).items():
+        assert (out_dir / f"graph-{vpc_id}.html").read_text() == (
+            html_export.build_hierarchical_html(sub, 50)
         )
 
 
