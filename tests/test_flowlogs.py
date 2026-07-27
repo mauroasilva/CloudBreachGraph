@@ -238,7 +238,11 @@ def _record(home, src, dst, *, start, dstport=443, proto="6"):
     }
 
 
-def _flow_bundle_with(*, network=(), historical=(), records=(), allocations=()):
+def _vpc(vpc_id, cidr):
+    return {"VpcId": vpc_id, "CidrBlock": cidr, "IsDefault": False, "Tags": []}
+
+
+def _flow_bundle_with(*, network=(), historical=(), records=(), allocations=(), vpcs=()):
     return {
         "meta": {"target": None, "region": "us-east-1", "accounts": {}},
         "network_interfaces": list(network),
@@ -246,7 +250,7 @@ def _flow_bundle_with(*, network=(), historical=(), records=(), allocations=()):
         "load_balancers_v2": [],
         "load_balancers_classic": [],
         "subnets": [],
-        "vpcs": [],
+        "vpcs": list(vpcs),
         "flow_logs": [],
         "ip_allocations": list(allocations),
         "historical_enis": list(historical),
@@ -354,6 +358,112 @@ def test_flow_on_a_now_terminated_home_eni_is_analysed_not_dropped():
     assert edge is not None  # not dropped despite the home ENI being terminated
     assert edge.target == "flow-peer:203.0.113.9"
     assert edge.attributes["ports"] == "tcp/22"
+
+
+# --------------------------------------------------------------------------- #
+# Unrecognised ENIs — surface (never drop) an unknown flow-record home id (§5.7)
+# --------------------------------------------------------------------------- #
+def test_unrecognised_eni_becomes_flagged_node_with_inferred_ip():
+    # A flow-record home id in neither the current nor historical inventory: instead of being
+    # dropped it becomes a flagged `unrecognised` ENI, its own IP inferred from a known VPC CIDR.
+    records = [
+        _record(
+            "eni-unknown00000001",
+            "10.0.7.7",
+            "203.0.113.10",
+            start=_epoch("2026-06-15T00:00:00+00:00"),
+        ),
+        _record(
+            "eni-unknown00000001",
+            "203.0.113.11",
+            "10.0.7.7",
+            start=_epoch("2026-06-16T00:00:00+00:00"),
+            dstport=22,
+        ),
+    ]
+    bundle = _flow_bundle_with(records=records, vpcs=[_vpc("vpc-1", "10.0.0.0/16")])
+    graph = build_graph(bundle, map_flow_logs=True)
+
+    node = graph.get_node("eni-unknown00000001")
+    assert node is not None and node.type == "eni"
+    assert node.attributes["unrecognised"] is True
+    assert node.attributes["origin"] == "flow_log"
+    assert node.attributes["needs_review"] is True
+    # The guess is NEVER in private_ips (confirmed only) — it is flagged under inferred_private_ips.
+    assert node.attributes["private_ips"] == []
+    assert node.attributes["inferred_private_ips"] == [
+        {"ip": "10.0.7.7", "method": "vpc_cidr", "confidence": "high"}
+    ]
+    # Its flows are still mapped: the external peers become flow_peer nodes.
+    connects = {(e.source, e.target) for e in _edges(graph, "connects_to")}
+    assert ("eni-unknown00000001", "flow-peer:203.0.113.10") in connects
+    assert ("flow-peer:203.0.113.11", "eni-unknown00000001") in connects
+
+
+def test_unrecognised_eni_inferred_ip_forms_eni_to_eni_edge_with_a_peer():
+    # A known ENI whose flow peer matches the unrecognised ENI's inferred IP links the two directly
+    # (ENI↔ENI); a peer matching no ENI stays an external flow_peer.
+    known = _eni_dict("eni-known0000000001", ["10.0.0.1"])
+    records = [
+        # establish the unrecognised ENI's own (recurring, VPC-internal) IP 10.0.7.7
+        _record(
+            "eni-unknown00000001",
+            "10.0.7.7",
+            "203.0.113.10",
+            start=_epoch("2026-06-15T00:00:00+00:00"),
+        ),
+        _record(
+            "eni-unknown00000001",
+            "10.0.7.7",
+            "203.0.113.11",
+            start=_epoch("2026-06-16T00:00:00+00:00"),
+        ),
+        # a known ENI's flow whose peer IS the unrecognised ENI's inferred IP
+        _record(
+            "eni-known0000000001", "10.0.0.1", "10.0.7.7", start=_epoch("2026-06-17T00:00:00+00:00")
+        ),
+    ]
+    bundle = _flow_bundle_with(
+        network=[known], records=records, vpcs=[_vpc("vpc-1", "10.0.0.0/16")]
+    )
+    graph = build_graph(bundle, map_flow_logs=True)
+    connects = {(e.source, e.target) for e in _edges(graph, "connects_to")}
+    # ENI↔ENI: the known ENI connects to the unrecognised ENI (not to a flow_peer for 10.0.7.7).
+    assert ("eni-known0000000001", "eni-unknown00000001") in connects
+    assert graph.get_node("flow-peer:10.0.7.7") is None
+    # A peer matching no ENI is still an external flow_peer.
+    assert graph.get_node("flow-peer:203.0.113.10") is not None
+
+
+def test_unrecognised_eni_falls_back_to_recurring_side_without_vpc_cidr():
+    # With no known VPC CIDR to pin the internal side, the own IP is the most-recurring address and
+    # the guess is flagged low confidence.
+    records = [
+        _record(
+            "eni-unknown00000001",
+            "10.9.9.9",
+            "203.0.113.10",
+            start=_epoch("2026-06-15T00:00:00+00:00"),
+        ),
+        _record(
+            "eni-unknown00000001",
+            "203.0.113.11",
+            "10.9.9.9",
+            start=_epoch("2026-06-16T00:00:00+00:00"),
+        ),
+    ]
+    graph = build_graph(_flow_bundle_with(records=records), map_flow_logs=True)
+    node = graph.get_node("eni-unknown00000001")
+    assert node.attributes["inferred_private_ips"] == [
+        {"ip": "10.9.9.9", "method": "recurring_side", "confidence": "low"}
+    ]
+
+
+def test_known_eni_home_is_not_flagged_unrecognised(flow_bundle):
+    # Sanity: the fixture's records are all captured on *known* ENIs, so no unrecognised node
+    # appears (the change is byte-inert on a graph whose homes are all resolvable).
+    graph = build_graph(flow_bundle, map_flow_logs=True)
+    assert not any(n.attributes.get("unrecognised") for n in graph.nodes)
 
 
 def test_flow_logs_are_a_noop_without_the_flag(flow_bundle):
