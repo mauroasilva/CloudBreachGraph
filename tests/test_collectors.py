@@ -5,6 +5,7 @@ The mock boundary is ``runner.run_aws`` — no subprocess, no network.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 
 import pytest
@@ -205,13 +206,184 @@ def test_collect_ip_allocation_events_parses_cloudtrail(fake_aws):
     assert inst["PrivateIpAddress"] == "10.0.1.10"
     assert inst["AllocatedAt"].startswith("2026-06-01")
     # The lookup was scoped to CreateNetworkInterface via --lookup-attributes.
-    call = next(c for c in fake_aws if tuple(c["args"][:2]) == ("cloudtrail", "lookup-events"))
+    call = next(
+        c
+        for c in fake_aws
+        if tuple(c["args"][:2]) == ("cloudtrail", "lookup-events")
+        and any("CreateNetworkInterface" in a for a in c["args"])
+    )
     assert any("CreateNetworkInterface" in a for a in call["args"])
-    # The lookback is set explicitly and aligned to the 60-day flow-log window.
+    # The lookback reaches the full 90-day CloudTrail retention (independent of flow-log window).
     start_arg = next(a for a in call["args"] if a.startswith("--start-time="))
     start = datetime.strptime(start_arg.split("=", 1)[1], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
     window_days = (datetime.now(UTC) - start).total_seconds() / 86400
-    assert abs(window_days - collectors.FLOW_LOG_MAX_LOOKBACK_DAYS) < 1
+    assert abs(window_days - collectors.CLOUDTRAIL_MAX_LOOKBACK_DAYS) < 1
+
+
+def _ct_event(name: str, when: str, detail: dict) -> dict:
+    """A CloudTrail ``Events[]`` entry whose ``CloudTrailEvent`` string carries ``detail``."""
+    body = {"eventTime": when, "eventName": name, **detail}
+    return {"EventName": name, "EventTime": when, "CloudTrailEvent": json.dumps(body)}
+
+
+def _event_name_of(args: list[str]) -> str | None:
+    for a in args:
+        if a.startswith("--lookup-attributes=") and "AttributeValue=" in a:
+            return a.split("AttributeValue=", 1)[1].split(",")[0]
+    return None
+
+
+def test_collect_historical_enis_reconstructs_from_events(monkeypatch):
+    # RunInstances yields two ASG instance ENIs; CreateNetworkInterface a standalone ENI;
+    # DeleteNetworkInterface + TerminateInstances set deleted_at.
+    by_event = {
+        "CreateNetworkInterface": {
+            "Events": [
+                _ct_event(
+                    "CreateNetworkInterface",
+                    "2026-05-01T00:00:00+00:00",
+                    {
+                        "responseElements": {
+                            "networkInterface": {
+                                "networkInterfaceId": "eni-standalone000001",
+                                "privateIpAddress": "10.0.3.7",
+                                "subnetId": "subnet-3",
+                                "vpcId": "vpc-1",
+                                "description": "a lambda ENI",
+                                "interfaceType": "lambda",
+                                "groupSet": {"items": [{"groupId": "sg-x"}]},
+                            }
+                        }
+                    },
+                )
+            ]
+        },
+        "RunInstances": {
+            "Events": [
+                _ct_event(
+                    "RunInstances",
+                    "2026-05-10T00:00:00+00:00",
+                    {
+                        "responseElements": {
+                            "instancesSet": {
+                                "items": [
+                                    {
+                                        "instanceId": "i-asg1",
+                                        "tagSet": {
+                                            "items": [
+                                                {
+                                                    "key": "aws:autoscaling:groupName",
+                                                    "value": "web-asg",
+                                                },
+                                                {"key": "Name", "value": "web"},
+                                            ]
+                                        },
+                                        "networkInterfaceSet": {
+                                            "items": [
+                                                {
+                                                    "networkInterfaceId": "eni-asg000000000001",
+                                                    "privateIpAddress": "10.0.9.11",
+                                                    "subnetId": "subnet-1",
+                                                    "vpcId": "vpc-1",
+                                                    "groupSet": {"items": []},
+                                                }
+                                            ]
+                                        },
+                                    },
+                                    {
+                                        "instanceId": "i-asg2",
+                                        "tagSet": {
+                                            "items": [
+                                                {
+                                                    "key": "aws:autoscaling:groupName",
+                                                    "value": "web-asg",
+                                                }
+                                            ]
+                                        },
+                                        "networkInterfaceSet": {
+                                            "items": [
+                                                {
+                                                    "networkInterfaceId": "eni-asg000000000002",
+                                                    "privateIpAddress": "10.0.9.12",
+                                                    "subnetId": "subnet-2",
+                                                    "vpcId": "vpc-1",
+                                                    "groupSet": {"items": []},
+                                                }
+                                            ]
+                                        },
+                                    },
+                                ]
+                            }
+                        }
+                    },
+                )
+            ]
+        },
+        "DeleteNetworkInterface": {
+            "Events": [
+                _ct_event(
+                    "DeleteNetworkInterface",
+                    "2026-06-05T00:00:00+00:00",
+                    {"requestParameters": {"networkInterfaceId": "eni-standalone000001"}},
+                )
+            ]
+        },
+        "TerminateInstances": {
+            "Events": [
+                _ct_event(
+                    "TerminateInstances",
+                    "2026-06-20T00:00:00+00:00",
+                    {"requestParameters": {"instancesSet": {"items": [{"instanceId": "i-asg2"}]}}},
+                )
+            ]
+        },
+    }
+
+    def _run(args, *, profile=None, region=None, cache_dir=None):
+        return by_event[_event_name_of(args)]
+
+    monkeypatch.setattr(runner, "run_aws", _run)
+    recs = collectors.collect_historical_enis("prod-audit", "us-east-1")
+    by_id = {r["NetworkInterfaceId"]: r for r in recs}
+    assert set(by_id) == {"eni-standalone000001", "eni-asg000000000001", "eni-asg000000000002"}
+
+    # RunInstances ENI: carries its instance, ASG name and the Name tag.
+    asg1 = by_id["eni-asg000000000001"]
+    assert asg1["InstanceId"] == "i-asg1"
+    assert asg1["AsgName"] == "web-asg"
+    assert asg1["Name"] == "web"
+    assert asg1["PrivateIpAddresses"] == ["10.0.9.11"]
+    assert asg1["CreatedAt"] == "2026-05-10T00:00:00+00:00"
+    assert asg1["DeletedAt"] is None  # its instance was not terminated
+
+    # The terminated instance's ENI inherits the termination time.
+    assert by_id["eni-asg000000000002"]["DeletedAt"] == "2026-06-20T00:00:00+00:00"
+
+    # Standalone CreateNetworkInterface ENI keeps subnet/vpc/description (the richer parse) and its
+    # own DeleteNetworkInterface time.
+    standalone = by_id["eni-standalone000001"]
+    assert standalone["SubnetId"] == "subnet-3" and standalone["VpcId"] == "vpc-1"
+    assert standalone["Description"] == "a lambda ENI"
+    assert standalone["InstanceId"] is None and standalone["AsgName"] is None
+    assert standalone["DeletedAt"] == "2026-06-05T00:00:00+00:00"
+
+    # Deterministic (sorted by ENI id).
+    assert [r["NetworkInterfaceId"] for r in recs] == sorted(by_id)
+
+
+def test_collect_historical_enis_disabled_returns_empty(monkeypatch):
+    called = []
+    monkeypatch.setattr(runner, "run_aws", lambda *a, **k: called.append(a) or {"Events": []})
+    collectors.set_historical_enis(False)
+    assert collectors.collect_historical_enis("p", "r") == []
+    assert called == []  # no CloudTrail calls when reconstruction is off
+
+
+def test_cloudtrail_lookback_is_always_ninety_days():
+    collectors.set_flow_log_window(30)
+    assert collectors._cloudtrail_lookback_days() == collectors.CLOUDTRAIL_MAX_LOOKBACK_DAYS
+    collectors.set_flow_log_window(120)  # longer than retention -> still capped at 90
+    assert collectors._cloudtrail_lookback_days() == collectors.CLOUDTRAIL_MAX_LOOKBACK_DAYS
 
 
 def test_collect_flow_log_records_parses_and_skips_nodata(fake_aws):
@@ -354,6 +526,7 @@ def test_flow_logs_role_registered():
     assert collectors.ROLE_RESULT_KEYS["flow_logs"] == [
         "flow_logs",
         "ip_allocations",
+        "historical_enis",
         "flow_log_records",
     ]
 

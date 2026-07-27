@@ -23,7 +23,10 @@ from __future__ import annotations
 from typing import Any, Protocol
 
 from .. import __version__
-from ..aws.collectors import FLOW_LOG_MAX_LOOKBACK_DAYS
+from ..aws.collectors import (
+    CLOUDTRAIL_MAX_LOOKBACK_DAYS,
+    get_flow_log_window,
+)
 from ..model.graph import Edge, Graph, Node
 from ..model.resources import (
     ClassicLoadBalancer,
@@ -32,6 +35,7 @@ from ..model.resources import (
     Eni,
     FlowLog,
     FlowLogRecord,
+    HistoricalEni,
     IpAllocation,
     NatGateway,
     RouteTable,
@@ -111,16 +115,19 @@ def _eni_node(eni: Eni) -> Node:
 
 
 def _instance_node(inst: Ec2Instance) -> Node:
+    attributes: dict[str, Any] = {
+        "state": inst.state,
+        "instance_type": inst.instance_type,
+        "vpc_id": inst.vpc_id,
+        "subnet_id": inst.subnet_id,
+    }
+    if inst.asg_name:  # ASG membership for the collapse view (§5.7 Part 4); omitted when absent
+        attributes["asg_name"] = inst.asg_name
     return Node(
         id=inst.id,
         type="ec2_instance",
         label=inst.name or inst.id,
-        attributes={
-            "state": inst.state,
-            "instance_type": inst.instance_type,
-            "vpc_id": inst.vpc_id,
-            "subnet_id": inst.subnet_id,
-        },
+        attributes=attributes,
     )
 
 
@@ -344,10 +351,101 @@ def build_graph(
         flow_log_models = [FlowLog.from_collected(x) for x in collected.get("flow_logs", [])]
         allocations = [IpAllocation.from_collected(x) for x in collected.get("ip_allocations", [])]
         records = [FlowLogRecord.from_collected(x) for x in collected.get("flow_log_records", [])]
-        flowlogs.map_flow_logs(graph, enis, flow_log_models, allocations, records)
-        graph.meta.setdefault("flow_log_window_days", FLOW_LOG_MAX_LOOKBACK_DAYS)
+        historical = [HistoricalEni.from_collected(x) for x in collected.get("historical_enis", [])]
+        # Merge reconstructed historical ENIs (terminated ASG members, etc.) into the graph as
+        # nodes before analysing connections, so a flow's peer can resolve to one of them (§5.7).
+        current_eni_ids = {e.id for e in enis if e.id}
+        _map_historical_enis(graph, historical, current_eni_ids, subnets, vpcs, instances)
+        flowlogs.map_flow_logs(graph, enis, flow_log_models, allocations, records, historical)
+        graph.meta.setdefault("flow_log_window_days", get_flow_log_window())
+        graph.meta.setdefault("cloudtrail_window_days", CLOUDTRAIL_MAX_LOOKBACK_DAYS)
 
     return graph
+
+
+def _map_historical_enis(
+    graph: Graph,
+    historical: list[HistoricalEni],
+    current_eni_ids: set[str],
+    subnets: dict[str, Subnet],
+    vpcs: dict[str, Vpc],
+    instances: dict[str, Ec2Instance],
+) -> None:
+    """Add a graph node for each reconstructed historical ENI that isn't a *current* ENI (§5.7).
+
+    A historical ENI is drawn as an ``eni`` node flagged ``historical=True`` / ``status`` from the
+    reconstruction (usually ``"terminated"``), carrying its lifetime (``created_at``/
+    ``terminated_at``) and ``ip_history`` (JSON-only). It is placed in its subnet/VPC (``in_subnet``
+    + ``in_vpc``, reusing the collected subnet/VPC when known, else a minimal node) and, when it was
+    an instance ENI, ``attached_to`` its instance (a historical instance node when that instance is
+    itself gone). ASG membership (``asg_name``/``instance_id``) rides along for the collapse view
+    (Part 4). Deterministic: historical ENIs are processed in sorted id order.
+    """
+    for h in sorted(historical, key=lambda x: x.id or ""):
+        if not h.id or h.id in current_eni_ids:
+            continue  # a live ENI already has a (richer) node — don't shadow it
+        ip_history = {
+            ip: {"start": h.created_at, "end": h.deleted_at} for ip in sorted(h.private_ips)
+        }
+        graph.add_node(
+            Node(
+                id=h.id,
+                type="eni",
+                label=h.name or h.id,
+                attributes={
+                    "historical": True,
+                    "status": "terminated",
+                    "terminated_at": h.deleted_at,
+                    "created_at": h.created_at,
+                    "interface_type": h.interface_type,
+                    "description": h.description or "",
+                    "requester_id": h.requester_id,
+                    "private_ips": sorted(h.private_ips),
+                    "public_ips": [],
+                    "security_groups": h.security_groups,
+                    "asg_name": h.asg_name,
+                    "instance_id": h.instance_id,
+                    "ip_history": ip_history,
+                },
+            )
+        )
+        if h.subnet_id:
+            _ensure_subnet_node(graph, h.subnet_id, subnets)
+            graph.add_edge(Edge(source=h.id, target=h.subnet_id, relationship="in_subnet"))
+            subnet = subnets.get(h.subnet_id)
+            vpc_id = (subnet.vpc_id if subnet else None) or h.vpc_id
+            if vpc_id:
+                _ensure_vpc_node(graph, vpc_id, vpcs)
+                graph.add_edge(Edge(source=h.subnet_id, target=vpc_id, relationship="in_vpc"))
+        if h.instance_id:
+            _ensure_historical_instance_node(graph, h.instance_id, h, instances)
+            graph.add_edge(Edge(source=h.id, target=h.instance_id, relationship="attached_to"))
+
+
+def _ensure_historical_instance_node(
+    graph: Graph, instance_id: str, h: HistoricalEni, instances: dict[str, Ec2Instance]
+) -> None:
+    """Ensure the instance a historical ENI attached to has a node — a *current* one when it still
+    exists, else a ``historical``/terminated placeholder carrying the ASG name from the ENI (§5.7).
+    """
+    inst = instances.get(instance_id)
+    if inst is not None:
+        graph.add_node(_instance_node(inst))
+        return
+    graph.add_node(
+        Node(
+            id=instance_id,
+            type="ec2_instance",
+            label=h.name or instance_id,
+            attributes={
+                "historical": True,
+                "state": "terminated",
+                "vpc_id": h.vpc_id,
+                "subnet_id": h.subnet_id,
+                "asg_name": h.asg_name,
+            },
+        )
+    )
 
 
 def _attribute_eni(

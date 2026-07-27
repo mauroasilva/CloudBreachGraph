@@ -45,6 +45,8 @@ _TYPE_STYLE: dict[str, tuple[str, str]] = {
     # VPC), so they use the ``component`` shape too, in their own distinct fills (§5.4).
     "nat_gateway": ("#E0F2F1", "component"),  # teal
     "vpc_endpoint": ("#E8EAF6", "component"),  # indigo tint
+    # An Auto Scaling group, collapsing a whole fleet's instances + ENIs into one node (§5.7).
+    "autoscaling_group": ("#D7CCC8", "box3d"),  # taupe, box3d (a stack of instances)
     # Reachability sources (docs/02_architecture.md §5.5) — who can reach an ENI.
     "internet": ("#FFEBEE", "doubleoctagon"),  # the whole internet (0.0.0.0/0 / ::/0), per-ENI
     "cidr": ("#FFF8E1", "note"),  # a specific source CIDR
@@ -96,8 +98,9 @@ def _node_vpc(
         "nat_gateway",
         "vpc_endpoint",
         "security_group",
+        "autoscaling_group",
     ):
-        # These are all VPC-scoped; cluster them with their VPC when known (§5.4/§5.5).
+        # These are all VPC-scoped; cluster them with their VPC when known (§5.4/§5.5/§5.7).
         return node.attributes.get("vpc_id")
     return None
 
@@ -120,7 +123,19 @@ def _node_lines(node: Node) -> list[str]:
             lines.append("Private IP: " + ", ".join(attrs["private_ips"]))
         if attrs.get("public_ips"):
             lines.append("Public IP: " + ", ".join(attrs["public_ips"]))
+        if attrs.get("historical"):  # a reconstructed, now-terminated ENI (§5.7) — no dates drawn
+            lines.append("(terminated)")
         # Note: full IP history (`ip_history`, §5.7) is JSON-only; the map shows only current IPs.
+    elif node.type == "autoscaling_group":
+        # A collapsed fleet (§5.7 Part 4): show current/historical member counts, not raw dates.
+        lines.append(
+            f"{attrs.get('instance_count', 0)} instances, {attrs.get('eni_count', 0)} ENIs"
+        )
+        historical = (attrs.get("historical_instance_count", 0)) + (
+            attrs.get("historical_eni_count", 0)
+        )
+        if historical:
+            lines.append(f"({historical} historical)")
     elif node.type == "load_balancer" and attrs.get("lb_type"):
         lines.append(str(attrs["lb_type"]))
     elif node.type == "nat_gateway":
@@ -143,12 +158,24 @@ def _node_lines(node: Node) -> list[str]:
 
 
 def _node_stmt(node: Node) -> str:
-    """A single ``"id" [ ... ];`` DOT node statement."""
+    """A single ``"id" [ ... ];`` DOT node statement.
+
+    ``synthetic`` placeholders and ``historical`` (reconstructed, now-terminated, §5.7) nodes are
+    drawn **dashed**; a historical node is additionally **greyed** (grey outline + font) so a
+    terminated resource reads as faded next to its live peers."""
     fill, shape = _TYPE_STYLE.get(node.type, _DEFAULT_STYLE)
-    style = "filled,dashed" if node.attributes.get("synthetic") else "filled"
+    attrs = node.attributes
+    styles = ["filled"]
+    extra = ""
+    if attrs.get("synthetic"):
+        styles.append("dashed")
+    if attrs.get("historical"):
+        styles.append("dashed")
+        extra = ', color="#9E9E9E", fontcolor="#757575"'
+    style = ",".join(dict.fromkeys(styles))
     return (
         f'"{_esc(node.id)}" [label="{_label(_node_lines(node))}", '
-        f'shape={shape}, style="{style}", fillcolor="{fill}"];'
+        f'shape={shape}, style="{style}", fillcolor="{fill}"{extra}];'
     )
 
 

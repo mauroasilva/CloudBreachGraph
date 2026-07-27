@@ -197,6 +197,165 @@ def test_eni_to_eni_edge_requires_peer_held_the_ip_at_record_time(flow_bundle):
     assert graph.get_node("flow-peer:10.0.1.20") is None
 
 
+# --------------------------------------------------------------------------- #
+# Historical ENIs + time-aware IP→ENI resolution (§5.7 Part 3)
+# --------------------------------------------------------------------------- #
+def _epoch(iso: str) -> int:
+    from datetime import datetime
+
+    return int(datetime.fromisoformat(iso).timestamp())
+
+
+def _hist(eni_id, ips, *, created=None, deleted=None, subnet="subnet-1", vpc="vpc-1", **kw):
+    return {
+        "NetworkInterfaceId": eni_id,
+        "PrivateIpAddresses": ips,
+        "SubnetId": subnet,
+        "VpcId": vpc,
+        "Groups": kw.get("groups", []),
+        "Description": kw.get("description"),
+        "InterfaceType": "interface",
+        "RequesterId": None,
+        "InstanceId": kw.get("instance_id"),
+        "AsgName": kw.get("asg_name"),
+        "Name": kw.get("name"),
+        "CreatedAt": created,
+        "DeletedAt": deleted,
+    }
+
+
+def _record(home, src, dst, *, start, dstport=443, proto="6"):
+    return {
+        "InterfaceId": home,
+        "SrcAddr": src,
+        "DstAddr": dst,
+        "SrcPort": 50000,
+        "DstPort": dstport,
+        "Protocol": proto,
+        "Action": "ACCEPT",
+        "Start": start,
+        "LogGroup": "/g",
+    }
+
+
+def _flow_bundle_with(*, network=(), historical=(), records=(), allocations=()):
+    return {
+        "meta": {"target": None, "region": "us-east-1", "accounts": {}},
+        "network_interfaces": list(network),
+        "ec2_instances": [],
+        "load_balancers_v2": [],
+        "load_balancers_classic": [],
+        "subnets": [],
+        "vpcs": [],
+        "flow_logs": [],
+        "ip_allocations": list(allocations),
+        "historical_enis": list(historical),
+        "flow_log_records": list(records),
+    }
+
+
+def test_time_aware_resolution_attributes_reused_ip_to_the_right_eni():
+    # Two historical ENIs reused 10.0.0.50 at different times; a flow at each time attributes to the
+    # ENI whose lifetime covers it — an ENI↔ENI edge to the right one, never a flow_peer.
+    home = _eni_dict("eni-home00000000001", ["10.0.0.1"])
+    historical = [
+        _hist(
+            "eni-old00000000001",
+            ["10.0.0.50"],
+            created="2026-02-01T00:00:00+00:00",
+            deleted="2026-03-01T00:00:00+00:00",
+        ),
+        _hist(
+            "eni-new00000000001",
+            ["10.0.0.50"],
+            created="2026-04-01T00:00:00+00:00",
+        ),
+    ]
+    records = [
+        _record(
+            "eni-home00000000001",
+            "10.0.0.1",
+            "10.0.0.50",
+            start=_epoch("2026-02-15T00:00:00+00:00"),
+        ),
+        _record(
+            "eni-home00000000001",
+            "10.0.0.1",
+            "10.0.0.50",
+            start=_epoch("2026-04-15T00:00:00+00:00"),
+        ),
+    ]
+    bundle = _flow_bundle_with(network=[home], historical=historical, records=records)
+    graph = build_graph(bundle, map_flow_logs=True)
+    connects = {(e.source, e.target) for e in _edges(graph, "connects_to")}
+    assert ("eni-home00000000001", "eni-old00000000001") in connects  # the Feb flow → the old ENI
+    assert ("eni-home00000000001", "eni-new00000000001") in connects  # the Apr flow → the new ENI
+    assert graph.get_node("flow-peer:10.0.0.50") is None  # never an external peer for an ENI IP
+
+
+def test_historical_eni_becomes_a_flagged_terminated_node():
+    home = _eni_dict("eni-home00000000001", ["10.0.0.1"])
+    historical = [
+        _hist(
+            "eni-term00000000001",
+            ["10.0.0.50"],
+            created="2026-02-01T00:00:00+00:00",
+            deleted="2026-03-01T00:00:00+00:00",
+        )
+    ]
+    records = [
+        _record(
+            "eni-home00000000001",
+            "10.0.0.1",
+            "10.0.0.50",
+            start=_epoch("2026-02-15T00:00:00+00:00"),
+        )
+    ]
+    graph = build_graph(
+        _flow_bundle_with(network=[home], historical=historical, records=records),
+        map_flow_logs=True,
+    )
+    node = graph.get_node("eni-term00000000001")
+    assert node is not None and node.type == "eni"
+    assert node.attributes["historical"] is True
+    assert node.attributes["status"] == "terminated"
+    assert node.attributes["terminated_at"] == "2026-03-01T00:00:00+00:00"
+    # It is placed in its subnet (so it clusters in the VPC).
+    assert any(
+        e.source == "eni-term00000000001" and e.relationship == "in_subnet" for e in graph.edges
+    )
+
+
+def test_flow_on_a_now_terminated_home_eni_is_analysed_not_dropped():
+    # A flow captured on an ENI since terminated is still analysed (its peer still resolves).
+    historical = [
+        _hist(
+            "eni-gone00000000001",
+            ["10.0.5.5"],
+            created="2026-02-01T00:00:00+00:00",
+            deleted="2026-05-01T00:00:00+00:00",
+        )
+    ]
+    records = [
+        _record(
+            "eni-gone00000000001",
+            "10.0.5.5",
+            "203.0.113.9",
+            start=_epoch("2026-03-01T00:00:00+00:00"),
+            dstport=22,
+        )
+    ]
+    graph = build_graph(
+        _flow_bundle_with(historical=historical, records=records), map_flow_logs=True
+    )
+    edge = next(
+        (e for e in _edges(graph, "connects_to") if e.source == "eni-gone00000000001"), None
+    )
+    assert edge is not None  # not dropped despite the home ENI being terminated
+    assert edge.target == "flow-peer:203.0.113.9"
+    assert edge.attributes["ports"] == "tcp/22"
+
+
 def test_flow_logs_are_a_noop_without_the_flag(flow_bundle):
     graph = build_graph(flow_bundle)  # network-only view
     types = {n.type for n in graph.nodes}

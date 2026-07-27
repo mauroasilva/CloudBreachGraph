@@ -461,6 +461,81 @@ def test_unsupported_flow_log_destination_exits_cleanly(tmp_path, monkeypatch, c
     assert "kinesis-data-firehose" in capsys.readouterr().err
 
 
+def test_flow_log_days_sets_window_and_cloudtrail_stays_90(tmp_path):
+    out = tmp_path / "out"
+    rc = cli.main(
+        [
+            "--from-cache",
+            str(FIXTURES),
+            "--flow-logs",
+            "--flow-log-days",
+            "30",
+            "--output-dir",
+            str(out),
+        ]
+    )
+    assert rc == 0
+    meta = json.loads((out / "graph.json").read_text())["meta"]
+    assert meta["flow_log_window_days"] == 30  # the configured record window
+    assert meta["cloudtrail_window_days"] == 90  # history still reaches the CloudTrail max
+
+
+def test_flow_log_days_must_be_positive(tmp_path):
+    out = tmp_path / "out"
+    rc = cli.main(["--from-cache", str(FIXTURES), "--flow-log-days", "0", "--output-dir", str(out)])
+    assert rc == 2
+
+
+def test_historical_enis_present_by_default_under_flow_logs(tmp_path):
+    out = tmp_path / "out"
+    assert cli.main(["--from-cache", str(FIXTURES), "--flow-logs", "--output-dir", str(out)]) == 0
+    nodes = json.loads((out / "graph.json").read_text())["nodes"]
+    historical = [n for n in nodes if n["type"] == "eni" and n["attributes"].get("historical")]
+    # The reconstructed ASG ENIs (from the RunInstances fixture) are present as terminated ENIs.
+    assert {n["id"] for n in historical} >= {"eni-0asg00000000001", "eni-0asg00000000002"}
+
+
+def test_no_historical_enis_opt_out(tmp_path):
+    out = tmp_path / "out"
+    rc = cli.main(
+        [
+            "--from-cache",
+            str(FIXTURES),
+            "--flow-logs",
+            "--no-historical-enis",
+            "--output-dir",
+            str(out),
+        ]
+    )
+    assert rc == 0
+    nodes = json.loads((out / "graph.json").read_text())["nodes"]
+    assert not any(n["type"] == "eni" and n["attributes"].get("historical") for n in nodes)
+
+
+def test_collapse_asgs_folds_the_fleet_into_one_node(tmp_path):
+    out = tmp_path / "out"
+    rc = cli.main(
+        ["--from-cache", str(FIXTURES), "--flow-logs", "--collapse-asgs", "--output-dir", str(out)]
+    )
+    assert rc == 0
+    data = json.loads((out / "graph.json").read_text())
+    nodes = {n["id"]: n for n in data["nodes"]}
+    assert "asg:web-asg" in nodes and nodes["asg:web-asg"]["type"] == "autoscaling_group"
+    # The member ENIs/instances are absorbed (gone from the graph).
+    assert not ({"eni-0asg00000000001", "eni-0asg00000000002", "i-0asg00000000001"} & set(nodes))
+    asg = nodes["asg:web-asg"]["attributes"]
+    assert asg["eni_count"] == 2 and asg["instance_count"] == 2
+
+
+def test_collapse_asgs_is_a_noop_without_asgs(tmp_path):
+    # Without --flow-logs there are no ASG members, so --collapse-asgs changes nothing.
+    plain = tmp_path / "plain"
+    collapsed = tmp_path / "collapsed"
+    cli.main(["--from-cache", str(FIXTURES), "--output-dir", str(plain)])
+    cli.main(["--from-cache", str(FIXTURES), "--collapse-asgs", "--output-dir", str(collapsed)])
+    assert (plain / "graph.json").read_text() == (collapsed / "graph.json").read_text()
+
+
 def test_flow_logs_live_run_uses_role_collectors(tmp_path, fake_aws):
     cfg = _write_config(tmp_path)
     rc = cli.main(

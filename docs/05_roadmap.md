@@ -35,6 +35,20 @@ loop (`§11.7`) don't change.
 > `flow_logs` (default: the `network` account); full cross-account splitting (config in the workload
 > account, records in a log-archive account) remains the design below. See also
 > `learnings_2026-07-25_flowlog-format-diagnostics.md`.
+>
+> **Extended again — historical ENIs, configurable window, ASG collapse.** The `flow_logs` role now
+> reconstructs the ENIs that existed in the last 90 days from CloudTrail (`RunInstances` /
+> `CreateNetworkInterface` / `DeleteNetworkInterface` / `TerminateInstances`), merges them into a
+> combined current ∪ historical inventory, and resolves each flow record's peer IP to whichever ENI
+> held it **at the record's timestamp** (a time-indexed resolver) — so a flow on a now-terminated
+> ASG ENI is analysed and links ENI↔ENI instead of dropping or becoming a `flow_peer`. The
+> flow-log-record window is configurable (`--flow-log-days N`, default 60) while CloudTrail history
+> always reaches its 90-day max; both windows are recorded in `graph.meta`. `--collapse-asgs` folds
+> every Auto Scaling group's instances **and** ENIs (current + historical) into one
+> `autoscaling_group` node (a view transform in `mapping/collapse.py`, alongside
+> `collapse_security_groups`). Still the extension model exactly: a new collector + registry entry, a
+> new `HistoricalEni` model, mapping changes, and new node/attribute types — no config-grammar
+> change. See `learnings_2026-07-27_historical-enis-asg-collapse.md`.
 
 ### Why it's cross-account
 VPC Flow Logs are frequently centralized: a VPC in a **workload account** publishes its flow

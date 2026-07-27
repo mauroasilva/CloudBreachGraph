@@ -75,17 +75,24 @@ flags. The AWS CLI auto-paginates by default, returning the full result set.
 | NAT Gateways | `aws ec2 describe-nat-gateways --region <r>` | `.NatGateways[]` |
 | VPC Endpoints | `aws ec2 describe-vpc-endpoints --region <r>` | `.VpcEndpoints[]` |
 | VPC Flow Logs config (`flow_logs`) | `aws ec2 describe-flow-logs --region <r>` | `.FlowLogs[]` |
-| IP-allocation history (`flow_logs`) | `aws cloudtrail lookup-events --lookup-attributes=AttributeKey=EventName,AttributeValue=CreateNetworkInterface --start-time=<now-60d>` | `.Events[].CloudTrailEvent` |
+| IP-allocation history (`flow_logs`) | `aws cloudtrail lookup-events --lookup-attributes=AttributeKey=EventName,AttributeValue=CreateNetworkInterface --start-time=<now-90d>` | `.Events[].CloudTrailEvent` |
+| Historical ENIs — reconstruction (`flow_logs`) | `aws cloudtrail lookup-events --lookup-attributes=AttributeKey=EventName,AttributeValue=<EventName> --start-time=<now-90d>` — one query each for `CreateNetworkInterface`, `RunInstances`, `DeleteNetworkInterface`, `TerminateInstances` | `.Events[].CloudTrailEvent` |
 | Flow-log records — CloudWatch (`flow_logs`) | `aws logs filter-log-events --log-group-name=<g> --start-time=<ms>` | `.events[].message` |
 | Flow-log records — S3 list (`flow_logs`) | `aws s3api list-objects-v2 --bucket=<b> --prefix=<p>` | `.Contents[].{Key,LastModified}` |
 | Flow-log records — S3 object (`flow_logs`) | `aws s3api get-object --bucket=<b> --key=<k> <file>` | gzip body → lines |
 | Caller identity (account check) | `aws sts get-caller-identity` | `.Account`, `.Arn` |
 
-The three `flow_logs`-role commands are opt-in (`--flow-logs`, §5.7). They are **read-only**
-retrievals — `cloudtrail lookup-events` and `logs filter-log-events` retrieve, never mutate — even
-though their verbs aren't the usual `describe`/`list`/`get`/`head` (the read-only guarantee is about
-*not mutating*, §9). Value-carrying flags are passed in `--flag=value` form so the cache-key /
-`--from-cache` file naming (which keys on the positional sub-command) stays stable.
+The `flow_logs`-role commands are opt-in (`--flow-logs`, §5.7). They are **read-only** retrievals —
+`cloudtrail lookup-events` and `logs filter-log-events` retrieve, never mutate — even though their
+verbs aren't the usual `describe`/`list`/`get`/`head` (the read-only guarantee is about *not
+mutating*, §9). Value-carrying flags are passed in `--flag=value` form so the cache-key /
+`--from-cache` file naming (which keys on the positional sub-command) stays stable. The
+historical-ENI reconstruction issues one `cloudtrail lookup-events` **per EventName**, so the
+`--from-cache` reader disambiguates them by the `EventName` in `--lookup-attributes`, serving
+`cloudtrail_lookup-events.<eventname>.json` when present (else falling back to the un-suffixed
+file). The flow-log-record window is configurable (`--flow-log-days N`, default 60); the CloudTrail
+history window is always the full 90-day retention (never shorter than the record window), so a
+flow captured on a now-terminated ENI can still be resolved to whichever ENI held its IP then.
 
 The **only** non-read command the tool can issue is `aws sso login --profile <p>`, run **strictly in
 reaction to an expired-token error** to refresh local credentials before retrying the run once
@@ -410,6 +417,58 @@ extension for this feature. Determinism holds: allocation times and record times
 data, and the 60-day bound is applied at the *collection* query (not from wall-clock in the output),
 so a fixed capture always yields the same graph.
 
+### 5.7.1 Historical ENIs + time-aware resolution (configurable window, ASG collapse)
+
+`--flow-logs` only knows the ENIs that exist **right now**. In an Auto Scaling group, instances and
+their ENIs are constantly replaced, so days of flow logs are full of records captured on
+**terminated** ENIs and traffic to/from **reused** IPs. Four connected pieces fix this:
+
+1. **Configurable flow-log window.** `--flow-log-days N` (default `FLOW_LOG_MAX_LOOKBACK_DAYS = 60`)
+   sets how many days of *records* are read. A module-level setter (`collectors.set_flow_log_window`,
+   mirroring `configure_cache`) threads it in without breaking the `collect_x(profile, region)`
+   contract. `graph.meta` records both `flow_log_window_days` (configured) and `cloudtrail_window_days`.
+
+2. **90-day CloudTrail history.** The historical-ENI reconstruction and IP-allocation history query
+   the full `CLOUDTRAIL_MAX_LOOKBACK_DAYS = 90` (`min(90, max(days, 90))` — always 90, never shorter
+   than the record window), independent of the record window, so a flow on a terminated ENI resolves
+   even when `--flow-log-days` is small.
+
+3. **Historical ENIs + time-aware resolution.** `collect_historical_enis` reconstructs the ENIs that
+   existed in the window from CloudTrail — one `lookup-events` per EventName:
+   `CreateNetworkInterface` (a standalone ENI), **`RunInstances`** (each instance's ENIs *and* its
+   `aws:autoscaling:groupName` tag — most instance ENIs have no standalone create event),
+   `DeleteNetworkInterface` / `TerminateInstances` (which set `deleted_at`, a terminated instance's
+   deletion cascading to its ENIs). These merge by ENI id into a `HistoricalEni` with a lifetime
+   `{created_at, deleted_at}`, `asg_name` and `instance_id`. The mapping builds a **combined ENI
+   inventory** (current ∪ historical, keyed by ENI id) and a **time-indexed resolver**: an
+   `(ip, record_epoch)` pair resolves to the ENI whose `[created_at, deleted_at]` lifetime contains
+   the record's time *and* held the IP (tie-break: latest `created_at ≤ record_epoch`). This subsumes
+   the old `ip_to_eni` dict + `ip_alloc_epoch` guard and disambiguates reused ASG IPs. A record's
+   **home** is resolved by `interface-id` against the combined inventory (so a terminated home gets
+   analysed, not dropped); the **peer** resolves through the time-indexed resolver → an ENI↔ENI edge
+   to whichever ENI held the IP then (current or historical), falling back to `flow_peer` only when
+   *no* ENI held it — and dropping the record (not inventing a peer) when the IP is otherwise
+   internal. Referenced historical ENIs become graph nodes (`type: "eni"`, `historical: true`,
+   `status: "terminated"`, `terminated_at`), placed in their subnet/VPC and styled **dashed/greyed**
+   in DOT/HTML. Reconstruction is **on** with `--flow-logs` (`--no-historical-enis` opts out; point
+   users at `--collapse-asgs` to keep the graph readable).
+
+4. **ASG collapse (`--collapse-asgs`).** A graph **view transform** (`mapping/collapse.py`, same
+   shape as `collapse_security_groups`), applied after the graph is built. It folds each Auto Scaling
+   group's **members** — every EC2 instance in the group *and* every ENI attached to them, current
+   **and** historical — into one `autoscaling_group` node (id `asg:<group-name>`). Membership is the
+   `aws:autoscaling:groupName` tag (current instances via `describe-instances`, current ENIs via
+   their instance, historical via the `RunInstances` `tagSet`). Edges re-point: an edge with one
+   member endpoint moves that endpoint to the ASG node (direction preserved) then de-dups/merges
+   parallels (`connects_to` unions `ports`; `in_subnet` keeps one edge per distinct member subnet, so
+   the fleet nests in its VPC across AZs); an edge with both endpoints in the same group is a
+   self-loop and is **dropped** (intra-fleet `connects_to`, every ENI→instance `attached_to`); a flow
+   between two different groups becomes one ASG→ASG edge. Subnets, VPCs, security groups, reachability
+   sources, `flow_peer`s and any non-ASG ENI/instance are untouched. The ASG node carries current vs
+   historical member counts (instances and ENIs), the member subnets + VPC, the union of member
+   private IPs, and a sample of instance ids. Deterministic and idempotent; a graph built without the
+   flag is byte-for-byte unchanged.
+
 ## 6. Graph data model (Phase 2 defines, Phase 3 consumes)
 
 A minimal, serialization-friendly model:
@@ -423,8 +482,11 @@ Node:
                         #   | "security_group" | "internet" | "cidr"   (reachability, §5.5)
                         #   | "flow_peer"  (external peer seen in flow logs, §5.7; flow-log config
                         #                   is a `flow_logs` attribute on the vpc node, not a node)
+                        #   | "autoscaling_group"  (a collapsed ASG fleet, --collapse-asgs, §5.7.1)
   label: str            # human-friendly (Name tag or id)
-  attributes: dict      # type-specific metadata (state, cidr, interface_type, synthetic, ...)
+  attributes: dict      # type-specific metadata (state, cidr, interface_type, synthetic, ...);
+                        #   a reconstructed, now-terminated ENI/instance carries `historical: true`
+                        #   + `terminated_at` (§5.7.1), styled dashed/greyed in DOT/HTML
 
 Edge:
   source: str           # node id

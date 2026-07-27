@@ -149,6 +149,17 @@ cloudbreachgraph --from-cache tests/fixtures --output-dir out/
                              flow_peer node). Needs extra read-only IAM
                              (ec2:DescribeFlowLogs, cloudtrail:LookupEvents,
                              logs:FilterLogEvents, s3:ListBucket + s3:GetObject)
+--flow-log-days N          how many days of flow-log records to analyse (default 60;
+                             only with --flow-logs). The 90-day CloudTrail history used
+                             to reconstruct historical ENIs is unaffected (always the
+                             full retention, never shorter than this window)
+--historical-enis /        with --flow-logs, reconstruct ENIs that existed in the last
+  --no-historical-enis       90 days from CloudTrail so a flow on a now-terminated ASG
+                             ENI is analysed and its peers resolve to the ENI that held
+                             the IP at the time (default: on; --no-historical-enis off)
+--collapse-asgs            collapse each Auto Scaling group's instances and ENIs
+                             (current + historical) into one autoscaling_group node,
+                             merging their edges (tames a churning fleet's fan-out)
 --security-groups /        show security groups as nodes between ENIs and their
   --no-security-groups       sources (default: on); --no-security-groups connects the
                              source IPs directly to the ENIs with routability
@@ -298,8 +309,8 @@ read-only permissions and reads recent log data) to add, all read-only:
   status) — VPC-, subnet- and ENI-scoped flow logs all roll up to their VPC. There are no separate
   flow-log nodes, and this config is written to **`graph.json` only** — it is not drawn in the DOT or
   HTML views.
-- **What connected to what.** It reads up to **60 days** of flow records from wherever each flow log
-  delivers — **CloudWatch Logs** (`logs filter-log-events`) or **S3** (`s3api list-objects-v2` +
+- **What connected to what.** It reads up to **60 days** of flow records (configurable with
+  `--flow-log-days N`) from wherever each flow log delivers — **CloudWatch Logs** (`logs filter-log-events`) or **S3** (`s3api list-objects-v2` +
   `get-object` on the gzipped objects), dispatched by the flow log's `LogDestinationType`. A
   destination type with no reader implemented (e.g. `kinesis-data-firehose`) raises an error rather
   than silently skipping. For every observed connection it adds a directed **`connects_to`** edge to
@@ -325,6 +336,39 @@ the same account as `network`, so in the common single-account case `--flow-logs
 `docs/02_architecture.md §5.7`). Reading S3 records needs `s3:ListBucket` + `s3:GetObject` on the
 destination bucket, in addition to `ec2:DescribeFlowLogs`, `cloudtrail:LookupEvents` and
 `logs:FilterLogEvents`.
+
+### Historical ENIs & ASG collapse
+
+`--flow-logs` only knows the ENIs that exist **right now**. In an Auto Scaling group, instances and
+their ENIs are churned constantly, so days of flow logs are full of records captured on
+**terminated** ENIs and traffic to/from **reused** IPs. To handle this:
+
+- **90-day CloudTrail reconstruction (on by default with `--flow-logs`).** CloudBreachGraph rebuilds
+  the ENIs that existed in the last 90 days from CloudTrail (`RunInstances` — which also carries each
+  instance's `aws:autoscaling:groupName` tag — plus `CreateNetworkInterface` /
+  `DeleteNetworkInterface` / `TerminateInstances`). These merge with the current ENIs into one
+  inventory with per-ENI lifetimes. A terminated ENI becomes a graph node flagged `historical` /
+  `terminated` (drawn **dashed and greyed**). Turn it off with `--no-historical-enis`.
+- **Time-aware IP → ENI resolution.** Each flow record's peer IP resolves to whichever ENI held that
+  IP **at the record's timestamp** — so a flow captured on a now-terminated ASG ENI is analysed (not
+  dropped), and a reused ASG IP is attributed to the ENI that actually owned it then, giving an
+  **ENI ↔ ENI** edge rather than a `flow_peer` whenever the peer was an ENI in the window.
+- **Configurable window.** `--flow-log-days N` (default 60) changes how many days of *records* are
+  read; the CloudTrail history always reaches its 90-day max (never shorter than the record window).
+  Both windows are recorded in `graph.meta` (`flow_log_window_days`, `cloudtrail_window_days`).
+- **`--collapse-asgs`.** A churning fleet produces a lot of historical ENIs. This flag collapses each
+  Auto Scaling group's instances **and** ENIs (current + historical) into a single
+  `autoscaling_group` node (`asg:<name>`), re-pointing and merging their edges: external edges move
+  onto the ASG node (ports unioned; one `in_subnet` per AZ subnet the fleet used), intra-fleet edges
+  (including every ENI→instance attachment) drop, and a flow between two ASGs becomes a single
+  ASG→ASG edge. The node carries current-vs-historical member counts, the member subnets/VPC, and the
+  union of member private IPs. Deterministic; a graph built without the flag is byte-for-byte
+  unchanged.
+
+```bash
+# 45 days of records, historical ENIs reconstructed, fleets collapsed (offline demo):
+cloudbreachgraph --from-cache tests/fixtures --flow-logs --flow-log-days 45 --collapse-asgs --output-dir out/
+```
 
 ### Resilient fetch (best-effort, with smart recovery)
 
