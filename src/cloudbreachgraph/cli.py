@@ -40,6 +40,7 @@ from .config import (
     verify_target,
 )
 from .mapping.builder import build_graph
+from .mapping.collapse import collapse_autoscaling_groups
 from .output import dot_export, html_export, json_export
 
 # The roles a run activates. ``network`` is always on; ``--flow-logs`` adds ``flow_logs`` (§5.7).
@@ -118,6 +119,31 @@ def build_parser() -> argparse.ArgumentParser:
         "destinations",
     )
     col.add_argument(
+        "--flow-log-days",
+        type=int,
+        default=collectors.FLOW_LOG_MAX_LOOKBACK_DAYS,
+        metavar="N",
+        help=f"how many days of flow-log records to analyse (default "
+        f"{collectors.FLOW_LOG_MAX_LOOKBACK_DAYS}; only with --flow-logs). The 90-day CloudTrail "
+        f"history used to reconstruct historical ENIs is unaffected (always the full retention, "
+        f"never shorter than this window)",
+    )
+    col.add_argument(
+        "--historical-enis",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="with --flow-logs, reconstruct ENIs that existed in the last 90 days from CloudTrail "
+        "(on by default) so a flow captured on a now-terminated ASG ENI is analysed and its peers "
+        "resolve to the ENI that held the IP at the time. --no-historical-enis turns it off; "
+        "consider --collapse-asgs to keep the graph readable",
+    )
+    col.add_argument(
+        "--collapse-asgs",
+        action="store_true",
+        help="collapse every Auto Scaling group's instances and ENIs (current + historical) into a "
+        "single autoscaling_group node, merging their edges — tames the fan-out of a churning ASG",
+    )
+    col.add_argument(
         "--security-groups",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -166,6 +192,18 @@ def build_parser() -> argparse.ArgumentParser:
 # --------------------------------------------------------------------------- #
 # Offline cache reader (--from-cache)
 # --------------------------------------------------------------------------- #
+def _cache_variant(args: list[str]) -> str | None:
+    """A cache-file variant suffix from a value-carrying lookup flag, or ``None``.
+
+    Currently only ``cloudtrail lookup-events`` needs one: its ``--lookup-attributes`` carries the
+    ``EventName`` the query is scoped to, so ``--from-cache`` can serve a distinct fixture per event
+    (the historical-ENI reconstruction issues one query per EventName)."""
+    for a in args:
+        if a.startswith("--lookup-attributes=") and "AttributeValue=" in a:
+            return a.split("AttributeValue=", 1)[1].split(",")[0].strip().lower()
+    return None
+
+
 def _make_cache_reader(cache_dir: str | Path):
     """A drop-in replacement for ``runner.run_aws`` that reads cached JSON off disk.
 
@@ -180,9 +218,15 @@ def _make_cache_reader(cache_dir: str | Path):
 
     def _reader(args: list[str], *, profile=None, region=None, cache_dir=None):
         positional = [a for a in args if not a.startswith("-")]
-        candidates = [
-            "-".join(positional) + ".json",  # runner cache-key format
-        ]
+        # A per-EventName variant for the repeated ``cloudtrail lookup-events`` queries (§5.7): the
+        # historical-ENI reconstruction runs one per EventName, so the fixture is disambiguated by
+        # ``<service>_<command>.<eventname>.json`` and only falls back to the un-suffixed file.
+        variant = _cache_variant(args)
+        candidates: list[str] = []
+        if variant and positional:
+            candidates.append(positional[0] + "_" + "-".join(positional[1:]) + f".{variant}.json")
+            candidates.append("-".join(positional) + f".{variant}.json")
+        candidates.append("-".join(positional) + ".json")  # runner cache-key format
         if positional:
             candidates.append(positional[0] + "_" + "-".join(positional[1:]) + ".json")  # fixtures
         for name in candidates:
@@ -247,6 +291,9 @@ def _write_outputs(collected: dict, out_dir: Path, stem: str, args: argparse.Nam
         show_security_groups=args.security_groups,
         map_flow_logs=args.flow_logs,
     )
+    if args.collapse_asgs:
+        # A post-build view transform (§5.7 Part 4): fold each ASG's members into one node.
+        graph = collapse_autoscaling_groups(graph)
     json_path = json_export.write_json(graph, out_dir / f"{stem}.json")
     dot_path = dot_export.write_dot(graph, out_dir / f"{stem}.dot")
     print(f"wrote {json_path}")
@@ -387,6 +434,14 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     out_dir = Path(args.output_dir)
     runner.set_verbose(bool(args.verbose))
+
+    if args.flow_log_days <= 0:
+        print("cloudbreachgraph: --flow-log-days must be > 0", file=sys.stderr)
+        return 2
+    # Thread the flow-log window + historical-ENI toggle into the collectors (module-level knobs,
+    # mirroring configure_cache), so the collect_x(profile, region) contract is untouched (§5.7).
+    collectors.set_flow_log_window(args.flow_log_days)
+    collectors.set_historical_enis(args.flow_logs and args.historical_enis)
 
     if args.optimize_passes < 0:
         print("cloudbreachgraph: --optimize-passes must be >= 0", file=sys.stderr)
