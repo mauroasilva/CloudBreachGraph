@@ -379,6 +379,44 @@ def test_collect_historical_enis_disabled_returns_empty(monkeypatch):
     assert called == []  # no CloudTrail calls when reconstruction is off
 
 
+def test_enis_from_events_tolerates_malformed_set_items():
+    # Real CloudTrail can carry a bare string where a {key, value} / {networkInterfaceId} object is
+    # expected inside a *Set.items[]. The parser must skip the junk entry, not crash, and still
+    # reconstruct the well-formed parts alongside it.
+    from cloudbreachgraph.aws.cloudtrail_enis import enis_from_events
+
+    detail = {
+        "eventName": "RunInstances",
+        "eventTime": "2026-05-10T00:00:00+00:00",
+        "responseElements": {
+            "instancesSet": {
+                "items": [
+                    "a-bare-string-instance",  # junk sibling — must be skipped
+                    {
+                        "instanceId": "i-1",
+                        "tagSet": {
+                            "items": [
+                                "a-bare-string-tag",  # junk sibling — must be skipped
+                                {"key": "aws:autoscaling:groupName", "value": "web-asg"},
+                            ]
+                        },
+                        "networkInterfaceSet": {
+                            "items": [
+                                "a-bare-string-nif",  # junk sibling — must be skipped
+                                {"networkInterfaceId": "eni-1", "privateIpAddress": "10.0.0.5"},
+                            ]
+                        },
+                    },
+                ]
+            }
+        },
+    }
+    recs = enis_from_events([{"CloudTrailEvent": json.dumps(detail)}])
+    assert [r["NetworkInterfaceId"] for r in recs] == ["eni-1"]
+    assert recs[0]["AsgName"] == "web-asg"  # good tag still read past the bad string
+    assert recs[0]["PrivateIpAddresses"] == ["10.0.0.5"]
+
+
 def test_cloudtrail_lookback_is_always_ninety_days():
     collectors.set_flow_log_window(30)
     assert collectors._cloudtrail_lookback_days() == collectors.CLOUDTRAIL_MAX_LOOKBACK_DAYS
