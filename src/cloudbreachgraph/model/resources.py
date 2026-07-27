@@ -19,12 +19,23 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
-def _name_tag(tags: list[dict] | None) -> str | None:
-    """Return the value of the ``Name`` tag from an AWS ``Tags`` list, if present."""
+def _tag(tags: list[dict] | None, key: str) -> str | None:
+    """Return the value of the ``key`` tag from an AWS ``Tags`` list, if present."""
     for tag in tags or []:
-        if tag.get("Key") == "Name":
+        if tag.get("Key") == key:
             return tag.get("Value")
     return None
+
+
+def _name_tag(tags: list[dict] | None) -> str | None:
+    """Return the value of the ``Name`` tag from an AWS ``Tags`` list, if present."""
+    return _tag(tags, "Name")
+
+
+# The tag AWS Auto Scaling stamps on every instance it manages; the source of ASG membership for
+# *current* instances (``docs/02_architecture.md §5.7`` Part 4). Historical instances/ENIs carry the
+# same name reconstructed from the CloudTrail ``RunInstances`` ``tagSet``.
+_ASG_TAG = "aws:autoscaling:groupName"
 
 
 @dataclass
@@ -94,6 +105,7 @@ class Ec2Instance:
     vpc_id: str | None
     subnet_id: str | None
     name: str | None
+    asg_name: str | None = None
 
     @classmethod
     def from_collected(cls, d: dict[str, Any]) -> Ec2Instance:
@@ -104,6 +116,8 @@ class Ec2Instance:
             vpc_id=d.get("VpcId"),
             subnet_id=d.get("SubnetId"),
             name=_name_tag(d.get("Tags")),
+            # The Auto Scaling group this instance belongs to, from its tags (§5.7 Part 4).
+            asg_name=_tag(d.get("Tags"), _ASG_TAG),
         )
 
 
@@ -413,6 +427,51 @@ class IpAllocation:
             eni_id=d.get("NetworkInterfaceId"),
             private_ip=d.get("PrivateIpAddress"),
             allocated_at=d.get("AllocatedAt"),
+        )
+
+
+@dataclass
+class HistoricalEni:
+    """An ENI reconstructed from CloudTrail that existed in the analysis window (``§5.7`` Part 2).
+
+    Unlike a current :class:`Eni` (which comes from ``describe-network-interfaces`` and exists
+    *now*), a historical ENI is rebuilt from ``CreateNetworkInterface`` / ``RunInstances`` events
+    and may since have been **terminated**. Its lifetime is ``[created_at, deleted_at]`` (ISO
+    strings, either possibly ``None`` — unknown-created means "predates the window", unknown-deleted
+    means "still alive or delete not seen"). ``asg_name`` / ``instance_id`` carry the ASG membership
+    used by the collapse view (Part 4).
+    """
+
+    id: str
+    subnet_id: str | None
+    vpc_id: str | None
+    interface_type: str | None
+    description: str | None
+    requester_id: str | None
+    private_ips: list[str] = field(default_factory=list)
+    security_groups: list[str] = field(default_factory=list)
+    instance_id: str | None = None
+    asg_name: str | None = None
+    name: str | None = None
+    created_at: str | None = None
+    deleted_at: str | None = None
+
+    @classmethod
+    def from_collected(cls, d: dict[str, Any]) -> HistoricalEni:
+        return cls(
+            id=d.get("NetworkInterfaceId"),
+            subnet_id=d.get("SubnetId"),
+            vpc_id=d.get("VpcId"),
+            interface_type=d.get("InterfaceType"),
+            description=d.get("Description"),
+            requester_id=d.get("RequesterId"),
+            private_ips=[ip for ip in (d.get("PrivateIpAddresses") or []) if ip],
+            security_groups=[g for g in (d.get("Groups") or []) if g],
+            instance_id=d.get("InstanceId"),
+            asg_name=d.get("AsgName"),
+            name=d.get("Name"),
+            created_at=d.get("CreatedAt"),
+            deleted_at=d.get("DeletedAt"),
         )
 
 
