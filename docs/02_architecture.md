@@ -469,6 +469,26 @@ their ENIs are constantly replaced, so days of flow logs are full of records cap
    private IPs, and a sample of instance ids. Deterministic and idempotent; a graph built without the
    flag is byte-for-byte unchanged.
 
+5. **Unrecognised ENIs (guesses flagged for review).** An ENI created **outside** CloudTrail's 90-day
+   retention (a long-lived ASG/instance interface) appears in flow logs but can't be reconstructed by
+   step 3, so its records used to be **silently dropped** (`mapping/flowlogs.py::_map_connections`,
+   the `if not home ...: continue`). Instead, every flow-record `interface-id` that is in **neither**
+   the current nor the historical inventory is now surfaced as an `eni` node flagged
+   `unrecognised: true` / `origin: "flow_log"` / `needs_review: true`. Its own private IP is
+   **inferred** and recorded — clearly separated from confirmed data for audit — in a dedicated
+   `inferred_private_ips` list (`[{ip, method, confidence}]`), **never** in `private_ips` (which stays
+   empty; confirmed addresses only). The inference (`_infer_own_ip`) takes the address that **recurs**
+   across the ENI's records (its own IP is on every record, peers vary), preferring one inside a known
+   **VPC CIDR** (`method = "vpc_cidr"`, high confidence) over the bare most-recurring address
+   (`method = "recurring_side"`, low confidence). The inferred IP is added to the time-aware resolver
+   (unbounded lifetime), so the unrecognised ENI's own flows map and a peer matching that IP forms an
+   **ENI↔ENI** edge; a peer matching no ENI stays a `flow_peer`. Deterministic (sorted id order). The
+   guesses are what `cloudbreachgraph-merge` (§7) later confirms/replaces.
+
+The CloudTrail → ENI-record reconstruction of step 3 lives in one **shared, pure** function,
+`aws/cloudtrail_enis.py::enis_from_events(events) -> list[dict]`, used by **both** the live collector
+(`collect_historical_enis`) and the `cloudbreachgraph-merge` tool — one parser, no divergence.
+
 ## 6. Graph data model (Phase 2 defines, Phase 3 consumes)
 
 A minimal, serialization-friendly model:
@@ -486,7 +506,10 @@ Node:
   label: str            # human-friendly (Name tag or id)
   attributes: dict      # type-specific metadata (state, cidr, interface_type, synthetic, ...);
                         #   a reconstructed, now-terminated ENI/instance carries `historical: true`
-                        #   + `terminated_at` (§5.7.1), styled dashed/greyed in DOT/HTML
+                        #   + `terminated_at` (§5.7.1), styled dashed/greyed in DOT/HTML;
+                        #   an ENI seen only in flow logs carries `unrecognised: true` /
+                        #   `origin: "flow_log"` / `needs_review: true` with its guessed IP under
+                        #   `inferred_private_ips: [{ip, method, confidence}]` (§5.7.1 point 5)
 
 Edge:
   source: str           # node id
@@ -679,6 +702,26 @@ Requirements:
   same sorted/deterministic shape as every other writer. Read-only and AWS-free (local file
   I/O only). Known limitation: literal-substring replacement can over-match a human name that
   is also a substring of structural text (e.g. a VPC named `network`).
+- **Merging offline sources into existing output** (`cloudbreachgraph-merge`, `merge.py`): an
+  auxiliary console entry point that enriches a previously written `graph.json` from **either or
+  both** of two AWS-free sources, producing a new merged `graph.json`:
+  `cloudbreachgraph-merge graph.json --data data.json --cloudtrail ct.json -o merged.json`. The
+  **`--data`** file (`{"enis": [{id, private_ips, owner, asg, subnet_id, vpc_id}]}`) is the operator's
+  ground truth for ENIs the tool couldn't resolve; the **`--cloudtrail`** file is a set of older
+  CloudTrail `lookup-events` (further in the past than the live 90-day window) reconstructed through
+  the **same shared parser** as the live collector (`aws/cloudtrail_enis.py::enis_from_events` — one
+  reconstruction, §5.7.1). Both may be given in tandem; either may be omitted. For every ENI a source
+  confirms, the merge **adds or upgrades** its `eni` node — a matching `unrecognised` node has its
+  guessed `inferred_private_ips` replaced by the confirmed `private_ips` and its `unrecognised` /
+  `needs_review` flags cleared (`origin` records which source confirmed it) — **absorbs the guesses it
+  displaces** (an external `flow_peer`, or a `/32` `cidr` reachability source, whose IP the ENI
+  actually owns is removed and its edges re-pointed to the ENI), and **attaches the owner**
+  (`attached_to`) plus **ASG membership** (`asg_name` on the ENI + its instance, ready for
+  `--collapse-asgs`), placing the ENI in its subnet/VPC. `--template` emits a skeleton `--data` file
+  of the graph's `needs_review` ENIs (echoing the inferred guesses as a hint) to fill in and feed
+  back. A rebuild-style view transform like `mapping/collapse.py`: deterministic, read-only and
+  AWS-free (local file I/O only), output round-tripped through `write_json`; with no informative
+  input the graph is returned byte-for-byte unchanged.
 
 ## 8. Regions
 

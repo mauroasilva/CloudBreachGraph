@@ -27,11 +27,12 @@ reshapes an in-memory :class:`~cloudbreachgraph.model.graph.Graph`.
 
 from __future__ import annotations
 
+import ipaddress
 from dataclasses import dataclass, field
 from datetime import datetime
 
 from ..model.graph import Edge, Graph, Node
-from ..model.resources import Eni, FlowLog, FlowLogRecord, HistoricalEni, IpAllocation
+from ..model.resources import Eni, FlowLog, FlowLogRecord, HistoricalEni, IpAllocation, Vpc
 
 # Protocol numbers we bother to name in a port label; anything else keeps its number.
 _PROTO_NAMES = {"1": "icmp", "6": "tcp", "17": "udp", "58": "icmpv6"}
@@ -174,12 +175,18 @@ def map_flow_logs(
     allocations: list[IpAllocation],
     records: list[FlowLogRecord],
     historical: list[HistoricalEni] | None = None,
+    vpcs: list[Vpc] | None = None,
 ) -> None:
     """Fold IP history, per-VPC flow-log config, and observed connections into ``graph`` (§5.7).
 
     ``historical`` are the CloudTrail-reconstructed ENIs; the caller (``mapping/builder.py``) is
     responsible for having already added their **nodes** (flagged ``historical``/terminated), so
     here they only feed the time-indexed resolver and the connection edges.
+
+    ``vpcs`` supply the VPC CIDRs used to infer an **unrecognised ENI**'s own IP: any flow-record
+    ``interface-id`` that is in neither the current nor the historical inventory is surfaced as an
+    ``eni`` node flagged ``unrecognised``/``needs_review`` — never silently dropped — with any
+    guessed IP recorded (separately, flagged) under ``inferred_private_ips`` for the user to audit.
     """
     historical = historical or []
 
@@ -187,6 +194,10 @@ def map_flow_logs(
     _attach_flow_log_config_to_vpcs(graph, flow_logs)
 
     inventory = _build_inventory(enis, alloc_start, historical)
+    # Surface every unrecognised ENI (a flow-record home id we don't know) before resolving
+    # connections, so its own flows map and its inferred IP can form ENI↔ENI edges with peers.
+    _add_unrecognised_enis(graph, records, inventory, _vpc_networks(vpcs or []))
+    inventory.index()  # re-index: the unrecognised entries added new IP→ENI mappings
     _map_connections(graph, records, inventory)
 
 
@@ -315,6 +326,103 @@ def _attach_flow_log_config_to_vpcs(graph: Graph, flow_logs: list[FlowLog]) -> N
     for vpc_id, entries in by_vpc.items():
         graph.get_node(vpc_id).attributes["flow_logs"] = sorted(
             entries, key=lambda e: e["flow_log_id"] or ""
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Unrecognised ENIs — surface (never drop) a flow-record home id we don't know (§5.7)
+# --------------------------------------------------------------------------- #
+def _vpc_networks(vpcs: list[Vpc]) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
+    """The parsed CIDR networks of the collected VPCs (skipping any without a usable CIDR)."""
+    nets: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+    for vpc in vpcs:
+        if vpc.cidr:
+            try:
+                nets.append(ipaddress.ip_network(vpc.cidr, strict=False))
+            except ValueError:
+                continue
+    return nets
+
+
+def _in_any_network(addr: str, nets: list[ipaddress.IPv4Network | ipaddress.IPv6Network]) -> bool:
+    """Whether ``addr`` parses to an IP inside any of ``nets`` (a known VPC CIDR)."""
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return False
+    return any(ip.version == net.version and ip in net for net in nets)
+
+
+def _infer_own_ip(
+    records: list[FlowLogRecord],
+    nets: list[ipaddress.IPv4Network | ipaddress.IPv6Network],
+) -> dict[str, str] | None:
+    """Guess an unrecognised ENI's own private IP from the flows captured on it, flagging *how*.
+
+    Every flow captured on the ENI has the ENI's own address on one side and a peer on the other, so
+    the ENI's IP is the address that **recurs** across its records. Preferring an address that also
+    falls inside a **known VPC CIDR** (``method = "vpc_cidr"``, high confidence) pins the internal
+    side; with no VPC-internal candidate we fall back to the most-recurring address overall
+    (``method = "recurring_side"``, low confidence). Returns ``{"ip", "method", "confidence"}`` or
+    ``None`` when the records carry no address at all. Deterministic (ties break to the lexically
+    smallest address)."""
+    freq: dict[str, int] = {}
+    for rec in records:
+        for addr in (rec.srcaddr, rec.dstaddr):
+            if addr:
+                freq[addr] = freq.get(addr, 0) + 1
+    if not freq:
+        return None
+    in_vpc = [a for a in freq if _in_any_network(a, nets)]
+    if in_vpc:
+        own = min(in_vpc, key=lambda a: (-freq[a], a))
+        return {"ip": own, "method": "vpc_cidr", "confidence": "high"}
+    own = min(freq, key=lambda a: (-freq[a], a))
+    return {"ip": own, "method": "recurring_side", "confidence": "low"}
+
+
+def _add_unrecognised_enis(
+    graph: Graph,
+    records: list[FlowLogRecord],
+    inventory: _Inventory,
+    nets: list[ipaddress.IPv4Network | ipaddress.IPv6Network],
+) -> None:
+    """Emit an ``eni`` node for every flow-record home id not in the combined inventory (§5.7).
+
+    ENIs created outside CloudTrail retention (long-lived ASG/instance interfaces) can't be
+    reconstructed, so their flow records used to be silently dropped. Instead, each such
+    ``interface-id`` becomes an ``eni`` node flagged ``unrecognised: true`` / ``origin: "flow_log"``
+    / ``needs_review: true``; any inferred IP goes under ``inferred_private_ips`` (with ``method`` +
+    ``confidence``) — **never** in ``private_ips`` (kept empty; confirmed addresses only). The
+    inferred IP is added to the resolver's inventory (unbounded lifetime) so the ENI's own flows map
+    and a peer matching that IP forms an ENI↔ENI edge. Deterministic: processed in sorted id order.
+    """
+    records_by_eni: dict[str, list[FlowLogRecord]] = {}
+    for rec in records:
+        if rec.interface_id:
+            records_by_eni.setdefault(rec.interface_id, []).append(rec)
+
+    for eni_id in sorted(records_by_eni):
+        if eni_id in inventory.entries:
+            continue  # a current or historical ENI — already a (richer) node
+        inferred = _infer_own_ip(records_by_eni[eni_id], nets)
+        inferred_list = [inferred] if inferred is not None else []
+        entry = inventory._entry(eni_id)  # created/deleted stay None -> alive at every record time
+        if inferred is not None:
+            entry.ips.add(inferred["ip"])
+        graph.add_node(
+            Node(
+                id=eni_id,
+                type="eni",
+                label=eni_id,
+                attributes={
+                    "unrecognised": True,
+                    "origin": "flow_log",
+                    "needs_review": True,
+                    "private_ips": [],  # confirmed only — a guess never lands here
+                    "inferred_private_ips": inferred_list,
+                },
+            )
         )
 
 

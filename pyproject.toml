@@ -32,6 +32,8 @@ cloudbreachgraph = "cloudbreachgraph.cli:main"
 cloudbreachgraph-to-html = "cloudbreachgraph.convert:main"
 # Auxiliary tool: anonymise an existing graph.json into a shareable example graph.
 cloudbreachgraph-anonymize = "cloudbreachgraph.anonymize:main"
+# Auxiliary tool: merge a graph.json with a user data file and/or older CloudTrail logs.
+cloudbreachgraph-merge = "cloudbreachgraph.merge:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

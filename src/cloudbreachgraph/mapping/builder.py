@@ -356,7 +356,15 @@ def build_graph(
         # nodes before analysing connections, so a flow's peer can resolve to one of them (§5.7).
         current_eni_ids = {e.id for e in enis if e.id}
         _map_historical_enis(graph, historical, current_eni_ids, subnets, vpcs, instances)
-        flowlogs.map_flow_logs(graph, enis, flow_log_models, allocations, records, historical)
+        flowlogs.map_flow_logs(
+            graph,
+            enis,
+            flow_log_models,
+            allocations,
+            records,
+            historical,
+            vpcs=list(vpcs.values()),
+        )
         graph.meta.setdefault("flow_log_window_days", get_flow_log_window())
         graph.meta.setdefault("cloudtrail_window_days", CLOUDTRAIL_MAX_LOOKBACK_DAYS)
 
