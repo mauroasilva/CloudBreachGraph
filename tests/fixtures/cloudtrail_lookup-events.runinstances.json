@@ -1,0 +1,10 @@
+{
+  "Events": [
+    {
+      "EventId": "bbbbbbbb-0000-0000-0000-000000000001",
+      "EventName": "RunInstances",
+      "EventTime": "2026-05-10T00:00:00+00:00",
+      "CloudTrailEvent": "{\"eventTime\": \"2026-05-10T00:00:00+00:00\", \"eventName\": \"RunInstances\", \"responseElements\": {\"instancesSet\": {\"items\": [{\"instanceId\": \"i-0asg00000000001\", \"tagSet\": {\"items\": [{\"key\": \"aws:autoscaling:groupName\", \"value\": \"web-asg\"}, {\"key\": \"Name\", \"value\": \"web-asg-node\"}]}, \"networkInterfaceSet\": {\"items\": [{\"networkInterfaceId\": \"eni-0asg00000000001\", \"privateIpAddress\": \"10.0.9.11\", \"subnetId\": \"subnet-011111111111111\", \"vpcId\": \"vpc-0aaaaaaaaaaaaaaaa\", \"groupSet\": {\"items\": [{\"groupId\": \"sg-0aaa0001\"}]}}]}}, {\"instanceId\": \"i-0asg00000000002\", \"tagSet\": {\"items\": [{\"key\": \"aws:autoscaling:groupName\", \"value\": \"web-asg\"}]}, \"networkInterfaceSet\": {\"items\": [{\"networkInterfaceId\": \"eni-0asg00000000002\", \"privateIpAddress\": \"10.0.9.12\", \"subnetId\": \"subnet-022222222222222\", \"vpcId\": \"vpc-0aaaaaaaaaaaaaaaa\", \"groupSet\": {\"items\": []}}]}}]}}}"
+    }
+  ]
+}

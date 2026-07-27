@@ -1,0 +1,10 @@
+{
+  "Events": [
+    {
+      "EventId": "cccccccc-0000-0000-0000-000000000001",
+      "EventName": "TerminateInstances",
+      "EventTime": "2026-06-20T00:00:00+00:00",
+      "CloudTrailEvent": "{\"eventTime\": \"2026-06-20T00:00:00+00:00\", \"eventName\": \"TerminateInstances\", \"requestParameters\": {\"instancesSet\": {\"items\": [{\"instanceId\": \"i-0asg00000000002\"}]}}}"
+    }
+  ]
+}
