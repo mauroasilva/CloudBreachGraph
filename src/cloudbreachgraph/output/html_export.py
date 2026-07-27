@@ -93,6 +93,8 @@ _TYPE_COLORS: dict[str, str] = {
     # NAT gateways / VPC endpoints share the load balancer's role class (§5.4), distinct fills.
     "nat_gateway": "#80CBC4",
     "vpc_endpoint": "#9FA8DA",
+    # A collapsed Auto Scaling group (§5.7 Part 4) — a whole fleet's instances + ENIs as one node.
+    "autoscaling_group": "#BCAAA4",  # taupe, matching dot_export
     # Reachability sources (docs/02_architecture.md §5.5) — who can reach an ENI.
     "internet": "#EF9A9A",
     "cidr": "#FFE082",
@@ -101,6 +103,8 @@ _TYPE_COLORS: dict[str, str] = {
     "flow_peer": "#B0BEC5",
 }
 _DEFAULT_COLOR = "#CFD8DC"
+# Fill for a reconstructed, now-terminated resource (§5.7) — greyed so it reads as faded/gone.
+_HISTORICAL_COLOR = "#B0BEC5"
 
 # Node types on the outermost *IP-source* ring (§5.5/§5.7): reachability sources (internet/cidr)
 # plus flow-log peers (external addresses observed talking to an ENI). Security groups are their own
@@ -119,6 +123,7 @@ _NODE_RADII: dict[str, float] = {
     "load_balancer": 13.0,
     "nat_gateway": 13.0,  # same role class / ring as the load balancer (§5.4)
     "vpc_endpoint": 13.0,
+    "autoscaling_group": 15.0,  # a whole fleet — drawn a touch larger (§5.7 Part 4)
     "ec2_instance": 11.0,
     "subnet": 11.0,
 }
@@ -137,8 +142,15 @@ def _view_data(graph: Graph) -> dict:
             "id": n.id,
             "type": n.type,
             "label": n.label,
-            "color": _TYPE_COLORS.get(n.type, _DEFAULT_COLOR),
+            # Reconstructed, now-terminated ENIs/instances (§5.7) render greyed + dashed so they
+            # read as faded next to live peers, matching the DOT view.
+            "color": (
+                _HISTORICAL_COLOR
+                if n.attributes.get("historical")
+                else _TYPE_COLORS.get(n.type, _DEFAULT_COLOR)
+            ),
             "synthetic": bool(n.attributes.get("synthetic")),
+            "historical": bool(n.attributes.get("historical")),
             "public": bool(n.attributes.get("public_ips")),
             "detail": _detail_line(n.type, n.attributes),
         }
@@ -156,7 +168,11 @@ def _detail_line(node_type: str, attrs: dict) -> str:
             bits.append("priv " + ", ".join(attrs["private_ips"]))
         if attrs.get("public_ips"):
             bits.append("pub " + ", ".join(attrs["public_ips"]))
+        if attrs.get("historical"):  # terminated — no dates in the display view (JSON-only)
+            bits.append("terminated")
         return " · ".join(bits)
+    if node_type == "autoscaling_group":
+        return f"{attrs.get('instance_count', 0)} inst · {attrs.get('eni_count', 0)} ENIs"
     if node_type == "load_balancer" and attrs.get("lb_type"):
         return str(attrs["lb_type"])
     if node_type == "nat_gateway" and attrs.get("state"):
@@ -871,6 +887,10 @@ def _vpc_group_of(graph: Graph) -> dict[str, str]:
             g = _vpc_of_sg(n.id)
         elif n.type == "flow_peer":  # trace to the VPC of the ENI it exchanges flows with (§5.7)
             g = _vpc_of_eni(peer_eni.get(n.id))
+        elif (
+            n.type == "autoscaling_group"
+        ):  # a collapsed fleet: its own vpc_id / its in_subnet edge
+            g = n.attributes.get("vpc_id") or subnet_vpc.get(eni_subnet.get(n.id, ""))
         elif n.type in _REACH_TYPES:
             g = _vpc_of_source(n.id)
         else:
@@ -2784,8 +2804,8 @@ function draw() {
     ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
     ctx.fillStyle = n.color; ctx.fill();
     if (n.public) { ctx.lineWidth = 2.5; ctx.strokeStyle = "#e53935"; ctx.stroke(); }
-    ctx.lineWidth = n.synthetic ? 1.5 : 1;
-    ctx.setLineDash(n.synthetic ? [3, 3] : []);
+    ctx.lineWidth = (n.synthetic || n.historical) ? 1.5 : 1;
+    ctx.setLineDash((n.synthetic || n.historical) ? [3, 3] : []);
     ctx.strokeStyle = "#37474f"; ctx.stroke(); ctx.setLineDash([]);
     if (showLabels) {
       ctx.fillStyle = getComputedStyle(document.body).color;
@@ -3101,8 +3121,8 @@ function draw() {
     ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
     ctx.fillStyle = n.color; ctx.fill();
     if (n.public) { ctx.lineWidth = 2.5; ctx.strokeStyle = "#e53935"; ctx.stroke(); }
-    ctx.lineWidth = n.synthetic ? 1.5 : 1;
-    ctx.setLineDash(n.synthetic ? [3, 3] : []);
+    ctx.lineWidth = (n.synthetic || n.historical) ? 1.5 : 1;
+    ctx.setLineDash((n.synthetic || n.historical) ? [3, 3] : []);
     ctx.strokeStyle = "#37474f"; ctx.stroke(); ctx.setLineDash([]);
     if (showLabels) {
       ctx.fillStyle = getComputedStyle(document.body).color;

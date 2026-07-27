@@ -2,24 +2,24 @@
 
 This is the mapping half of the ``flow_logs`` role (the collectors are in
 ``aws/collectors.py``). Given the collected flow-log *configuration*, the per-ENI IP-allocation
-events, and the parsed flow-log *records*, :func:`map_flow_logs` folds three things into the
-already-built graph:
+events, the **historical ENIs** reconstructed from CloudTrail, and the parsed flow-log *records*,
+:func:`map_flow_logs` folds three things into the already-built graph:
 
-1. **IP history** — each ENI node gains an ``ip_history`` attribute: ``{ip: {"start", "end"}}`` for
-   every address it has held (from CloudTrail ``CreateNetworkInterface`` events). JSON-only; the
-   DOT/HTML views show only the ENI's *current* private IPs.
+1. **IP history** — each *current* ENI node gains an ``ip_history`` attribute: ``{ip: {"start",
+   "end"}}`` for every address it has held (from CloudTrail ``CreateNetworkInterface`` events).
+   JSON-only; the DOT/HTML views show only the ENI's *current* private IPs.
 2. **Flow-log configuration** — *not* separate nodes: each flow log's destination (where the logs
    are stored) is recorded as a ``flow_logs`` **attribute on the VPC** that owns the logged resource
-   (a VPC-, subnet- or ENI-scoped flow log all attach to their VPC). So the map answers "where does
-   this VPC store its logs?" on the VPC itself.
-3. **Observed connections** — for every flow record captured on a collected ENI, from the moment its
-   IP was allocated onward (clamped to at most 60 days, ``collectors.FLOW_LOG_MAX_LOOKBACK_DAYS``),
-   the *peer* end of the flow becomes a directed ``connects_to`` edge. When the peer IP belongs to
-   **another collected ENI** — *and that ENI already held the IP at the record's time* — the edge
-   runs **ENI → ENI** directly (no new node); otherwise the peer is an external ``flow_peer`` node.
-   A record whose peer IP currently belongs to an ENI but was allocated to it *after* the record was
-   captured is a **historic-IP reuse** and is dropped, so the map never links a current ENI through
-   an address it didn't own at the time.
+   (a VPC-, subnet- or ENI-scoped flow log all attach to their VPC).
+3. **Observed connections** — for every flow record captured on an ENI (current **or** reconstructed
+   historical), the *peer* end of the flow becomes a directed ``connects_to`` edge. IP→ENI
+   resolution is **time-aware**: the peer IP resolves to whichever ENI held it **at the record's
+   timestamp** (a :class:`_Inventory` time-indexed resolver over the combined current ∪ historical
+   inventory), so a reused ASG IP is attributed to the ENI that actually owned it then — an
+   **ENI → ENI** edge (no ``flow_peer``) when the peer was an ENI in the window. Only when *no* ENI
+   held the IP at that time does the peer become an external ``flow_peer`` node — unless the IP is
+   known to be internal (some inventory ENI held it at another time), in which case the record is
+   dropped rather than inventing a spurious external peer.
 
 The transform is deterministic (sorted iteration, aggregated port labels) and read-only — it only
 reshapes an in-memory :class:`~cloudbreachgraph.model.graph.Graph`.
@@ -27,10 +27,11 @@ reshapes an in-memory :class:`~cloudbreachgraph.model.graph.Graph`.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from datetime import datetime
 
 from ..model.graph import Edge, Graph, Node
-from ..model.resources import Eni, FlowLog, FlowLogRecord, IpAllocation
+from ..model.resources import Eni, FlowLog, FlowLogRecord, HistoricalEni, IpAllocation
 
 # Protocol numbers we bother to name in a port label; anything else keeps its number.
 _PROTO_NAMES = {"1": "icmp", "6": "tcp", "17": "udp", "58": "icmpv6"}
@@ -57,49 +58,171 @@ def _epoch(iso: str | None) -> int | None:
         return None
 
 
+# --------------------------------------------------------------------------- #
+# Combined ENI inventory + time-indexed IP→ENI resolver (§5.7 Part 3)
+# --------------------------------------------------------------------------- #
+@dataclass
+class _Entry:
+    """One ENI in the combined inventory, with the lifetime bounds resolution keys on.
+
+    ``created``/``deleted`` are epoch seconds (either possibly ``None`` — unknown-created means
+    "predates the window / held throughout"; unknown-deleted means "still alive"). ``ips`` is every
+    private IP the ENI is known to have held (current ∪ reconstructed)."""
+
+    eni_id: str
+    ips: set[str] = field(default_factory=set)
+    created: int | None = None
+    deleted: int | None = None
+    historical: bool = False
+
+
+class _Inventory:
+    """The combined current ∪ historical ENI inventory + a time-indexed IP→ENI resolver.
+
+    Subsumes the old ``ip_to_eni`` dict + ``ip_alloc_epoch`` temporal guard: :meth:`resolve`
+    answers "which ENI held this IP at time ``t``", disambiguating a reused ASG IP by lifetime.
+    """
+
+    def __init__(self) -> None:
+        self.entries: dict[str, _Entry] = {}
+        self._ip_index: dict[str, list[str]] = {}
+
+    def _entry(self, eni_id: str) -> _Entry:
+        entry = self.entries.get(eni_id)
+        if entry is None:
+            entry = _Entry(eni_id)
+            self.entries[eni_id] = entry
+        return entry
+
+    def add_current(self, eni_id: str, ips: set[str], created: int | None) -> None:
+        entry = self._entry(eni_id)
+        entry.ips |= ips
+        entry.created = _min_epoch(entry.created, created)
+        entry.deleted = None  # a current ENI exists now — never terminated
+        entry.historical = entry.historical and False
+
+    def add_historical(
+        self, eni_id: str, ips: set[str], created: int | None, deleted: int | None
+    ) -> None:
+        existing = self.entries.get(eni_id)
+        if existing is not None:
+            # Also a current ENI (same id): enrich its IPs/created, keep it alive (deleted stays).
+            existing.ips |= ips
+            existing.created = _min_epoch(existing.created, created)
+            return
+        self.entries[eni_id] = _Entry(eni_id, set(ips), created, deleted, historical=True)
+
+    def index(self) -> None:
+        """Build the IP → [eni ids] index (sorted, so resolution ties break deterministically)."""
+        self._ip_index = {}
+        for entry in self.entries.values():
+            for ip in entry.ips:
+                self._ip_index.setdefault(ip, []).append(entry.eni_id)
+        for ids in self._ip_index.values():
+            ids.sort()
+
+    def ever_internal(self, ip: str) -> bool:
+        """Whether *any* inventory ENI (current or historical) ever held ``ip``."""
+        return ip in self._ip_index
+
+    @staticmethod
+    def alive_at(entry: _Entry, t: int | None) -> bool:
+        """Whether ``entry``'s ``[created, deleted]`` lifetime contains time ``t``.
+
+        Unknown ``t`` (a record with no ``start``) can't be clamped, so it always passes."""
+        if t is None:
+            return True
+        if entry.created is not None and t < entry.created:
+            return False
+        if entry.deleted is not None and t > entry.deleted:
+            return False
+        return True
+
+    def resolve(self, ip: str, t: int | None) -> str | None:
+        """The ENI that held ``ip`` at time ``t`` — the time-aware IP→ENI resolution.
+
+        Among the ENIs that ever held ``ip``, keep those whose lifetime covers ``t``; tie-break to
+        the **latest ``created`` ≤ ``t``** (an unknown ``created`` sorts earliest). ``None`` when no
+        ENI held ``ip`` at ``t`` (so the caller falls back to a ``flow_peer`` — or drops the record
+        if the IP is otherwise internal)."""
+        candidates = [
+            self.entries[eid]
+            for eid in self._ip_index.get(ip, [])
+            if ip in self.entries[eid].ips and self.alive_at(self.entries[eid], t)
+        ]
+        if not candidates and t is None:
+            return None
+        if not candidates:
+            return None
+        # Prefer a still-alive (current) ENI when the time is unknown; else latest created ≤ t.
+        if t is None:
+            current = [e for e in candidates if e.deleted is None]
+            candidates = current or candidates
+        candidates.sort(key=lambda e: (e.created if e.created is not None else -1, e.eni_id))
+        return candidates[-1].eni_id
+
+
+def _min_epoch(a: int | None, b: int | None) -> int | None:
+    vals = [x for x in (a, b) if x is not None]
+    return min(vals) if vals else None
+
+
 def map_flow_logs(
     graph: Graph,
     enis: list[Eni],
     flow_logs: list[FlowLog],
     allocations: list[IpAllocation],
     records: list[FlowLogRecord],
+    historical: list[HistoricalEni] | None = None,
 ) -> None:
-    """Fold IP history, per-VPC flow-log config, and observed connections into ``graph`` (§5.7)."""
-    ip_to_eni: dict[str, str] = {}
-    eni_ips: dict[str, set[str]] = {}
-    for eni in enis:
-        if not eni.id:
-            continue
-        ips = {ip for ip in eni.private_ips if ip}
-        eni_ips[eni.id] = ips
-        for ip in ips:
-            ip_to_eni.setdefault(ip, eni.id)
+    """Fold IP history, per-VPC flow-log config, and observed connections into ``graph`` (§5.7).
 
-    # When each *current* ENI IP was allocated (keyed by the IP itself — an IP maps to one ENI).
-    # Used to reject a flow whose peer IP belonged to that ENI only *after* the flow was captured.
-    ip_alloc_epoch: dict[str, int] = {}
-    for alloc in allocations:
-        ep = _epoch(alloc.allocated_at)
-        if alloc.private_ip and ep is not None:
-            # If an IP appears in several events, keep the earliest allocation.
-            ip_alloc_epoch[alloc.private_ip] = min(ep, ip_alloc_epoch.get(alloc.private_ip, ep))
+    ``historical`` are the CloudTrail-reconstructed ENIs; the caller (``mapping/builder.py``) is
+    responsible for having already added their **nodes** (flagged ``historical``/terminated), so
+    here they only feed the time-indexed resolver and the connection edges.
+    """
+    historical = historical or []
 
     alloc_start = _map_ip_history(graph, enis, allocations)
     _attach_flow_log_config_to_vpcs(graph, flow_logs)
-    _map_connections(graph, records, ip_to_eni, eni_ips, alloc_start, ip_alloc_epoch)
+
+    inventory = _build_inventory(enis, alloc_start, historical)
+    _map_connections(graph, records, inventory)
+
+
+def _build_inventory(
+    enis: list[Eni], alloc_start: dict[str, int], historical: list[HistoricalEni]
+) -> _Inventory:
+    """Combine current ENIs (alive; created from CloudTrail) and historical ENIs (w/ lifetimes)."""
+    inv = _Inventory()
+    for eni in enis:
+        if not eni.id:
+            continue
+        inv.add_current(eni.id, {ip for ip in eni.private_ips if ip}, alloc_start.get(eni.id))
+    for h in historical:
+        if not h.id:
+            continue
+        inv.add_historical(
+            h.id,
+            {ip for ip in h.private_ips if ip},
+            _epoch(h.created_at),
+            _epoch(h.deleted_at),
+        )
+    inv.index()
+    return inv
 
 
 def _map_ip_history(
     graph: Graph, enis: list[Eni], allocations: list[IpAllocation]
 ) -> dict[str, int]:
-    """Attach an ``ip_history`` dict to **every** ENI node; return the earliest alloc epoch per ENI.
+    """Attach an ``ip_history`` dict to **every** current ENI node; return the earliest alloc epoch.
 
     ``ip_history`` maps each IP the ENI has held to ``{"start", "end"}`` ISO timestamps: ``start``
     is when it was allocated (from CloudTrail, ``None`` if unknown), ``end`` is ``None`` while the
     ENI still holds the IP (its *current* addresses) else the allocation time of the IP that
-    superseded it. This is the full history for the JSON output only — the DOT/HTML views show the
-    *current* private IPs. The returned earliest-alloc epoch per ENI bounds how far back that ENI's
-    flow records are analysed (traffic before its IP existed is a different interface's, dropped).
+    superseded it. JSON-only. The returned earliest-alloc epoch per ENI is the current ENI's
+    ``created`` bound for the combined inventory (traffic before its IP existed is a different
+    interface's).
     """
     by_eni: dict[str, list[IpAllocation]] = {}
     for alloc in allocations:
@@ -195,61 +318,56 @@ def _attach_flow_log_config_to_vpcs(graph: Graph, flow_logs: list[FlowLog]) -> N
         )
 
 
-def _map_connections(
-    graph: Graph,
-    records: list[FlowLogRecord],
-    ip_to_eni: dict[str, str],
-    eni_ips: dict[str, set[str]],
-    alloc_start: dict[str, int],
-    ip_alloc_epoch: dict[str, int],
-) -> None:
+def _map_connections(graph: Graph, records: list[FlowLogRecord], inventory: _Inventory) -> None:
     """Turn flow records into ``connects_to`` edges (+ ``flow_peer`` nodes for external peers).
 
-    For each record captured on a collected ENI ``A``, the *peer* end (the address that is not
-    ``A``'s) becomes the other node. A peer IP that belongs to another collected ENI ``B`` yields a
-    direct **ENI → ENI** edge — but only if ``B`` already held that IP when the flow was captured
-    (else the record is a historic-IP reuse and is dropped). Otherwise the peer is an external
-    ``flow_peer`` node. Ports are aggregated per directed edge so repeated flows collapse to one
-    edge with a merged port label.
+    For each record captured on an ENI ``A`` (current or historical — the *home*, resolved by
+    ``interface-id``), the *peer* end (the address that isn't one of ``A``'s) is resolved **at the
+    record's time** via :meth:`_Inventory.resolve`:
+
+    * home ``A`` must have been **alive** when the flow was captured (its lifetime covers
+      ``rec.start``); else the record belonged to a different interface and is dropped;
+    * a peer IP that resolves to an ENI ``B`` (that held it at ``rec.start``) yields a direct
+      **ENI → ENI** edge — even when ``B`` is now terminated;
+    * otherwise the peer is an external ``flow_peer`` node — unless the IP is otherwise internal
+      (held by some inventory ENI at another time), in which case the record is dropped so a reused
+      internal address never surfaces as a spurious external peer.
+
+    Ports are aggregated per directed edge so repeated flows collapse to one edge.
     """
     # (source_id, target_id) -> {ports, peer_ip (set only for a flow_peer node)}
     agg: dict[tuple[str, str], dict] = {}
 
     for rec in records:
-        home = rec.interface_id
-        if not home or home not in eni_ips:
-            continue
-        ips = eni_ips[home]
+        home = inventory.entries.get(rec.interface_id) if rec.interface_id else None
+        if home is None:
+            continue  # the home ENI isn't in the combined inventory — nothing to anchor on
+        if not inventory.alive_at(home, rec.start):
+            continue  # home ENI didn't exist at record time — a different interface's traffic
 
-        if rec.dstaddr in ips:
+        if rec.dstaddr in home.ips:
             peer_ip, inbound = rec.srcaddr, True
-        elif rec.srcaddr in ips:
+        elif rec.srcaddr in home.ips:
             peer_ip, inbound = rec.dstaddr, False
         else:
             continue  # record isn't about this ENI's own addresses
         if not peer_ip:
             continue
 
-        # Clamp to the home ENI's IP-allocation window: drop traffic seen before its IP existed.
-        start_bound = alloc_start.get(home)
-        if start_bound is not None and rec.start is not None and rec.start < start_bound:
-            continue
-
-        peer_eni = ip_to_eni.get(peer_ip)
-        if peer_eni == home:
+        peer_eni = inventory.resolve(peer_ip, rec.start)
+        if peer_eni == home.eni_id:
             continue  # a flow between this ENI's own addresses — no peer
 
         if peer_eni is not None:
-            # Temporal guard: only link to the peer ENI if it already held this IP at record time.
-            # A known allocation *after* the flow means the IP was a different interface's then.
-            peer_alloc = ip_alloc_epoch.get(peer_ip)
-            if peer_alloc is not None and rec.start is not None and rec.start < peer_alloc:
-                continue  # historic-IP reuse — don't link the current ENI through a stale address
-            src, tgt = (peer_eni, home) if inbound else (home, peer_eni)
+            src, tgt = (peer_eni, home.eni_id) if inbound else (home.eni_id, peer_eni)
             peer_node_ip = None
+        elif inventory.ever_internal(peer_ip):
+            # Internal IP, but no ENI held it at record time — historic reuse / lifetime gap. Drop
+            # rather than invent an external peer for an address that is really an ENI's.
+            continue
         else:
             peer_id = f"flow-peer:{peer_ip}"
-            src, tgt = (peer_id, home) if inbound else (home, peer_id)
+            src, tgt = (peer_id, home.eni_id) if inbound else (home.eni_id, peer_id)
             peer_node_ip = peer_ip
 
         entry = agg.setdefault((src, tgt), {"ports": set(), "peer_ip": peer_node_ip})
