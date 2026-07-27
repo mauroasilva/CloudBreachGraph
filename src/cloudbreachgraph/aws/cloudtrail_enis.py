@@ -66,15 +66,28 @@ def _earliest(*isos: str | None) -> str | None:
     return min(vals) if vals else None
 
 
+def _dict_items(container: Any) -> list[dict]:
+    """The ``.items[]`` of a CloudTrail ``*Set`` element, keeping only the dict entries.
+
+    Real CloudTrail responses are occasionally malformed — a ``tagSet``/``networkInterfaceSet`` item
+    can arrive as a bare string instead of the expected ``{key: ...}`` object. Filtering to dicts
+    here keeps every ``.get`` caller from crashing on such an entry (it is simply skipped).
+    ``container`` may itself be the ``{"items": [...]}`` object or, legacy, a bare list."""
+    if isinstance(container, dict):
+        items = container.get("items", [])
+    elif isinstance(container, list):
+        items = container
+    else:
+        items = []
+    return [x for x in items if isinstance(x, dict)]
+
+
 def _iface_ips(iface: dict) -> list[str]:
     """The private IPs on a CloudTrail ``networkInterface`` element (primary + secondary set)."""
     ips: list[str] = []
     for candidate in (
         iface.get("privateIpAddress"),
-        *(
-            item.get("privateIpAddress")
-            for item in (iface.get("privateIpAddressesSet") or {}).get("items", [])
-        ),
+        *(item.get("privateIpAddress") for item in _dict_items(iface.get("privateIpAddressesSet"))),
     ):
         if candidate and candidate not in ips:
             ips.append(candidate)
@@ -83,16 +96,13 @@ def _iface_ips(iface: dict) -> list[str]:
 
 def _iface_groups(iface: dict) -> list[str]:
     """The security-group ids on a CloudTrail ``networkInterface`` element's ``groupSet``."""
-    return [
-        g.get("groupId") for g in (iface.get("groupSet") or {}).get("items", []) if g.get("groupId")
-    ]
+    return [g.get("groupId") for g in _dict_items(iface.get("groupSet")) if g.get("groupId")]
 
 
 def _tag_items(tagset: Any) -> dict[str, str]:
     """A ``{key: value}`` map from a CloudTrail ``tagSet`` (``.items[]`` of ``{key, value}``)."""
-    items = (tagset or {}).get("items", []) if isinstance(tagset, dict) else (tagset or [])
     out: dict[str, str] = {}
-    for tag in items:
+    for tag in _dict_items(tagset):
         key = tag.get("key", tag.get("Key"))
         if key is not None:
             out[key] = tag.get("value", tag.get("Value"))
@@ -128,6 +138,8 @@ def _absorb_create_network_interface(
 ) -> None:
     """A ``CreateNetworkInterface`` event → a (usually standalone) reconstructed ENI."""
     iface = ((detail.get("responseElements") or {}).get("networkInterface")) or {}
+    if not isinstance(iface, dict):
+        return
     eni_id = iface.get("networkInterfaceId")
     if not eni_id:
         return
@@ -150,13 +162,12 @@ def _absorb_run_instances(detail: dict, when: str | None, by_eni: dict[str, dict
 
     Essential: most instance ENIs have **no** standalone ``CreateNetworkInterface`` event, so this
     is where an ASG fleet's ENIs (and their ``aws:autoscaling:groupName`` tag) come from."""
-    items = ((detail.get("responseElements") or {}).get("instancesSet") or {}).get("items", [])
-    for inst in items:
+    for inst in _dict_items((detail.get("responseElements") or {}).get("instancesSet")):
         instance_id = inst.get("instanceId")
         tags = _tag_items(inst.get("tagSet"))
         asg_name = tags.get("aws:autoscaling:groupName")
         name = tags.get("Name")
-        for nif in (inst.get("networkInterfaceSet") or {}).get("items", []):
+        for nif in _dict_items(inst.get("networkInterfaceSet")):
             eni_id = nif.get("networkInterfaceId")
             if not eni_id:
                 continue
@@ -178,8 +189,7 @@ def _terminated_instance_ids(detail: dict) -> list[str]:
     """The instance ids in a ``TerminateInstances`` event (request or response ``instancesSet``)."""
     out: list[str] = []
     for section in ("requestParameters", "responseElements"):
-        items = ((detail.get(section) or {}).get("instancesSet") or {}).get("items", [])
-        for item in items:
+        for item in _dict_items((detail.get(section) or {}).get("instancesSet")):
             iid = item.get("instanceId")
             if iid and iid not in out:
                 out.append(iid)
