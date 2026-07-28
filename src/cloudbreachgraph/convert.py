@@ -12,8 +12,16 @@ everything else — ``output/html_export.write_ringed_html``).
 
 With ``--split-by-vpc`` it instead writes **one HTML per VPC** — ``graph-<VPC ID>.html`` in the
 output directory (``-o``, default: the input's directory) — each a stand-alone view of that VPC's
-nodes and their edges (``output/html_export.split_by_vpc``). The layout flags (``--ringed`` /
-``--optimize-passes`` / ``--no-security-groups``) apply to every per-VPC file.
+nodes and their edges (``output/html_export.split_by_vpc``). The layout / view-transform flags
+(``--ringed`` / ``--optimize-passes`` / ``--no-security-groups`` / ``--collapse-asgs``) apply to
+every per-VPC file.
+
+Two **view transforms** rewrite the loaded graph before rendering, mirroring the main pipeline:
+``--no-security-groups`` collapses the security-group layer (``collapse_security_groups``) and
+``--collapse-asgs`` folds each Auto Scaling group's members into one ``autoscaling_group`` node
+(``collapse_autoscaling_groups``). Both can only reshape what is already in the input — they never
+re-collect from AWS — so ``--collapse-asgs`` needs a graph the main tool built with ``--flow-logs``
+(which records the ASG membership); on a graph with no ASG membership it is a no-op.
 
 It reuses the exact same writer and size guard as the main pipeline: if the graph is too
 large to render responsibly in a browser, it warns and **falls back to writing a ``.dot``**
@@ -29,7 +37,7 @@ from pathlib import Path
 
 from . import __version__
 from .graph_io import GraphLoadError, load_graph
-from .mapping.collapse import collapse_security_groups
+from .mapping.collapse import collapse_autoscaling_groups, collapse_security_groups
 from .model.graph import Graph
 from .output import dot_export, html_export
 
@@ -61,6 +69,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="keep security-group nodes as-is (default: on). --no-security-groups collapses the "
         "SG layer, bringing the source IPs forward to connect directly to the ENIs. It can only "
         "remove SG nodes present in the input, not add them (no AWS re-collection)",
+    )
+    p.add_argument(
+        "--collapse-asgs",
+        action="store_true",
+        help="collapse each Auto Scaling group's instances and ENIs (current + historical) into a "
+        "single autoscaling_group node, merging their edges. Uses the ASG membership already in "
+        "the input (the asg_name attribute the main tool records with --flow-logs) — it re-points "
+        "and merges what's there, never re-collects from AWS",
     )
     p.add_argument(
         "--ringed",
@@ -147,6 +163,11 @@ def main(argv: list[str] | None = None) -> int:
     if not args.security_groups:
         # Collapse the SG layer of the loaded graph (a view transform; can only remove SG nodes).
         graph = collapse_security_groups(graph)
+
+    if args.collapse_asgs:
+        # Collapse each ASG's members into one node (a view transform; a no-op when the input has no
+        # ASG membership — i.e. it wasn't built with --flow-logs / historical ENIs).
+        graph = collapse_autoscaling_groups(graph)
 
     if args.split_by_vpc:
         # One self-contained HTML per VPC: graph-<VPC ID>.html in the output directory.
