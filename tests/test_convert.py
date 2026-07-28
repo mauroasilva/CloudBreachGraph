@@ -239,6 +239,71 @@ def test_convert_no_security_groups_flag(graph, tmp_path):
     assert "eni-00instance0000001" in text
 
 
+# --------------------------------------------------------------------------- #
+# --collapse-asgs: fold each ASG's members into one node on a loaded graph
+# --------------------------------------------------------------------------- #
+def _asg_graph():
+    """A small graph carrying ASG membership (asg_name on an instance + a historical ENI)."""
+    from cloudbreachgraph.model.graph import Edge, Graph, Node
+
+    g = Graph(meta={"region": "us-east-1"})
+    g.add_node(Node("vpc-1", "vpc", "vpc-1", {"cidr": "10.0.0.0/16"}))
+    g.add_node(Node("subnet-1", "subnet", "subnet-1", {"vpc_id": "vpc-1"}))
+    g.add_edge(Edge("subnet-1", "vpc-1", "in_vpc"))
+    g.add_node(Node("i-1", "ec2_instance", "i-1", {"vpc_id": "vpc-1", "asg_name": "web-asg"}))
+    g.add_node(Node("eni-1", "eni", "eni-1", {"private_ips": ["10.0.0.1"]}))
+    g.add_node(
+        Node(
+            "eni-2",
+            "eni",
+            "eni-2",
+            {"private_ips": ["10.0.0.2"], "historical": True, "asg_name": "web-asg"},
+        )
+    )
+    g.add_edge(Edge("eni-1", "i-1", "attached_to"))
+    g.add_edge(Edge("eni-1", "subnet-1", "in_subnet"))
+    g.add_edge(Edge("eni-2", "subnet-1", "in_subnet"))
+    g.add_node(Node("eni-ext", "eni", "eni-ext", {"private_ips": ["10.0.0.9"]}))
+    g.add_edge(Edge("eni-ext", "subnet-1", "in_subnet"))
+    g.add_edge(Edge("eni-1", "eni-ext", "connects_to", {"ports": "tcp/443", "via": "flow_log"}))
+    return g
+
+
+def test_convert_collapse_asgs_flag(tmp_path):
+    jp = json_export.write_json(_asg_graph(), tmp_path / "graph.json")
+    out = tmp_path / "collapsed.html"
+    rc = convert.main([str(jp), "--collapse-asgs", "-o", str(out)])
+    assert rc == 0
+    text = out.read_text()
+    # The fleet is one autoscaling_group node; its member ENIs/instance are gone from the render.
+    assert '"type": "autoscaling_group"' in text
+    assert "asg:web-asg" in text
+    assert '"id": "eni-1"' not in text and '"id": "i-1"' not in text
+    # A non-member neighbour survives.
+    assert "eni-ext" in text
+
+
+def test_convert_collapse_asgs_matches_transform_then_render(tmp_path):
+    from cloudbreachgraph.mapping.collapse import collapse_autoscaling_groups
+
+    g = _asg_graph()
+    jp = json_export.write_json(g, tmp_path / "graph.json")
+    out = tmp_path / "collapsed.html"
+    convert.main([str(jp), "--collapse-asgs", "-o", str(out)])
+    # Converting with --collapse-asgs reproduces exactly transform-then-render of the loaded graph.
+    assert out.read_text() == html_export.build_html(collapse_autoscaling_groups(g))
+
+
+def test_convert_collapse_asgs_is_a_noop_without_membership(graph, tmp_path):
+    # The standard fixture has no ASG membership, so --collapse-asgs renders identically to plain.
+    jp = json_export.write_json(graph, tmp_path / "graph.json")
+    plain = tmp_path / "plain.html"
+    collapsed = tmp_path / "collapsed.html"
+    convert.main([str(jp), "-o", str(plain)])
+    convert.main([str(jp), "--collapse-asgs", "-o", str(collapsed)])
+    assert plain.read_text() == collapsed.read_text()
+
+
 def test_convert_dot_to_html(graph, tmp_path):
     dp = dot_export.write_dot(graph, tmp_path / "graph.dot")
     rc = convert.main([str(dp), "-o", str(tmp_path / "out.html")])

@@ -417,6 +417,7 @@ cloudbreachgraph-to-html capture.data --format json     # force the input format
 cloudbreachgraph-to-html out/graph.json --ringed        # concentric-ringed layout
 cloudbreachgraph-to-html out/graph.json --optimize-passes 10000  # overlap-free layout
 cloudbreachgraph-to-html out/graph.json --no-security-groups  # collapse the SG layer
+cloudbreachgraph-to-html out/graph.json --collapse-asgs       # collapse ASG fleets
 cloudbreachgraph-to-html out/graph.json --split-by-vpc -o out/  # one HTML per VPC
 ```
 
@@ -424,6 +425,14 @@ cloudbreachgraph-to-html out/graph.json --split-by-vpc -o out/  # one HTML per V
 IPs forward to connect directly to the ENIs. It can only **remove** SG nodes already present in the
 input (it never re-collects from AWS), so on a graph that was built with `--no-security-groups` it
 is a no-op.
+
+`--collapse-asgs` folds each Auto Scaling group's instances and ENIs (current + historical) into a
+single `autoscaling_group` node, re-pointing and merging their edges — the same view transform the
+main tool's `--collapse-asgs` applies, but on an already-written graph. Like `--no-security-groups`
+it only reshapes what's already in the input, so it needs a graph the main tool built with
+`--flow-logs` (which records the `aws:autoscaling:groupName` membership); on a graph with no ASG
+membership it is a no-op. Both transforms compose, and both apply to every per-VPC file under
+`--split-by-vpc`.
 
 No capture of your own? A shipped, fully **anonymised** example graph (a real-shaped
 multi-VPC topology — 4 VPCs, 28 subnets, 60 ENIs, 19 load balancers; all names, IDs and IPs
