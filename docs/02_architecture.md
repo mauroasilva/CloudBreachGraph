@@ -675,10 +675,16 @@ Requirements:
   `cli._write_outputs` and `convert.main` call, so they can't drift; `N=0` (default) keeps the
   force/ringed layout. Same `MAX_NODES`/`MAX_HTML_BYTES` guard and `.dot` fallback. Its
   `--split-by-vpc` flag writes **one HTML per VPC** — `graph-<VPC ID>.html` in the `-o` directory
-  (default: the input's directory) — via `html_export.split_by_vpc`, which partitions the graph on
-  the same `_vpc_group_of` tracing the ringed layout clusters by: each sub-graph holds the nodes
-  that resolve to that VPC plus the edges wholly within it (unassigned nodes and cross-VPC edges are
-  dropped). It reuses `write_layout_html` per sub-graph, so the layout flags (`--ringed`/
+  (default: the input's directory) — via `html_export.split_by_vpc`. It assigns each **edge** to a
+  VPC by the edge's **semantics** (`_edge_vpc`), not by a node's single home group: a reachability
+  edge (`can_reach*`) lands in the VPC of the resource it reaches (its target), a flow `connects_to`
+  in the VPC of its ENI end, and a structural edge in the one VPC both endpoints share. Both of an
+  edge's endpoints are then pulled into that VPC, so a source that relates to several VPCs — a CIDR,
+  an `internet`/`flow_peer`, **or a security group referenced across a peering** — appears in every
+  VPC it reaches (unassigned nodes and edges that resolve to no VPC are still dropped). This is on
+  purpose different from `_vpc_group_of`, which single-assigns a shared source (correct for the
+  overlap-free single-page layouts, where each node is drawn once, but exposure-hiding when
+  splitting). It reuses `write_layout_html` per sub-graph, so the layout flags (`--ringed`/
   `--hierarchical`/`--optimize-passes`/`--no-security-groups`) and the size guard / per-file `.dot`
   fallback all apply to every VPC file.
 - **Anonymising existing output** (`cloudbreachgraph-anonymize`, `anonymize.py`): an auxiliary

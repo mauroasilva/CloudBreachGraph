@@ -899,37 +899,94 @@ def _vpc_group_of(graph: Graph) -> dict[str, str]:
     return group
 
 
+def _edge_vpc(edge: Edge, group: dict[str, str], node_type: dict[str, str]) -> str:
+    """Return the single VPC an edge belongs to, decided by the edge's *semantics*.
+
+    The split assigns an edge to a VPC by what the edge **means**, not by either endpoint's
+    type — this is what keeps cross-VPC security-group references working the same as
+    CIDR/internet/flow_peer sources (``docs/02_architecture.md §5.5/§5.6``):
+
+    * a **reachability** edge (``can_reach`` and its routable / not-routable variants) points
+      *source → target*, so it belongs to the VPC of the resource it reaches — the **target**
+      (an ENI or SG, which always resolves to a real VPC). A source referenced from several VPCs
+      therefore lands one such edge in *each* of those VPCs;
+    * a **flow** ``connects_to`` edge (flow_peer ↔ ENI, or ENI ↔ ENI, either direction) belongs
+      to the VPC of the **ENI** end — the non-``flow_peer`` endpoint, falling back to the source
+      when both ends are ENIs (a cross-VPC flow is anchored on its initiator);
+    * every **structural** edge (``in_vpc`` / ``in_subnet`` / ``attached_to`` / ``secured_by``)
+      has both endpoints in one VPC, so it resolves there — and is dropped (returns
+      :data:`_UNASSIGNED`) if, impossibly for well-formed AWS data, its ends disagree.
+    """
+    if edge.relationship in _REACH_RELS:
+        return group.get(edge.target, _UNASSIGNED)
+    if edge.relationship == "connects_to":
+        eni_end = edge.target if node_type.get(edge.source) == "flow_peer" else edge.source
+        return group.get(eni_end, _UNASSIGNED)
+    src_vpc = group.get(edge.source, _UNASSIGNED)
+    return src_vpc if src_vpc == group.get(edge.target, _UNASSIGNED) else _UNASSIGNED
+
+
 def split_by_vpc(graph: Graph) -> dict[str, Graph]:
     """Split *graph* into one self-contained sub-:class:`Graph` per VPC, keyed by VPC id.
 
-    Every node is assigned to its VPC via :func:`_vpc_group_of` (the same tracing the ringed
-    layout uses to cluster). A VPC's sub-graph holds exactly the nodes that resolve to it plus
-    every edge whose *both* endpoints resolve to that same VPC; nodes that trace to no VPC
-    (:data:`_UNASSIGNED`) and edges spanning two VPCs are dropped, so each sub-graph is a clean,
-    stand-alone picture of one VPC. A shared reachability source that fans into several VPCs is
-    grouped with just one of them (the first, deterministically — see :func:`_vpc_group_of`).
+    A VPC's sub-graph holds every node that relates to that VPC plus every edge placed in it.
+    Placement follows **edge semantics** (:func:`_edge_vpc`), not a node's single home group, so
+    a node that legitimately relates to several VPCs — a CIDR block, an ``internet`` / ``flow_peer``
+    source, **or a security group referenced across a VPC peering** — appears (with its edge) in
+    *every* VPC it reaches, not just one. Each such node has one outgoing ``can_reach`` /
+    ``connects_to`` edge per VPC; every edge lands in the single VPC of the resource it reaches,
+    and **both** its endpoints are pulled into that VPC, so the foreign source shows up as a node
+    there. Nodes/edges that trace to no VPC (:data:`_UNASSIGNED`) are dropped, so each sub-graph
+    stays a clean, stand-alone picture of one VPC.
+
+    Note this deliberately differs from :func:`_vpc_group_of`, which keeps a shared source in a
+    **single** VPC — that single-assignment is correct for the overlap-free single-page layouts
+    (each node is drawn once) but hides real exposure when splitting, where a node reaching *N*
+    VPCs must appear in all *N* files.
 
     ``meta`` is copied onto each sub-graph. The result is ordered by VPC id so callers emit files
     deterministically; it is empty when the graph has no VPC nodes.
     """
     group = _vpc_group_of(graph)
+    node_type = {n.id: n.type for n in graph.nodes}
     vpc_ids = sorted(n.id for n in graph.nodes if n.type == "vpc")
     subgraphs: dict[str, Graph] = {vid: Graph(meta=dict(graph.meta)) for vid in vpc_ids}
+
+    # Which VPC sub-graph(s) each node belongs in. Seed from its single home group (the same
+    # tracing the ringed layout clusters by), then add every VPC an incident edge is placed in.
+    # The seed keeps home-only nodes (e.g. a VPC with no resources) present; the edge additions
+    # are what let a shared source span several VPCs. A node's set may hold more than one VPC.
+    node_vpcs: dict[str, set[str]] = {n.id: set() for n in graph.nodes}
     for n in graph.nodes:
-        sub = subgraphs.get(group.get(n.id, _UNASSIGNED))
-        if sub is not None:
-            sub.add_node(Node(id=n.id, type=n.type, label=n.label, attributes=dict(n.attributes)))
+        home = group.get(n.id, _UNASSIGNED)
+        if home in subgraphs:
+            node_vpcs[n.id].add(home)
+
+    placements: list[tuple[Edge, str]] = []
     for e in graph.edges:
-        g = group.get(e.source, _UNASSIGNED)
-        if g == group.get(e.target, _UNASSIGNED) and g in subgraphs:
-            subgraphs[g].add_edge(
-                Edge(
-                    source=e.source,
-                    target=e.target,
-                    relationship=e.relationship,
-                    attributes=dict(e.attributes),
-                )
+        v = _edge_vpc(e, group, node_type)
+        if v in subgraphs:
+            placements.append((e, v))
+            # Both endpoints belong in the edge's VPC — this is what pulls a foreign source in.
+            node_vpcs[e.source].add(v)
+            node_vpcs[e.target].add(v)
+
+    node_by_id = {n.id: n for n in graph.nodes}
+    for nid, vpcs in node_vpcs.items():  # nid iteration follows graph.nodes' deterministic order
+        n = node_by_id[nid]
+        for v in vpcs:
+            subgraphs[v].add_node(
+                Node(id=n.id, type=n.type, label=n.label, attributes=dict(n.attributes))
             )
+    for e, v in placements:
+        subgraphs[v].add_edge(
+            Edge(
+                source=e.source,
+                target=e.target,
+                relationship=e.relationship,
+                attributes=dict(e.attributes),
+            )
+        )
     return subgraphs
 
 
