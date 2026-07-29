@@ -899,45 +899,59 @@ def _vpc_group_of(graph: Graph) -> dict[str, str]:
     return group
 
 
-def _edge_vpc(edge: Edge, group: dict[str, str], node_type: dict[str, str]) -> str:
-    """Return the single VPC an edge belongs to, decided by the edge's *semantics*.
+def _edge_vpcs(edge: Edge, group: dict[str, str], node_type: dict[str, str]) -> set[str]:
+    """Return the VPC(s) an edge belongs to, decided by the edge's *semantics*.
 
-    The split assigns an edge to a VPC by what the edge **means**, not by either endpoint's
-    type — this is what keeps cross-VPC security-group references working the same as
-    CIDR/internet/flow_peer sources (``docs/02_architecture.md §5.5/§5.6``):
+    The split assigns an edge by what the edge **means**, not by either endpoint's type — this is
+    what keeps cross-VPC security-group references working the same as CIDR/internet/flow_peer
+    sources (``docs/02_architecture.md §5.5/§5.6``). Most edges resolve to a single VPC; an
+    observed cross-VPC flow between two real ENIs resolves to *both*:
 
     * a **reachability** edge (``can_reach`` and its routable / not-routable variants) points
       *source → target*, so it belongs to the VPC of the resource it reaches — the **target**
       (an ENI or SG, which always resolves to a real VPC). A source referenced from several VPCs
-      therefore lands one such edge in *each* of those VPCs;
-    * a **flow** ``connects_to`` edge (flow_peer ↔ ENI, or ENI ↔ ENI, either direction) belongs
-      to the VPC of the **ENI** end — the non-``flow_peer`` endpoint, falling back to the source
-      when both ends are ENIs (a cross-VPC flow is anchored on its initiator);
+      therefore lands one such edge in *each* of those VPCs. It is one-directional: it never lands
+      in the *source's* VPC (that would be outbound noise, e.g. an SG shown reaching a foreign SG);
+    * a **flow** ``connects_to`` edge is an *observed* connection between two real resources:
+      - **flow_peer ↔ ENI** (either direction): the flow_peer has no VPC of its own, so it belongs
+        to the ENI end's VPC (the ENI is the non-``flow_peer`` endpoint);
+      - **ENI ↔ ENI**: both ends are real resources, so the flow belongs to **both** their VPCs —
+        each VPC's file shows the connection with the *other* ENI pulled in as a foreign node. When
+        the two ENIs share a VPC the set collapses to that one VPC;
     * every **structural** edge (``in_vpc`` / ``in_subnet`` / ``attached_to`` / ``secured_by``)
-      has both endpoints in one VPC, so it resolves there — and is dropped (returns
-      :data:`_UNASSIGNED`) if, impossibly for well-formed AWS data, its ends disagree.
+      has both endpoints in one VPC, so it resolves there — and is dropped (empty set) if,
+      impossibly for well-formed AWS data, its ends disagree.
+
+    VPC ids that are not real sub-graphs (e.g. :data:`_UNASSIGNED`) may appear in the set; the
+    caller filters them out.
     """
     if edge.relationship in _REACH_RELS:
-        return group.get(edge.target, _UNASSIGNED)
+        return {group.get(edge.target, _UNASSIGNED)}
     if edge.relationship == "connects_to":
-        eni_end = edge.target if node_type.get(edge.source) == "flow_peer" else edge.source
-        return group.get(eni_end, _UNASSIGNED)
+        source_is_peer = node_type.get(edge.source) == "flow_peer"
+        target_is_peer = node_type.get(edge.target) == "flow_peer"
+        if source_is_peer or target_is_peer:  # flow_peer ↔ ENI: anchor on the ENI end
+            eni_end = edge.target if source_is_peer else edge.source
+            return {group.get(eni_end, _UNASSIGNED)}
+        # ENI ↔ ENI: an observed flow between two real resources — show it in both their VPCs.
+        return {group.get(edge.source, _UNASSIGNED), group.get(edge.target, _UNASSIGNED)}
     src_vpc = group.get(edge.source, _UNASSIGNED)
-    return src_vpc if src_vpc == group.get(edge.target, _UNASSIGNED) else _UNASSIGNED
+    return {src_vpc} if src_vpc == group.get(edge.target, _UNASSIGNED) else set()
 
 
 def split_by_vpc(graph: Graph) -> dict[str, Graph]:
     """Split *graph* into one self-contained sub-:class:`Graph` per VPC, keyed by VPC id.
 
     A VPC's sub-graph holds every node that relates to that VPC plus every edge placed in it.
-    Placement follows **edge semantics** (:func:`_edge_vpc`), not a node's single home group, so
+    Placement follows **edge semantics** (:func:`_edge_vpcs`), not a node's single home group, so
     a node that legitimately relates to several VPCs — a CIDR block, an ``internet`` / ``flow_peer``
     source, **or a security group referenced across a VPC peering** — appears (with its edge) in
-    *every* VPC it reaches, not just one. Each such node has one outgoing ``can_reach`` /
-    ``connects_to`` edge per VPC; every edge lands in the single VPC of the resource it reaches,
-    and **both** its endpoints are pulled into that VPC, so the foreign source shows up as a node
-    there. Nodes/edges that trace to no VPC (:data:`_UNASSIGNED`) are dropped, so each sub-graph
-    stays a clean, stand-alone picture of one VPC.
+    *every* VPC it reaches, not just one. **Both** endpoints of a placed edge are pulled into its
+    VPC, so the foreign end (a shared source, or the ENI on the other side of a cross-VPC flow)
+    shows up as a node there. A reachability edge lands in the single VPC of the resource it
+    reaches; an *observed* cross-VPC flow between two real ENIs lands in **both** their VPCs, so
+    each side's file shows the connection. Nodes/edges that trace to no VPC (:data:`_UNASSIGNED`)
+    are dropped, so each sub-graph stays a clean, stand-alone picture of one VPC.
 
     Note this deliberately differs from :func:`_vpc_group_of`, which keeps a shared source in a
     **single** VPC — that single-assignment is correct for the overlap-free single-page layouts
@@ -964,10 +978,11 @@ def split_by_vpc(graph: Graph) -> dict[str, Graph]:
 
     placements: list[tuple[Edge, str]] = []
     for e in graph.edges:
-        v = _edge_vpc(e, group, node_type)
-        if v in subgraphs:
+        for v in _edge_vpcs(e, group, node_type):
+            if v not in subgraphs:
+                continue
             placements.append((e, v))
-            # Both endpoints belong in the edge's VPC — this is what pulls a foreign source in.
+            # Both endpoints belong in the edge's VPC — this is what pulls a foreign node in.
             node_vpcs[e.source].add(v)
             node_vpcs[e.target].add(v)
 

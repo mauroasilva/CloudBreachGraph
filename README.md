@@ -464,12 +464,14 @@ Each file is a stand-alone view of just that VPC: its subnets, ENIs, EC2/LB, sec
 reachability sources, plus the edges placed in it. A node that legitimately relates to **several**
 VPCs — a CIDR block, an `Internet` / flow-peer source, **or a security group referenced across a
 VPC peering** — appears in **every** VPC it reaches, together with the `can_reach` / `connects_to`
-edge into that VPC, so cross-VPC exposure is never hidden. Each edge lands in the single VPC of the
-resource it reaches, so a target VPC's file never gains another VPC's own resources; resources that
-trace to no VPC are omitted. Files land in the `-o` **directory** (default: the input file's
-directory). The other layout flags compose with it — `--ringed`, `--optimize-passes` and
-`--no-security-groups` all apply to **every** per-VPC file — and each file is subject to the same
-size guard and per-file `.dot` fallback (`graph-<VPC ID>.dot`).
+edge into that VPC, so cross-VPC exposure is never hidden. A `can_reach` edge lands only in the VPC
+of the resource it reaches (a target VPC's file never gains another VPC's own reach sources as
+targets); an **observed flow between two ENIs in different VPCs** (`connects_to`, via flow logs)
+is a connection between two real resources, so it appears in **both** their files, each pulling in
+the other side's ENI. Resources that trace to no VPC are omitted. Files land in the `-o`
+**directory** (default: the input file's directory). The other layout flags compose with it —
+`--ringed`, `--optimize-passes` and `--no-security-groups` all apply to **every** per-VPC file —
+and each file is subject to the same size guard and per-file `.dot` fallback (`graph-<VPC ID>.dot`).
 
 ### Ringed layout (`--ringed`)
 

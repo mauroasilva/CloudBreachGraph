@@ -1394,6 +1394,43 @@ def test_split_by_vpc_shared_flow_peer_appears_in_every_reached_vpc():
         assert any(e.relationship == "connects_to" for e in subs[v].edges)
 
 
+def test_split_by_vpc_cross_vpc_eni_to_eni_flow_appears_in_both_vpcs():
+    # An observed flow between two real ENIs in different VPCs (connects_to) is a connection
+    # between two resources, not a one-directional exposure: it must appear in BOTH VPC files,
+    # each showing the other side's ENI pulled in as a foreign node.
+    from cloudbreachgraph.model.graph import Edge
+
+    g = _base_two_vpcs()
+    g.add_edge(Edge("eni-vpc-a", "eni-vpc-b", "connects_to"))  # a talks to b (across a peering)
+
+    subs = html_export.split_by_vpc(g)
+    for v in ("vpc-a", "vpc-b"):
+        sub = subs[v]
+        assert sub.get_node("eni-vpc-a") is not None  # both ENIs present in each file
+        assert sub.get_node("eni-vpc-b") is not None
+        assert ("eni-vpc-a", "eni-vpc-b", "connects_to") in {
+            (e.source, e.target, e.relationship) for e in sub.edges
+        }
+
+
+def test_split_by_vpc_same_vpc_eni_to_eni_flow_stays_in_one_vpc():
+    # When both ENIs live in the same VPC, the flow resolves to just that VPC (set collapses).
+    from cloudbreachgraph.model.graph import Edge, Node
+
+    g = _base_two_vpcs()
+    g.add_node(Node("eni-vpc-a2", "eni", "eni-vpc-a2"))
+    g.add_edge(Edge("eni-vpc-a2", "subnet-vpc-a", "in_subnet"))
+    g.add_edge(Edge("eni-vpc-a", "eni-vpc-a2", "connects_to"))
+
+    subs = html_export.split_by_vpc(g)
+    assert ("eni-vpc-a", "eni-vpc-a2", "connects_to") in {
+        (e.source, e.target, e.relationship) for e in subs["vpc-a"].edges
+    }
+    # It must not leak into vpc-b.
+    assert subs["vpc-b"].get_node("eni-vpc-a2") is None
+    assert all(e.relationship != "connects_to" for e in subs["vpc-b"].edges)
+
+
 _EXAMPLE_GRAPH_4VPC = (
     Path(__file__).resolve().parents[1] / "docs" / "examples" / "example-graph.json"
 )
