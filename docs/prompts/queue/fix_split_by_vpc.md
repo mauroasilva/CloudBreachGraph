@@ -1,3 +1,40 @@
+## READ THESE FIRST (repo protocol — do not skip)
+
+You are working in **CloudBreachGraph**, a read-only Python 3.11+ CLI (stdlib-only runtime, no
+boto3) that maps an AWS account's network topology. Before writing any code, read the docs
+relevant to this change and follow the repo's conventions:
+
+- `docs/04_conventions.md` — the rules you MUST follow: Python 3.11+, full type hints,
+  `dataclasses` for models, zero required third-party runtime deps, read-only by construction,
+  deterministic output (sort before serializing; no timestamps), ruff-clean, small
+  single-purpose modules. **It also defines the REQUIRED learnings-file protocol** (every session
+  that changes the repo ends by writing exactly one learnings file) and contains the template to
+  use.
+- `docs/learnings/README.md` — the learnings-file naming rules and what to capture. This is a
+  MANDATORY final deliverable, committed with your code.
+- `docs/02_architecture.md` — design of record. Read **§5 relationship-mapping rules** (esp.
+  §5.5/§5.6 reachability sources and routability, and the security-group-as-source behavior),
+  §6 graph model, and **§7 output formats** (the converter / split / layout section you are
+  changing).
+- `README.md` — user-facing behavior and flags for `cloudbreachgraph-to-html` (the "Splitting
+  per VPC" subsection is one of the docs you must update).
+- Most-relevant prior learnings for context on the code you're touching:
+  `docs/learnings/learnings_2026-07-22_split-graph-by-vpc.md` (how the split was built and why
+  it single-assigns today), `docs/learnings/learnings_2026-07-22_eni-reachability-mapping.md`,
+  and `docs/learnings/learnings_2026-07-22_routable-reachability.md` (how reachability sources,
+  including SG-references-SG, become nodes/edges).
+- Trust the code over the docs where they disagree, and note any doc drift you find.
+
+Source you'll touch lives under `src/cloudbreachgraph/`: the split logic is in
+`output/html_export.py` (`split_by_vpc`, `_vpc_group_of`); the edges you're partitioning are
+built in `mapping/builder.py` (`_map_reachability_via_sgs` / `_map_reachability_direct`); the CLI
+is `convert.py`. Tests are fully offline (they mock at the `aws/runner.py` boundary and feed
+fixtures from `tests/fixtures/`) — never hit the network in a test.
+
+**Required final step (per docs/04_conventions.md — do not forget):** write exactly one learnings
+file `docs/learnings/learnings_<YYYY-MM-DD>_fix-split-vpc-shared-sources.md` using the template in
+`docs/04_conventions.md`, and commit it together with the code.
+
 ## CHANGE REQUEST (bug fix)
 
 **What's broken:**
