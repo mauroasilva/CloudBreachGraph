@@ -96,7 +96,12 @@ def build_parser() -> argparse.ArgumentParser:
     col.add_argument(
         "--region", metavar="REGION", help="AWS region (overrides per-account default)"
     )
-    col.add_argument("--cache-dir", metavar="DIR", help="also write raw AWS JSON responses here")
+    col.add_argument(
+        "--cache-dir",
+        metavar="DIR",
+        help="also write raw AWS JSON responses here, and cache downloaded S3 flow-log objects "
+        "(reused for 30 days, so a re-run doesn't re-download them)",
+    )
     col.add_argument(
         "--from-cache",
         metavar="DIR",

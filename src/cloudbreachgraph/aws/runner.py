@@ -15,12 +15,19 @@ subcommands (see ``docs/02_architecture.md §9``).
 
 from __future__ import annotations
 
+import hashlib
 import json
+import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Any
+
+# S3 flow-log objects are immutable once written, so a downloaded body can be reused for a long
+# time. When ``--cache-dir`` is set, :func:`download_object` caches each object under
+# ``<cache-dir>/s3-objects/`` and reuses it (no re-download) if it's younger than this TTL.
+_OBJECT_CACHE_TTL_SECONDS = 30 * 86400
 
 # Optional cache directory for raw-JSON dumps (see ``configure_cache``). When set,
 # every ``run_aws`` response is also written verbatim to disk so Phase 2/3 and tests
@@ -160,8 +167,18 @@ def download_object(
     argument; stdout (the object metadata) is ignored. Raises :class:`AwsCliError` on a non-zero
     exit — with the **full** command (``dest`` included) so the message names the exact invocation.
     This is the same mock boundary as :func:`run_aws` — tests patch it, so no network.
+
+    When ``--cache-dir`` is set the object body is cached (S3 flow-log objects are immutable): a
+    fresh cached copy (< :data:`_OBJECT_CACHE_TTL_SECONDS`) is reused with **no** download, and a
+    freshly-downloaded body is written to the cache for the next run.
     """
     full_args = [*args, str(dest)]
+    cache_path = _object_cache_path(args)
+    if cache_path is not None and _cache_fresh(cache_path):
+        _echo("+ (cache hit) aws " + " ".join(full_args))
+        shutil.copyfile(cache_path, dest)
+        return Path(dest)
+
     cmd = ["aws", *full_args, "--no-cli-pager"]
     if region:
         cmd += ["--region", region]
@@ -176,7 +193,49 @@ def download_object(
         _echo(f"  NOT OK (exit {proc.returncode}, {elapsed:.2f}s)")
         raise AwsCliError(full_args, proc.returncode, proc.stderr)
     _echo(f"  OK ({elapsed:.2f}s)")
+    if cache_path is not None:
+        _store_in_cache(dest, cache_path)
     return Path(dest)
+
+
+def _object_cache_path(args: list[str]) -> Path | None:
+    """The cache path for an ``s3api get-object`` call, or ``None`` if caching is off.
+
+    Keyed by the object's ``bucket`` + ``key`` (from the ``--bucket=``/``--key=``
+    args) under ``<cache-dir>/s3-objects/``. Only meaningful when a cache dir is
+    configured and both bucket and key are present.
+    """
+    if _cache_dir is None:
+        return None
+    bucket = key = None
+    for a in args:
+        if a.startswith("--bucket="):
+            bucket = a[len("--bucket=") :]
+        elif a.startswith("--key="):
+            key = a[len("--key=") :]
+    if not bucket or not key:
+        return None
+    digest = hashlib.sha256(f"{bucket}\0{key}".encode()).hexdigest()
+    return _cache_dir / "s3-objects" / f"{digest}.bin"
+
+
+def _cache_fresh(cache_path: Path) -> bool:
+    """Whether a cached object exists and is younger than :data:`_OBJECT_CACHE_TTL_SECONDS`."""
+    try:
+        return time.time() - cache_path.stat().st_mtime < _OBJECT_CACHE_TTL_SECONDS
+    except OSError:
+        return False
+
+
+def _store_in_cache(src: str | Path, cache_path: Path) -> None:
+    """Copy a freshly-downloaded object body into the cache atomically (temp + replace)."""
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        shutil.copyfile(src, tmp)
+        tmp.replace(cache_path)
+    except OSError:
+        pass  # caching is best-effort — a cache write failure must never break the fetch
 
 
 def sso_login(profile: str) -> None:

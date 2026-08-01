@@ -98,6 +98,52 @@ def test_download_object_error_includes_dest(monkeypatch, tmp_path):
     assert str(dest) in str(err)
 
 
+def test_download_object_caches_and_reuses_with_cache_dir(monkeypatch, tmp_path):
+    from pathlib import Path
+
+    calls = {"n": 0}
+
+    def fake_run(cmd, *a, **k):
+        calls["n"] += 1
+        outfile = cmd[cmd.index("--no-cli-pager") - 1]  # the get-object output-file positional
+        Path(outfile).write_bytes(b"OBJECT-BODY")
+        return _FakeProc(0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    args = ["s3api", "get-object", "--bucket=b", "--key=k"]
+    try:
+        runner.configure_cache(tmp_path / "cache")
+        first = tmp_path / "first.gz"
+        runner.download_object(args, first)
+        assert calls["n"] == 1 and first.read_bytes() == b"OBJECT-BODY"
+
+        # Same bucket/key again -> served from cache, no second aws call.
+        second = tmp_path / "second.gz"
+        runner.download_object(args, second)
+        assert calls["n"] == 1  # unchanged: cache hit
+        assert second.read_bytes() == b"OBJECT-BODY"
+    finally:
+        runner.configure_cache(None)
+
+
+def test_download_object_no_cache_without_cache_dir(monkeypatch, tmp_path):
+    from pathlib import Path
+
+    calls = {"n": 0}
+
+    def fake_run(cmd, *a, **k):
+        calls["n"] += 1
+        Path(cmd[cmd.index("--no-cli-pager") - 1]).write_bytes(b"BODY")
+        return _FakeProc(0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    runner.configure_cache(None)  # no cache dir -> every call downloads
+    args = ["s3api", "get-object", "--bucket=b", "--key=k"]
+    runner.download_object(args, tmp_path / "a.gz")
+    runner.download_object(args, tmp_path / "b.gz")
+    assert calls["n"] == 2
+
+
 # --------------------------------------------------------------------------- #
 # --verbose command echo (stderr only; stdout/graph files stay clean)
 # --------------------------------------------------------------------------- #

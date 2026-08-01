@@ -697,6 +697,12 @@ _FAILURE_STREAK_ABORT = 5
 _FAILURE_MIN_SAMPLE = 4
 _FAILURE_RATE_THRESHOLD = 0.5
 
+# Fast-fail probe for S3 flow-log objects: if this many objects download successfully but yield
+# **zero** usable flow records, abort rather than download the (possibly tens of thousands) rest —
+# the flow log is almost certainly all-NODATA or an unrecognised format (``docs/02_architecture.md
+# §5.7``). Sized as a representative sample; a run that finds even one record disables the probe.
+_FLOW_LOG_PROBE_OBJECTS = 25
+
 
 class CredentialsExpiredError(RuntimeError):
     """Credentials / session token expired mid-fetch (``ExpiredToken``/``InvalidToken``/…).
@@ -1101,6 +1107,16 @@ def _read_s3_records(
             if outcome.ok:
                 objects_read += 1
                 records.extend(outcome.value)
+                # Fast-fail: if a representative sample of objects downloaded but nothing parsed,
+                # abort instead of downloading the rest (the flow log is all-NODATA / unrecognised).
+                if objects_read >= _FLOW_LOG_PROBE_OBJECTS and not records:
+                    raise FlowLogFetchError(
+                        f"aborting flow-log fetch: downloaded {objects_read} S3 objects from "
+                        f"'{bucket}' but parsed 0 usable flow records (e.g. s3://{bucket}/{key}). "
+                        f"The objects appear to contain no usable records (all NODATA/SKIPDATA) or "
+                        f"an unrecognised format — not downloading the rest. Check the flow log's "
+                        f"TrafficType/format, or narrow the window."
+                    )
     return records, objects_read, tracker.failed
 
 
