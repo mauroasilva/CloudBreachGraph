@@ -90,9 +90,15 @@ mutating*, §9). Value-carrying flags are passed in `--flag=value` form so the c
 historical-ENI reconstruction issues one `cloudtrail lookup-events` **per EventName**, so the
 `--from-cache` reader disambiguates them by the `EventName` in `--lookup-attributes`, serving
 `cloudtrail_lookup-events.<eventname>.json` when present (else falling back to the un-suffixed
-file). The flow-log-record window is configurable (`--flow-log-days N`, default 60); the CloudTrail
-history window is always the full 90-day retention (never shorter than the record window), so a
-flow captured on a now-terminated ENI can still be resolved to whichever ENI held its IP then.
+file). The flow-log-record window is configurable, as either a day count (`--flow-log-days N`,
+default 60) or an explicit range (`--flow-log-start <ts>` from that time to now, optionally bounded
+by `--flow-log-end <ts>`; ISO-8601 or epoch seconds, mutually exclusive with `--flow-log-days`). The
+record readers bound their queries accordingly — CloudWatch `filter-log-events` with
+`--start-time`/`--end-time`, S3 by filtering each object's `LastModified` — while the CloudTrail
+history window is always the full 90-day retention (never shorter than the record window), so a flow
+captured on a now-terminated ENI can still be resolved to whichever ENI held its IP then. The chosen
+window is recorded in `graph.meta` (`flow_log_window_days`, or `flow_log_start`/`flow_log_end` in
+range mode).
 
 The **only** non-read command the tool can issue is `aws sso login --profile <p>`, run **strictly in
 reaction to an expired-token error** to refresh local credentials before retrying the run once

@@ -6,7 +6,9 @@ The mock boundary is ``runner.run_aws`` — no subprocess, no network.
 from __future__ import annotations
 
 import json
+import time
 from datetime import UTC, datetime
+from unittest import mock
 
 import pytest
 from conftest import load_fixture
@@ -440,6 +442,55 @@ def test_collect_flow_log_records_parses_and_skips_nodata(fake_aws):
     # It discovered the CloudWatch log group from describe-flow-logs and filtered that group.
     filt = next(c for c in fake_aws if tuple(c["args"][:2]) == ("logs", "filter-log-events"))
     assert any("--log-group-name=/vpc/flowlogs/prod" == a for a in filt["args"])
+
+
+def test_flow_log_days_window_bounds_start_only(fake_aws):
+    # Days mode: filter-log-events gets a start-time ~N days back and no end-time.
+    try:
+        collectors.set_flow_log_range(None)
+        collectors.set_flow_log_window(30)
+        collectors.collect_flow_log_records("p", "us-east-1")
+    finally:
+        collectors.set_flow_log_window(collectors.FLOW_LOG_MAX_LOOKBACK_DAYS)
+    filt = next(c for c in fake_aws if tuple(c["args"][:2]) == ("logs", "filter-log-events"))
+    start = next(a for a in filt["args"] if a.startswith("--start-time="))
+    start_ms = int(start.split("=", 1)[1])
+    days = (time.time() - start_ms / 1000) / 86400
+    assert abs(days - 30) < 1
+    assert not any(a.startswith("--end-time=") for a in filt["args"])
+
+
+def test_flow_log_explicit_range_sets_start_and_end(fake_aws):
+    # Range mode: an explicit [start, end] passes both --start-time and --end-time (epoch ms).
+    start_epoch = 1780000000.0
+    end_epoch = 1785000000.0
+    try:
+        collectors.set_flow_log_range(start_epoch, end_epoch)
+        collectors.collect_flow_log_records("p", "us-east-1")
+    finally:
+        collectors.set_flow_log_range(None)
+    filt = next(c for c in fake_aws if tuple(c["args"][:2]) == ("logs", "filter-log-events"))
+    assert f"--start-time={int(start_epoch * 1000)}" in filt["args"]
+    assert f"--end-time={int(end_epoch * 1000)}" in filt["args"]
+
+
+def test_list_s3_flow_log_keys_filters_by_range():
+    # An object before the start and one after the end are dropped; one inside is kept.
+    def _run(args, *, profile=None, region=None, cache_dir=None):
+        return {
+            "Contents": [
+                {"Key": "a/before.log.gz", "LastModified": "2026-04-01T00:00:00+00:00"},
+                {"Key": "a/inside.log.gz", "LastModified": "2026-05-15T00:00:00+00:00"},
+                {"Key": "a/after.log.gz", "LastModified": "2026-07-01T00:00:00+00:00"},
+                {"Key": "a/notgz.txt", "LastModified": "2026-05-15T00:00:00+00:00"},
+            ]
+        }
+
+    start = datetime(2026, 5, 1, tzinfo=UTC).timestamp()
+    end = datetime(2026, 6, 1, tzinfo=UTC).timestamp()
+    with mock.patch.object(collectors.runner, "run_aws", _run):
+        keys = collectors._list_s3_flow_log_keys("b", "a/", start, end, "p", "r")
+    assert keys == ["a/inside.log.gz"]
 
 
 def test_field_index_from_format_default_and_custom():

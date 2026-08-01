@@ -365,7 +365,11 @@ def build_graph(
             historical,
             vpcs=list(vpcs.values()),
         )
-        graph.meta.setdefault("flow_log_window_days", get_flow_log_window())
+        # Only fall back to a days-window when collect_all recorded no window at all. An explicit
+        # --flow-log-start/--flow-log-end range records `flow_log_start`, so don't also stamp a
+        # (misleading) day count over it.
+        if "flow_log_start" not in graph.meta:
+            graph.meta.setdefault("flow_log_window_days", get_flow_log_window())
         graph.meta.setdefault("cloudtrail_window_days", CLOUDTRAIL_MAX_LOOKBACK_DAYS)
 
     return graph

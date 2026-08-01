@@ -153,6 +153,11 @@ cloudbreachgraph --from-cache tests/fixtures --output-dir out/
                              only with --flow-logs). The 90-day CloudTrail history used
                              to reconstruct historical ENIs is unaffected (always the
                              full retention, never shorter than this window)
+--flow-log-start TIMESTAMP analyse flow-log records from this timestamp instead of
+                             --flow-log-days (ISO-8601 like 2026-05-01 / 2026-05-01T12:00:00Z,
+                             or epoch seconds; mutually exclusive with --flow-log-days)
+--flow-log-end TIMESTAMP   with --flow-log-start, only analyse records up to this
+                             timestamp (default: now); same formats as --flow-log-start
 --historical-enis /        with --flow-logs, reconstruct ENIs that existed in the last
   --no-historical-enis       90 days from CloudTrail so a flow on a now-terminated ASG
                              ENI is analysed and its peers resolve to the ENI that held
@@ -354,8 +359,16 @@ their ENIs are churned constantly, so days of flow logs are full of records capt
   dropped), and a reused ASG IP is attributed to the ENI that actually owned it then, giving an
   **ENI ↔ ENI** edge rather than a `flow_peer` whenever the peer was an ENI in the window.
 - **Configurable window.** `--flow-log-days N` (default 60) changes how many days of *records* are
-  read; the CloudTrail history always reaches its 90-day max (never shorter than the record window).
-  Both windows are recorded in `graph.meta` (`flow_log_window_days`, `cloudtrail_window_days`).
+  read. Or specify an **explicit range** with `--flow-log-start <timestamp>` (from that time to now)
+  and optionally `--flow-log-end <timestamp>` (bounding the end) — timestamps are ISO-8601
+  (`2026-05-01`, `2026-05-01T12:00:00Z`) or epoch seconds; `--flow-log-start` is mutually exclusive
+  with `--flow-log-days`. The CloudTrail history always reaches its 90-day max (never shorter than the
+  record window). The window is recorded in `graph.meta` — `flow_log_window_days` in days mode, or
+  `flow_log_start`/`flow_log_end` in range mode — plus `cloudtrail_window_days`.
+
+  ```bash
+  cloudbreachgraph --account prod --flow-logs --flow-log-start 2026-05-01 --flow-log-end 2026-06-01
+  ```
 - **`--collapse-asgs`.** A churning fleet produces a lot of historical ENIs. This flag collapses each
   Auto Scaling group's instances **and** ENIs (current + historical) into a single
   `autoscaling_group` node (`asg:<name>`), re-pointing and merging their edges: external edges move

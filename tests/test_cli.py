@@ -486,6 +486,104 @@ def test_flow_log_days_must_be_positive(tmp_path):
     assert rc == 2
 
 
+def test_flow_log_start_records_range_in_meta(tmp_path):
+    out = tmp_path / "out"
+    rc = cli.main(
+        [
+            "--from-cache",
+            str(FIXTURES),
+            "--flow-logs",
+            "--flow-log-start",
+            "2026-05-01T00:00:00Z",
+            "--flow-log-end",
+            "2026-06-01T00:00:00Z",
+            "--output-dir",
+            str(out),
+        ]
+    )
+    assert rc == 0
+    meta = json.loads((out / "graph.json").read_text())["meta"]
+    assert meta["flow_log_start"] == "2026-05-01T00:00:00Z"
+    assert meta["flow_log_end"] == "2026-06-01T00:00:00Z"
+    assert "flow_log_window_days" not in meta  # range mode replaces the day count
+    assert meta["cloudtrail_window_days"] == 90
+
+
+def test_flow_log_start_only_leaves_end_open(tmp_path):
+    out = tmp_path / "out"
+    rc = cli.main(
+        [
+            "--from-cache",
+            str(FIXTURES),
+            "--flow-logs",
+            "--flow-log-start",
+            "1780000000",
+            "--output-dir",
+            str(out),
+        ]
+    )
+    assert rc == 0
+    meta = json.loads((out / "graph.json").read_text())["meta"]
+    assert meta["flow_log_start"] == "2026-05-28T20:26:40Z"  # epoch-seconds input accepted
+    assert meta["flow_log_end"] is None  # open-ended -> up to now
+
+
+def test_flow_log_end_requires_start(tmp_path, capsys):
+    rc = cli.main(
+        [
+            "--from-cache",
+            str(FIXTURES),
+            "--flow-log-end",
+            "2026-06-01",
+            "--output-dir",
+            str(tmp_path),
+        ]
+    )
+    assert rc == 2
+    assert "--flow-log-end requires --flow-log-start" in capsys.readouterr().err
+
+
+def test_flow_log_end_must_be_after_start(tmp_path, capsys):
+    rc = cli.main(
+        [
+            "--from-cache",
+            str(FIXTURES),
+            "--flow-log-start",
+            "2026-06-01",
+            "--flow-log-end",
+            "2026-05-01",
+            "--output-dir",
+            str(tmp_path),
+        ]
+    )
+    assert rc == 2
+    assert "must be after" in capsys.readouterr().err
+
+
+def test_flow_log_start_rejects_bad_timestamp(tmp_path, capsys):
+    rc = cli.main(
+        ["--from-cache", str(FIXTURES), "--flow-log-start", "nope", "--output-dir", str(tmp_path)]
+    )
+    assert rc == 2
+    assert "invalid timestamp" in capsys.readouterr().err
+
+
+def test_flow_log_days_and_start_are_mutually_exclusive(tmp_path):
+    with pytest.raises(SystemExit):  # argparse rejects the combination
+        cli.main(
+            [
+                "--from-cache",
+                str(FIXTURES),
+                "--flow-log-days",
+                "30",
+                "--flow-log-start",
+                "2026-05-01",
+                "--output-dir",
+                str(tmp_path),
+            ]
+        )
+
+
 def test_historical_enis_present_by_default_under_flow_logs(tmp_path):
     out = tmp_path / "out"
     assert cli.main(["--from-cache", str(FIXTURES), "--flow-logs", "--output-dir", str(out)]) == 0
