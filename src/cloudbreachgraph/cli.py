@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 from . import __version__
@@ -118,7 +119,10 @@ def build_parser() -> argparse.ArgumentParser:
         "cloudtrail:LookupEvents, logs:FilterLogEvents, and s3:ListBucket + s3:GetObject for S3 "
         "destinations",
     )
-    col.add_argument(
+    # The record window is either a day count (--flow-log-days) or an explicit start[/end] range
+    # (--flow-log-start[/--flow-log-end]); the first two are mutually exclusive.
+    window = col.add_mutually_exclusive_group()
+    window.add_argument(
         "--flow-log-days",
         type=int,
         default=collectors.FLOW_LOG_MAX_LOOKBACK_DAYS,
@@ -127,6 +131,19 @@ def build_parser() -> argparse.ArgumentParser:
         f"{collectors.FLOW_LOG_MAX_LOOKBACK_DAYS}; only with --flow-logs). The 90-day CloudTrail "
         f"history used to reconstruct historical ENIs is unaffected (always the full retention, "
         f"never shorter than this window)",
+    )
+    window.add_argument(
+        "--flow-log-start",
+        metavar="TIMESTAMP",
+        help="analyse flow-log records from this timestamp instead of --flow-log-days (ISO-8601 "
+        "like 2026-05-01 or 2026-05-01T12:00:00Z, or epoch seconds; only with --flow-logs). "
+        "Records are read from here up to now, or to --flow-log-end if given",
+    )
+    col.add_argument(
+        "--flow-log-end",
+        metavar="TIMESTAMP",
+        help="with --flow-log-start, only analyse records up to this timestamp (default: now); "
+        "same timestamp formats as --flow-log-start",
     )
     col.add_argument(
         "--historical-enis",
@@ -430,17 +447,61 @@ def _run_all_accounts(cfg: AccountConfig, out_dir: Path, args: argparse.Namespac
 # --------------------------------------------------------------------------- #
 # Entry point
 # --------------------------------------------------------------------------- #
+def _parse_timestamp(value: str) -> float:
+    """Parse an ISO-8601 timestamp or epoch seconds into epoch seconds (UTC-assumed if naive).
+
+    Accepts ``2026-05-01``, ``2026-05-01T12:00:00``, ``...Z``, ``...+00:00`` or a bare epoch-seconds
+    integer. Raises :class:`ValueError` with an actionable message on anything else."""
+    v = value.strip()
+    if v.isdigit():
+        return float(v)
+    try:
+        dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(
+            f"invalid timestamp {value!r} (use ISO-8601 like 2026-05-01T12:00:00Z or epoch seconds)"
+        ) from exc
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.timestamp()
+
+
+def _configure_flow_log_window(args: argparse.Namespace) -> str | None:
+    """Apply the flow-log-record window to the collectors from the CLI args.
+
+    Uses the explicit ``--flow-log-start``/``--flow-log-end`` range when given, else the
+    ``--flow-log-days`` count. Returns an error message (for exit 2) or ``None`` on success.
+    ``--flow-log-days`` and ``--flow-log-start`` are already mutually exclusive via argparse."""
+    collectors.set_flow_log_range(None)  # reset; default is the days-based window
+    if args.flow_log_start is not None:
+        try:
+            start = _parse_timestamp(args.flow_log_start)
+            end = _parse_timestamp(args.flow_log_end) if args.flow_log_end else None
+        except ValueError as exc:
+            return str(exc)
+        if end is not None and end <= start:
+            return "--flow-log-end must be after --flow-log-start"
+        collectors.set_flow_log_range(start, end)
+        return None
+    if args.flow_log_end is not None:
+        return "--flow-log-end requires --flow-log-start"
+    if args.flow_log_days <= 0:
+        return "--flow-log-days must be > 0"
+    collectors.set_flow_log_window(args.flow_log_days)
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     out_dir = Path(args.output_dir)
     runner.set_verbose(bool(args.verbose))
 
-    if args.flow_log_days <= 0:
-        print("cloudbreachgraph: --flow-log-days must be > 0", file=sys.stderr)
-        return 2
     # Thread the flow-log window + historical-ENI toggle into the collectors (module-level knobs,
     # mirroring configure_cache), so the collect_x(profile, region) contract is untouched (§5.7).
-    collectors.set_flow_log_window(args.flow_log_days)
+    window_error = _configure_flow_log_window(args)
+    if window_error is not None:
+        print(f"cloudbreachgraph: {window_error}", file=sys.stderr)
+        return 2
     collectors.set_historical_enis(args.flow_logs and args.historical_enis)
 
     if args.optimize_passes < 0:

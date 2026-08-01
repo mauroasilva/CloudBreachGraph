@@ -61,6 +61,13 @@ _flow_log_window_days: int = FLOW_LOG_MAX_LOOKBACK_DAYS
 # no extra CloudTrail calls are made and the mapping sees no historical ENIs.
 _historical_enabled: bool = True
 
+# An explicit flow-log-record window ``[start, end]`` in epoch seconds (``--flow-log-start`` /
+# ``--flow-log-end``). When ``_flow_log_start_epoch`` is set it **overrides** the days-based window
+# (:data:`_flow_log_window_days`); ``_flow_log_end_epoch`` ``None`` means "up to now". Set once by
+# the CLI via :func:`set_flow_log_range`, mirroring the ``set_flow_log_window`` knob.
+_flow_log_start_epoch: float | None = None
+_flow_log_end_epoch: float | None = None
+
 
 def set_flow_log_window(days: int) -> None:
     """Set the flow-log-record window in days (``--flow-log-days N``); read by the collectors.
@@ -83,6 +90,27 @@ def set_historical_enis(enabled: bool) -> None:
     turns it off). Off ⇒ :func:`collect_historical_enis` short-circuits to an empty list."""
     global _historical_enabled
     _historical_enabled = enabled
+
+
+def set_flow_log_range(start_epoch: float | None, end_epoch: float | None = None) -> None:
+    """Set an explicit flow-log-record window ``[start, end]`` in epoch seconds
+    (``--flow-log-start`` / ``--flow-log-end``), overriding the days-based window.
+    ``end_epoch=None`` means "up to now". ``start_epoch=None`` clears the range (back to the
+    ``--flow-log-days`` window)."""
+    global _flow_log_start_epoch, _flow_log_end_epoch
+    _flow_log_start_epoch = start_epoch
+    _flow_log_end_epoch = end_epoch if start_epoch is not None else None
+
+
+def _flow_log_window_bounds() -> tuple[float, float | None]:
+    """The flow-log-record window as ``(start_epoch, end_epoch|None)``.
+
+    An explicit ``--flow-log-start`` / ``--flow-log-end`` range wins; otherwise ``start = now −
+    <window> days`` and ``end = None`` (up to now). Only the *record* readers use these bounds — the
+    CloudTrail history always reaches its 90-day cap (:func:`_cloudtrail_lookback_days`)."""
+    if _flow_log_start_epoch is not None:
+        return _flow_log_start_epoch, _flow_log_end_epoch
+    return time.time() - _flow_log_window_days * 86400, None
 
 
 def _cloudtrail_lookback_days() -> int:
@@ -989,12 +1017,14 @@ def collect_flow_log_records(profile: str | None, region: str | None) -> list[di
         if dest not in FLOW_LOG_READERS:
             raise FlowLogDestinationError(dest, fls[0].get("FlowLogId"))
 
-    since_epoch = time.time() - _flow_log_window_days * 86400
+    since_epoch, until_epoch = _flow_log_window_bounds()
     records: list[dict] = []
     fetched_by_type: dict[str, int] = {}
     skipped_by_type: dict[str, int] = {}
     for dest, fls in by_type.items():
-        recs, fetched, skipped = FLOW_LOG_READERS[dest](fls, profile, region, since_epoch)
+        recs, fetched, skipped = FLOW_LOG_READERS[dest](
+            fls, profile, region, since_epoch, until_epoch
+        )
         records.extend(recs)
         fetched_by_type[dest] = fetched
         skipped_by_type[dest] = skipped
@@ -1004,11 +1034,16 @@ def collect_flow_log_records(profile: str | None, region: str | None) -> list[di
 
 
 def _read_cloudwatch_records(
-    flow_logs: list[dict], profile: str | None, region: str | None, since_epoch: float
+    flow_logs: list[dict],
+    profile: str | None,
+    region: str | None,
+    since_epoch: float,
+    until_epoch: float | None = None,
 ) -> tuple[list[dict], int, int]:
     """Read records from each CloudWatch log group (``logs filter-log-events``). Returns
     ``(records, events_fetched, groups_skipped)``. Each group's fields come from its own
-    ``LogFormat``. Each group is one **unit** run through :func:`_run_unit`, so a missing group
+    ``LogFormat``. ``until_epoch`` (from ``--flow-log-end``) bounds the query with ``--end-time``
+    when set. Each group is one **unit** run through :func:`_run_unit`, so a missing group
     (``ResourceNotFoundException``) or a transient stall on one group is warned + skipped (with
     backoff/retry) while the others are read — a systemic error (``AccessDenied``) still aborts."""
     group_fields: dict[str, dict[str, int]] = {}
@@ -1020,17 +1055,22 @@ def _read_cloudwatch_records(
                 group_fields[group] = fields
 
     start_ms = int(since_epoch * 1000)
+    end_ms = int(until_epoch * 1000) if until_epoch is not None else None
     records: list[dict] = []
     fetched = 0
     tracker = _FailureTracker("cloud-watch-logs")
     for group in sorted(group_fields):
 
         def _fetch(g: str = group) -> list[dict]:
-            data = runner.run_aws(
-                ["logs", "filter-log-events", f"--log-group-name={g}", f"--start-time={start_ms}"],
-                profile=profile,
-                region=region,
-            )
+            args = [
+                "logs",
+                "filter-log-events",
+                f"--log-group-name={g}",
+                f"--start-time={start_ms}",
+            ]
+            if end_ms is not None:
+                args.append(f"--end-time={end_ms}")
+            data = runner.run_aws(args, profile=profile, region=region)
             return data.get("events", [])
 
         outcome = _run_unit(
@@ -1063,11 +1103,16 @@ def _parse_s3_arn(arn: str | None) -> tuple[str, str] | None:
 
 
 def _read_s3_records(
-    flow_logs: list[dict], profile: str | None, region: str | None, since_epoch: float
+    flow_logs: list[dict],
+    profile: str | None,
+    region: str | None,
+    since_epoch: float,
+    until_epoch: float | None = None,
 ) -> tuple[list[dict], int, int]:
     """Read records from each S3 destination: list the gzipped objects modified within the window
     (``s3api list-objects-v2``), download and parse each (``s3api get-object`` + gunzip). Returns
-    ``(records, objects_read, objects_skipped)``. Distinct ``(bucket, prefix)`` sources are read
+    ``(records, objects_read, objects_skipped)``. ``until_epoch`` (from ``--flow-log-end``) upper-
+    bounds the objects' ``LastModified`` when set. Distinct ``(bucket, prefix)`` sources are read
     once. The per-source *list* and each per-object *get* are units run through :func:`_run_unit`,
     so a corrupt/missing object (``NoSuchKey``/bad gzip) or a transient stall is warned + skipped
     (with backoff) while the rest are read — a systemic error (``AccessDenied``) still aborts."""
@@ -1083,7 +1128,9 @@ def _read_s3_records(
     for bucket, prefix in sorted(sources):
         iam = f"s3:ListBucket and s3:GetObject on bucket '{bucket}'"
         keys_outcome = _run_unit(
-            lambda b=bucket, p=prefix: _list_s3_flow_log_keys(b, p, since_epoch, profile, region),
+            lambda b=bucket, p=prefix: _list_s3_flow_log_keys(
+                b, p, since_epoch, until_epoch, profile, region
+            ),
             source="s3",
             unit=f"s3://{bucket}/{prefix} (list)",
             iam_hint=iam,
@@ -1105,9 +1152,17 @@ def _read_s3_records(
 
 
 def _list_s3_flow_log_keys(
-    bucket: str, prefix: str, since_epoch: float, profile: str | None, region: str | None
+    bucket: str,
+    prefix: str,
+    since_epoch: float,
+    until_epoch: float | None,
+    profile: str | None,
+    region: str | None,
 ) -> list[str]:
-    """The ``.gz`` object keys under ``bucket``/``prefix`` last modified within the window."""
+    """The ``.gz`` object keys under ``bucket``/``prefix`` last modified within the window.
+
+    ``since_epoch`` lower-bounds ``LastModified``; ``until_epoch`` (from ``--flow-log-end``) upper-
+    bounds it when set. Objects with an unknown timestamp are kept."""
     args = ["s3api", "list-objects-v2", f"--bucket={bucket}"]
     if prefix:
         args.append(f"--prefix={prefix}")
@@ -1119,7 +1174,9 @@ def _list_s3_flow_log_keys(
             continue
         modified = _epoch_from_iso(obj.get("LastModified"))
         if modified is not None and modified < since_epoch:
-            continue  # older than the lookback window — skip (keep it if the timestamp is unknown)
+            continue  # older than the window start — skip (keep it if the timestamp is unknown)
+        if modified is not None and until_epoch is not None and modified > until_epoch:
+            continue  # newer than the window end (--flow-log-end)
         keys.append(key)
     return sorted(keys)
 
@@ -1188,7 +1245,10 @@ def _epoch_from_iso(value: str | None) -> float | None:
 # (e.g. kinesis-data-firehose) is one entry here + its reader; until then such a type raises
 # FlowLogDestinationError, so the tool always pulls from the right source or fails loudly (§5.7).
 FLOW_LOG_READERS: dict[
-    str, Callable[[list[dict], str | None, str | None, float], tuple[list[dict], int, int]]
+    str,
+    Callable[
+        [list[dict], str | None, str | None, float, float | None], tuple[list[dict], int, int]
+    ],
 ] = {
     "cloud-watch-logs": _read_cloudwatch_records,
     "s3": _read_s3_records,
@@ -1330,10 +1390,23 @@ def collect_all(
             bundle[key] = collector(acct.profile, acct.region)
         bundle["meta"]["accounts"][role] = acct.account_id
 
-    # Record both flow-log windows so the graph carries them (§5.7 Part 1): the configured record
-    # window and the (always-90) CloudTrail history window. Only when the flow_logs role ran.
+    # Record the flow-log record window so the graph carries it (§5.7): either the configured
+    # ``--flow-log-days`` count, or an explicit ``--flow-log-start``/``--flow-log-end`` range (ISO,
+    # deterministic — user-supplied, not wall-clock). Plus the (always-90) CloudTrail window.
+    # Only when the flow_logs role ran.
     if "flow_logs" in roles:
-        bundle["meta"]["flow_log_window_days"] = _flow_log_window_days
+        if _flow_log_start_epoch is not None:
+            bundle["meta"]["flow_log_start"] = _iso_utc(_flow_log_start_epoch)
+            bundle["meta"]["flow_log_end"] = (
+                _iso_utc(_flow_log_end_epoch) if _flow_log_end_epoch is not None else None
+            )
+        else:
+            bundle["meta"]["flow_log_window_days"] = _flow_log_window_days
         bundle["meta"]["cloudtrail_window_days"] = _cloudtrail_lookback_days()
 
     return bundle
+
+
+def _iso_utc(epoch: float) -> str:
+    """Format epoch seconds as a UTC ISO-8601 string (``2026-05-01T00:00:00Z``)."""
+    return datetime.fromtimestamp(epoch, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
