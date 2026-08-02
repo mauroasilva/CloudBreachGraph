@@ -18,6 +18,7 @@ import email.utils
 import gzip
 import json as _json
 import os
+import re
 import socket
 import struct
 import sys
@@ -28,13 +29,39 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from . import cloudtrail_enis, runner
 from .cloudtrail_enis import enis_from_events
 
+if TYPE_CHECKING:
+    from ..config import ResolvedAccount
+
 # A collector's contract: given an optional profile and region, return normalized dicts.
 Collector = Callable[[str | None, str | None], list[dict]]
+
+
+@dataclass(frozen=True)
+class ArchiveAccess:
+    """How the S3 flow-log object I/O resolves an account (``docs/02_architecture.md §5.7``).
+
+    VPC flow-log *objects* live in the log-archive account, which is often **not** the account the
+    VPCs live in (the ``network`` account). This carries the resolution strategy for the S3 read:
+
+    * ``primary`` — the account attempted **first** (the network account); in centralized-logging
+      setups the source account is frequently granted cross-account read on the bucket, so this
+      usually just works with no config.
+    * ``explicit`` — when the ``flow_logs`` role is **explicitly bound** (a ``[targets.<t>.roles]``
+      entry, or ``--profile``), the S3 read uses this account **directly** — the auto-resolution
+      trial is skipped.
+    * ``candidates`` — the ordered fallback accounts (distinct configured ``account_id → profile``
+      entries) tried, first success wins, only when ``explicit`` is unset and ``primary`` is denied.
+    """
+
+    primary: ResolvedAccount
+    explicit: ResolvedAccount | None = None
+    candidates: tuple[ResolvedAccount, ...] = ()
+
 
 # How far back the flow-log *record* analysis reaches by default (``docs/02_architecture.md §5.7``).
 # This is the **default** for the configurable ``--flow-log-days N`` window; the effective window is
@@ -342,6 +369,10 @@ def _normalize_flow_log(raw: dict) -> dict:
         "LogDestinationType": raw.get("LogDestinationType"),
         "LogGroupName": raw.get("LogGroupName"),
         "LogDestination": raw.get("LogDestination"),
+        # ``LogFormat`` is kept so the *record* fetch can reuse this one config source (queried in
+        # the network account) — the CloudWatch reader derives each group's field positions from it,
+        # rather than re-running ``describe-flow-logs`` under a second profile (§5.7 cross-account).
+        "LogFormat": raw.get("LogFormat"),
         "DeliverLogsStatus": raw.get("DeliverLogsStatus"),
         "FlowLogStatus": raw.get("FlowLogStatus"),
         "TrafficType": raw.get("TrafficType"),
@@ -761,6 +792,30 @@ class FlowLogFetchError(RuntimeError):
     *should* have worked failing in a way that makes a partial graph misleading, not incomplete."""
 
 
+class FlowLogCoverageError(RuntimeError):
+    """The discovered flow-log config doesn't cover the discovered VPCs (``§5.7`` coverage check).
+
+    Raised **before** any S3 download when the ``describe-flow-logs`` result references **none** of
+    the discovered ``vpc-``/``subnet-``/``eni-`` ids — the exact symptom of querying the flow-log
+    configuration in the **wrong account** (the archive account instead of the VPC/network account),
+    which returns that account's unrelated flow logs with no error. Also raised on the fetch side
+    when **every** covered VPC yields zero in-window objects. Caught in
+    :func:`cloudbreachgraph.cli.main` → non-zero exit. Distinct from :class:`FlowLogFetchError`
+    (a fetch that should have worked failing): this is a *config/account mismatch*, not a fetch
+    failure — an auth error can't catch it because the wrong-account query *succeeds*."""
+
+
+class _S3AccessDeniedError(RuntimeError):
+    """S3 ``list``/``get`` was denied (``AccessDenied``/``Forbidden``) for one profile.
+
+    Internal signal that drives the archive-account auto-resolution fallback
+    (``docs/02_architecture.md §5.7`` design guidance B) rather than a hard abort: the S3 read is
+    retried under the next configured profile. Only surfaced by :func:`_run_unit` when
+    ``access_denied_signals=True`` (the auto-resolution list probe); otherwise an ``AccessDenied``
+    still aborts via :class:`FlowLogFetchError` as before (e.g. an explicit binding, or a per-object
+    ``get`` after the account is already resolved)."""
+
+
 class _SkippableUnitError(RuntimeError):
     """A single unit is unreadable in a way that is safe to skip (corrupt gzip, decode error).
 
@@ -779,12 +834,11 @@ class _ErrorTier(Enum):
 
 
 _EXPIRED_TOKENS = ("ExpiredToken", "ExpiredTokenException", "InvalidToken", "TokenRefreshRequired")
-_SYSTEMIC_TOKENS = (
-    "AccessDenied",
-    "Forbidden",
-    "AuthorizationHeaderMalformed",
-    "SignatureDoesNotMatch",
-)
+# Permission-denied tokens (a subset of the systemic tier). For the S3 auto-resolution list probe
+# these drive the archive-account fallback (:class:`_S3AccessDeniedError`) instead of aborting; a
+# real signing/clock systemic error (``SignatureDoesNotMatch``) always aborts and is excluded here.
+_ACCESS_DENIED_TOKENS = ("AccessDenied", "Forbidden", "AuthorizationHeaderMalformed")
+_SYSTEMIC_TOKENS = (*_ACCESS_DENIED_TOKENS, "SignatureDoesNotMatch")
 _TRANSIENT_TOKENS = (
     "RequestTimeout",
     "SlowDown",
@@ -904,7 +958,21 @@ def _short_cause(exc: BaseException) -> str:
     return text[0] if text else exc.__class__.__name__
 
 
-def _run_unit(fetch: Callable[[], Any], *, source: str, unit: str, iam_hint: str) -> _FetchOutcome:
+def _is_access_denied(stderr: str | None) -> bool:
+    """Whether a systemic error is a *permission* denial (drives the S3 archive fallback), as
+    opposed to a signing/clock systemic error (``SignatureDoesNotMatch``, which always aborts)."""
+    s = stderr or ""
+    return any(tok in s for tok in _ACCESS_DENIED_TOKENS)
+
+
+def _run_unit(
+    fetch: Callable[[], Any],
+    *,
+    source: str,
+    unit: str,
+    iam_hint: str,
+    access_denied_signals: bool = False,
+) -> _FetchOutcome:
     """Run one unit fetch (an S3 object, or a CloudWatch group) under the shared resilience rules.
 
     ``fetch`` performs the AWS call(s) and returns the unit's value; it is re-invoked from scratch
@@ -912,7 +980,13 @@ def _run_unit(fetch: Callable[[], Any], *, source: str, unit: str, iam_hint: str
     ``"s3"``/``"cloud-watch-logs"`` and ``iam_hint`` names the IAM a systemic auth failure would
     need — both only for messages. Returns a :class:`_FetchOutcome`; raises
     :class:`CredentialsExpiredError` (tier 2) or :class:`FlowLogFetchError` (tier 1 real-clock /
-    tier 4 systemic) to abort/propagate."""
+    tier 4 systemic) to abort/propagate.
+
+    When ``access_denied_signals`` is set (the S3 auto-resolution *list* probe), a permission
+    denial (``AccessDenied``/``Forbidden``) raises :class:`_S3AccessDeniedError` instead of
+    aborting,
+    so the caller can retry under the next configured profile; ``SignatureDoesNotMatch`` still
+    aborts."""
     attempt = 0
     while True:
         try:
@@ -927,6 +1001,8 @@ def _run_unit(fetch: Callable[[], Any], *, source: str, unit: str, iam_hint: str
                     f"credentials expired while fetching {source} unit {unit}: {_short_cause(exc)}"
                 ) from exc
             if tier is _ErrorTier.SYSTEMIC:
+                if access_denied_signals and _is_access_denied(exc.stderr):
+                    raise _S3AccessDeniedError(_short_cause(exc)) from exc
                 raise FlowLogFetchError(_systemic_message(source, unit, iam_hint, exc)) from exc
             if tier is _ErrorTier.CLOCK_SKEW:
                 offset = _trusted_time_offset()
@@ -1008,6 +1084,143 @@ class _FailureTracker:
             )
 
 
+# --------------------------------------------------------------------------- #
+# VPC coverage reconciliation (§5.7 design guidance C) — validate that the discovered flow-log
+# config actually references the discovered VPCs *before* downloading a single object, so a
+# config-in-wrong-account mistake fails fast instead of after thousands of unrelated gets.
+# --------------------------------------------------------------------------- #
+# A VPC flow-log id as it appears in an S3 object key (``..._vpcflowlogs_<region>_fl-<hex>_...``)
+# and as ``describe-flow-logs`` returns it. Used by the precision filter + per-VPC accounting.
+_FLOW_LOG_ID_RE = re.compile(r"fl-[0-9a-f]+")
+# The source account id in an S3 flow-log key path ``AWSLogs/<account-id>/...`` (a 12-digit id). It
+# is the account the VPCs live in (the network account), used as a secondary precision guard.
+_AWS_LOGS_ACCOUNT_RE = re.compile(r"AWSLogs/(\d{12})/")
+
+
+@dataclass
+class FlowLogCoverage:
+    """Reconciliation of discovered flow logs against the discovered VPC/subnet/ENI universe.
+
+    Built by :func:`check_vpc_coverage` from the network account's ``vpcs``/``subnets``/
+    ``network_interfaces`` and the ``describe-flow-logs`` result. Drives the coverage hard-fail
+    (config queried in the wrong account), the uncovered-VPC warning, the S3 precision filter
+    (``in_scope_fl_ids``) and the per-VPC completeness accounting (``fl_to_vpc``)."""
+
+    vpcs_total: int
+    covered_vpcs: list[str]  # discovered VPCs with ≥1 flow log (sorted)
+    uncovered_vpcs: list[str]  # discovered VPCs with no flow log (sorted)
+    in_scope_fl_ids: set[str]  # flow-log ids referencing a discovered vpc/subnet/eni
+    fl_to_vpc: dict[str, str]  # in-scope flow-log id -> the discovered VPC it maps to
+
+    def meta(self, per_vpc: dict[str, dict[str, int]] | None = None) -> dict:
+        """A deterministic ``meta.flow_log_coverage`` payload (sorted; no wall-clock)."""
+        out: dict = {
+            "vpcs_total": self.vpcs_total,
+            "vpcs_covered": len(self.covered_vpcs),
+            "covered_vpcs": sorted(self.covered_vpcs),
+            "uncovered_vpcs": sorted(self.uncovered_vpcs),
+        }
+        if per_vpc is not None:
+            out["per_vpc"] = {
+                vpc: {
+                    "objects": per_vpc.get(vpc, {}).get("objects", 0),
+                    "records": per_vpc.get(vpc, {}).get("records", 0),
+                }
+                for vpc in sorted(self.covered_vpcs)
+            }
+        return out
+
+
+def check_vpc_coverage(
+    flow_logs: list[dict],
+    vpcs: list[dict],
+    subnets: list[dict],
+    enis: list[dict],
+) -> FlowLogCoverage:
+    """Reconcile the discovered flow logs against the discovered VPCs (``§5.7`` guidance C).
+
+    A flow log "covers" a discovered resource when its ``ResourceId`` (a ``vpc-``/``subnet-``/
+    ``eni-`` id) maps up to a discovered VPC. Raises :class:`FlowLogCoverageError` — **before** any
+    S3 I/O — when flow logs exist but reference **none** of the discovered VPCs (the cross-account
+    symptom). VPCs with no flow log are reported (not fatal) via the returned ``uncovered_vpcs``."""
+    vpc_ids = {v.get("VpcId") for v in vpcs if v.get("VpcId")}
+    subnet_to_vpc = {s.get("SubnetId"): s.get("VpcId") for s in subnets if s.get("SubnetId")}
+    eni_to_vpc = {
+        e.get("NetworkInterfaceId"): e.get("VpcId") for e in enis if e.get("NetworkInterfaceId")
+    }
+
+    def _vpc_of(resource_id: str | None) -> str | None:
+        if not resource_id:
+            return None
+        if resource_id.startswith("vpc-"):
+            return resource_id if resource_id in vpc_ids else None
+        if resource_id.startswith("subnet-"):
+            vpc = subnet_to_vpc.get(resource_id)
+            return vpc if vpc in vpc_ids else None
+        if resource_id.startswith("eni-"):
+            vpc = eni_to_vpc.get(resource_id)
+            return vpc if vpc in vpc_ids else None
+        return None
+
+    in_scope_fl_ids: set[str] = set()
+    fl_to_vpc: dict[str, str] = {}
+    covered: set[str] = set()
+    for fl in flow_logs:
+        vpc = _vpc_of(fl.get("ResourceId"))
+        if vpc is None:
+            continue
+        covered.add(vpc)
+        fid = fl.get("FlowLogId")
+        if fid:
+            in_scope_fl_ids.add(fid)
+            fl_to_vpc[fid] = vpc
+
+    uncovered = sorted(vpc_ids - covered)  # type: ignore[operator]
+    coverage = FlowLogCoverage(
+        vpcs_total=len(vpc_ids),
+        covered_vpcs=sorted(covered),
+        uncovered_vpcs=uncovered,
+        in_scope_fl_ids=in_scope_fl_ids,
+        fl_to_vpc=fl_to_vpc,
+    )
+
+    # Hard fail (the cross-account symptom): flow logs exist and VPCs were discovered, but no flow
+    # log references any of them — describe-flow-logs was almost certainly queried in the wrong
+    # account. Fail here, before downloading anything.
+    if flow_logs and vpc_ids and not covered:
+        raise FlowLogCoverageError(
+            f"aborting flow-log analysis: discovered {len(vpc_ids)} VPC(s) but "
+            f"describe-flow-logs returned {len(flow_logs)} flow log(s), none referencing any of "
+            f"them (their ResourceIds are all foreign). The flow-log configuration was almost "
+            f"certainly queried in the wrong account — it must run in the VPC/network account, not "
+            f"the log-archive account. Check the `network` vs `flow_logs` target binding."
+        )
+    return coverage
+
+
+def _flow_log_id_from_key(key: str) -> str | None:
+    """The ``fl-…`` id embedded in an S3 flow-log object filename, or ``None`` (§5.7 precision)."""
+    m = _FLOW_LOG_ID_RE.search(key)
+    return m.group(0) if m else None
+
+
+def _aws_logs_account_from_key(key: str) -> str | None:
+    """The source account id from an ``AWSLogs/<account-id>/`` S3 key segment, or ``None``."""
+    m = _AWS_LOGS_ACCOUNT_RE.search(key)
+    return m.group(1) if m else None
+
+
+def _warn_uncovered_vpcs(coverage: FlowLogCoverage) -> None:
+    """Warn (stderr, non-fatal per §9) about discovered VPCs with **no** flow log configured."""
+    if coverage.uncovered_vpcs:
+        print(
+            f"cloudbreachgraph: warning: {len(coverage.uncovered_vpcs)} discovered VPC(s) have no "
+            f"flow log configured (no flow-log analysis for them): "
+            f"{', '.join(coverage.uncovered_vpcs)}.",
+            file=sys.stderr,
+        )
+
+
 def collect_flow_log_records(profile: str | None, region: str | None) -> list[dict]:
     """Fetch and parse the flow-log *records* for the account's flow logs, per destination type.
 
@@ -1023,17 +1236,7 @@ def collect_flow_log_records(profile: str | None, region: str | None) -> list[di
     config = runner.run_aws(["ec2", "describe-flow-logs"], profile=profile, region=region)
     flow_logs = config.get("FlowLogs", [])
 
-    by_type: dict[str | None, list[dict]] = {}
-    dest_counts: dict[str, int] = {}
-    for fl in flow_logs:
-        dest = fl.get("LogDestinationType")
-        dest_counts[dest or "unknown"] = dest_counts.get(dest or "unknown", 0) + 1
-        by_type.setdefault(dest, []).append(fl)
-
-    # Fail loudly on any destination type we can't read — before doing partial work.
-    for dest, fls in by_type.items():
-        if dest not in FLOW_LOG_READERS:
-            raise FlowLogDestinationError(dest, fls[0].get("FlowLogId"))
+    by_type, dest_counts = _group_flow_logs_by_dest(flow_logs)
 
     since_epoch, until_epoch = _flow_log_window_bounds()
     records: list[dict] = []
@@ -1051,26 +1254,119 @@ def collect_flow_log_records(profile: str | None, region: str | None) -> list[di
     return records
 
 
+def _group_flow_logs_by_dest(
+    flow_logs: list[dict],
+) -> tuple[dict[str | None, list[dict]], dict[str, int]]:
+    """Group flow logs by ``LogDestinationType`` and validate each has an implemented reader.
+
+    Returns ``(by_type, dest_counts)``; raises :class:`FlowLogDestinationError` for a destination
+    type with no reader — **before** any partial fetch work (``docs/02_architecture.md §5.7``)."""
+    by_type: dict[str | None, list[dict]] = {}
+    dest_counts: dict[str, int] = {}
+    for fl in flow_logs:
+        dest = fl.get("LogDestinationType")
+        dest_counts[dest or "unknown"] = dest_counts.get(dest or "unknown", 0) + 1
+        by_type.setdefault(dest, []).append(fl)
+    for dest, fls in by_type.items():
+        if dest not in FLOW_LOG_READERS:
+            raise FlowLogDestinationError(dest, fls[0].get("FlowLogId"))
+    return by_type, dest_counts
+
+
+def fetch_flow_log_records(
+    flow_logs: list[dict],
+    network: ResolvedAccount,
+    archive: ArchiveAccess,
+    *,
+    coverage: FlowLogCoverage | None = None,
+    network_account_id: str | None = None,
+) -> tuple[list[dict], dict[str, dict[str, int]], ResolvedAccount | None]:
+    """Fetch flow-log *records* across two accounts (``§5.7`` cross-account split), given the config
+    already discovered (in the **network** account — queried once, not re-run here).
+
+    CloudWatch reads (``logs filter-log-events``) run under ``network`` (the log group lives with
+    the VPCs); S3 reads (``list-objects-v2`` + ``get-object``) run under the **archive** account
+    resolved by :class:`_ArchiveResolver` (explicit binding, else primary→AccessDenied fallback).
+    ``coverage``
+    scopes the S3 download to the in-scope ``fl-…`` objects (precision) and drives per-VPC
+    object/record accounting (completeness). Returns ``(records, per_vpc, resolved_archive)`` — the
+    per-VPC counts and the account the S3 objects were actually read under (for provenance)."""
+    by_type, dest_counts = _group_flow_logs_by_dest(flow_logs)
+    since_epoch, until_epoch = _flow_log_window_bounds()
+    fl_to_vpc = coverage.fl_to_vpc if coverage else None
+    # Only scope by fl-id when a discovered VPC universe exists; with no VPCs (e.g. a thin cache) an
+    # empty in-scope set would wrongly drop every object, so fall back to no precision filter.
+    allowed = coverage.in_scope_fl_ids if (coverage and coverage.vpcs_total) else None
+
+    resolver = _ArchiveResolver(archive)
+    per_vpc: dict[str, dict[str, int]] = {}
+    records: list[dict] = []
+    fetched_by_type: dict[str, int] = {}
+    skipped_by_type: dict[str, int] = {}
+    for dest, fls in by_type.items():
+        if dest == "s3":
+            recs, fetched, skipped = _read_s3_records(
+                fls,
+                network.profile,
+                network.region,
+                since_epoch,
+                until_epoch,
+                resolver=resolver,
+                allowed_fl_ids=allowed,
+                fl_to_vpc=fl_to_vpc,
+                network_account_id=network_account_id,
+                per_vpc=per_vpc,
+            )
+        else:  # cloud-watch-logs — validated by _group_flow_logs_by_dest
+            recs, fetched, skipped = _read_cloudwatch_records(
+                fls,
+                network.profile,
+                network.region,
+                since_epoch,
+                until_epoch,
+                fl_to_vpc=fl_to_vpc,
+                per_vpc=per_vpc,
+            )
+        records.extend(recs)
+        fetched_by_type[dest] = fetched
+        skipped_by_type[dest] = skipped
+
+    _report_flow_log_records(flow_logs, dest_counts, fetched_by_type, skipped_by_type, len(records))
+    return records, per_vpc, resolver.resolved
+
+
 def _read_cloudwatch_records(
     flow_logs: list[dict],
     profile: str | None,
     region: str | None,
     since_epoch: float,
     until_epoch: float | None = None,
+    *,
+    fl_to_vpc: dict[str, str] | None = None,
+    per_vpc: dict[str, dict[str, int]] | None = None,
 ) -> tuple[list[dict], int, int]:
     """Read records from each CloudWatch log group (``logs filter-log-events``). Returns
     ``(records, events_fetched, groups_skipped)``. Each group's fields come from its own
     ``LogFormat``. ``until_epoch`` (from ``--flow-log-end``) bounds the query with ``--end-time``
     when set. Each group is one **unit** run through :func:`_run_unit`, so a missing group
     (``ResourceNotFoundException``) or a transient stall on one group is warned + skipped (with
-    backoff/retry) while the others are read — a systemic error (``AccessDenied``) still aborts."""
+    backoff/retry) while the others are read — a systemic error (``AccessDenied``) still aborts.
+
+    The CloudWatch reader runs under the **network** account (the log group lives with the VPCs).
+    When ``per_vpc`` is provided, each group's events/records are attributed to the VPC(s) the group
+    belongs to (via ``fl_to_vpc``) for the completeness accounting (§5.7 guidance D)."""
     group_fields: dict[str, dict[str, int]] = {}
+    group_to_vpcs: dict[str, set[str]] = {}
     for fl in flow_logs:
         group = fl.get("LogGroupName")
         if group and group not in group_fields:
             fields = _field_index_from_format(fl.get("LogFormat"))
             if fields is not None:
                 group_fields[group] = fields
+        if group and fl_to_vpc is not None:
+            vpc = fl_to_vpc.get(fl.get("FlowLogId"))
+            if vpc:
+                group_to_vpcs.setdefault(group, set()).add(vpc)
 
     start_ms = int(since_epoch * 1000)
     end_ms = int(until_epoch * 1000) if until_epoch is not None else None
@@ -1102,11 +1398,109 @@ def _read_cloudwatch_records(
             continue
         events = outcome.value
         fetched += len(events)
+        parsed_here = 0
         for event in events:
             rec = _parse_flow_log_message(event.get("message", ""), group, group_fields[group])
             if rec is not None:
                 records.append(rec)
+                parsed_here += 1
+        if per_vpc is not None:
+            for vpc in group_to_vpcs.get(group, set()):
+                acc = per_vpc.setdefault(vpc, {"objects": 0, "records": 0})
+                acc["objects"] += len(events)
+                acc["records"] += parsed_here
     return records, fetched, tracker.failed
+
+
+class _ArchiveResolver:
+    """Resolve which account the S3 flow-log objects are read under (``§5.7`` design guidance B).
+
+    An explicit ``flow_logs`` binding is used directly (no trial). Otherwise the **primary**
+    (network) account is tried first — the ``list-objects-v2`` we already make *is* the access probe
+    (no separate probe, no wasted ``get-object``) — and on an ``AccessDenied``/``Forbidden`` the
+    read
+    falls back through the configured candidate profiles, first success wins. The working account is
+    remembered so later sources try it first, and the per-object ``get-object`` calls run under it.
+    """
+
+    def __init__(self, archive: ArchiveAccess) -> None:
+        self.archive = archive
+        self.resolved: ResolvedAccount | None = archive.explicit
+
+    def _ordered_accounts(self) -> list[ResolvedAccount]:
+        if self.archive.explicit is not None:
+            return [self.archive.explicit]
+        ordered: list[ResolvedAccount] = []
+        for acct in (self.resolved, self.archive.primary, *self.archive.candidates):
+            if acct is not None and all(acct.profile != s.profile for s in ordered):
+                ordered.append(acct)
+        return ordered
+
+    def list_source(
+        self, bucket: str, prefix: str, since: float, until: float | None, iam: str
+    ) -> tuple[_FetchOutcome, ResolvedAccount]:
+        """List one source, resolving the account. Returns ``(list_outcome, account)``; the account
+        is what the caller reads objects under. Raises :class:`FlowLogFetchError` when every
+        candidate is denied (auto-resolution exhausted) — naming the bucket and profiles tried."""
+        accounts = self._ordered_accounts()
+        auto = self.archive.explicit is None
+        denied: list[ResolvedAccount] = []
+        for acct in accounts:
+            try:
+                outcome = _run_unit(
+                    lambda a=acct: _list_s3_flow_log_objects(
+                        bucket, prefix, since, until, a.profile, a.region
+                    ),
+                    source="s3",
+                    unit=f"s3://{bucket}/{prefix} (list)",
+                    iam_hint=iam,
+                    access_denied_signals=auto,
+                )
+            except _S3AccessDeniedError:
+                denied.append(acct)
+                continue
+            if outcome.ok:
+                self.resolved = acct
+            return outcome, acct
+        raise FlowLogFetchError(_archive_unresolved_message(bucket, denied))
+
+
+def _archive_unresolved_message(bucket: str, tried: list[ResolvedAccount]) -> str:
+    profiles = ", ".join(a.profile or "<default>" for a in tried) or "<none>"
+    return (
+        f"aborting flow-log fetch: none of the tried profiles could read the flow-log archive "
+        f"bucket '{bucket}' (AccessDenied under [{profiles}]). Bind the archive account explicitly "
+        f'with a [targets.<name>.roles] entry (e.g. `flow_logs = "<archive-account-alias>"`), or '
+        f"grant the primary profile s3:ListBucket + s3:GetObject on the bucket."
+    )
+
+
+def _filter_objects_in_scope(
+    objects: list[tuple[str, int]],
+    allowed_fl_ids: set[str] | None,
+    network_account_id: str | None,
+) -> list[tuple[str, int]]:
+    """Keep only the in-scope flow-log objects (``§5.7`` guidance D precision).
+
+    Drops an object whose embedded ``fl-…`` id is **not** in ``allowed_fl_ids`` (the flow logs whose
+    ``ResourceId`` maps to a discovered VPC), and — as a secondary guard — one whose
+    ``AWSLogs/<acct>/`` segment names a **different** account than ``network_account_id``. Objects
+    with no extractable id/account are kept (a non-standard key can't be proven out-of-scope). With
+    both filters unset this is a no-op (the legacy single-account path)."""
+    if allowed_fl_ids is None and network_account_id is None:
+        return objects
+    kept: list[tuple[str, int]] = []
+    for key, size in objects:
+        if allowed_fl_ids is not None:
+            fid = _flow_log_id_from_key(key)
+            if fid is not None and fid not in allowed_fl_ids:
+                continue
+        if network_account_id is not None:
+            acct = _aws_logs_account_from_key(key)
+            if acct is not None and acct != network_account_id:
+                continue
+        kept.append((key, size))
+    return kept
 
 
 def _parse_s3_arn(arn: str | None) -> tuple[str, str] | None:
@@ -1126,6 +1520,12 @@ def _read_s3_records(
     region: str | None,
     since_epoch: float,
     until_epoch: float | None = None,
+    *,
+    resolver: _ArchiveResolver | None = None,
+    allowed_fl_ids: set[str] | None = None,
+    fl_to_vpc: dict[str, str] | None = None,
+    network_account_id: str | None = None,
+    per_vpc: dict[str, dict[str, int]] | None = None,
 ) -> tuple[list[dict], int, int]:
     """Read records from each S3 destination: list the gzipped objects modified within the window
     (``s3api list-objects-v2``), download and parse each (``s3api get-object`` + gunzip). Returns
@@ -1134,6 +1534,11 @@ def _read_s3_records(
     once. The per-source *list* and each per-object *get* are units run through :func:`_run_unit`,
     so a corrupt/missing object (``NoSuchKey``/bad gzip) or a transient stall is warned + skipped
     (with backoff) while the rest are read — a systemic error (``AccessDenied``) still aborts.
+
+    When ``resolver`` is given (the cross-account path) the list + gets run under the **archive**
+    account it resolves (primary → AccessDenied fallback), not the passed ``profile``/``region``.
+    ``allowed_fl_ids``/``network_account_id`` scope the download to the in-scope objects (precision,
+    §5.7 D) and ``per_vpc``/``fl_to_vpc`` accumulate per-VPC object/record counts (completeness).
 
     Each source is read **largest object first** (:func:`_size_descending_keys`) and stops early on
     a run of NODATA (empty parses): a cold source with no records is abandoned after
@@ -1154,17 +1559,26 @@ def _read_s3_records(
     empty_sources: list[str] = []  # sources abandoned as all-NODATA (largest objects parse nothing)
     for bucket, prefix in sorted(sources):
         iam = f"s3:ListBucket and s3:GetObject on bucket '{bucket}'"
-        objects_outcome = _run_unit(
-            lambda b=bucket, p=prefix: _list_s3_flow_log_objects(
-                b, p, since_epoch, until_epoch, profile, region
-            ),
-            source="s3",
-            unit=f"s3://{bucket}/{prefix} (list)",
-            iam_hint=iam,
-        )
+        if resolver is not None:
+            objects_outcome, acct = resolver.list_source(
+                bucket, prefix, since_epoch, until_epoch, iam
+            )
+            get_profile, get_region = acct.profile, acct.region
+        else:
+            objects_outcome = _run_unit(
+                lambda b=bucket, p=prefix: _list_s3_flow_log_objects(
+                    b, p, since_epoch, until_epoch, profile, region
+                ),
+                source="s3",
+                unit=f"s3://{bucket}/{prefix} (list)",
+                iam_hint=iam,
+            )
+            get_profile, get_region = profile, region
         if not objects_outcome.ok:
             continue  # couldn't list this source (skippable/transient-exhausted) — move on
-        objects = objects_outcome.value
+        objects = _filter_objects_in_scope(
+            objects_outcome.value, allowed_fl_ids, network_account_id
+        )
         total = len(objects)
         largest = max((size for _, size in objects), default=0)
         order = _size_descending_keys(objects)
@@ -1173,7 +1587,9 @@ def _read_s3_records(
         zero_streak = 0  # consecutive successfully-read objects (in size order) that parsed nothing
         for i, key in enumerate(order):
             outcome = _run_unit(
-                lambda b=bucket, k=key: _read_s3_object_records(b, k, profile, region),
+                lambda b=bucket, k=key, gp=get_profile, gr=get_region: _read_s3_object_records(
+                    b, k, gp, gr
+                ),
                 source="s3",
                 unit=f"s3://{bucket}/{key}",
                 iam_hint=iam,
@@ -1186,6 +1602,7 @@ def _read_s3_records(
             parsed = len(outcome.value)
             records.extend(outcome.value)
             src_parsed += parsed
+            _account_object_to_vpc(per_vpc, fl_to_vpc, key, parsed)
             zero_streak = zero_streak + 1 if parsed == 0 else 0
             # Read largest first, so once a run of NODATA builds up the remaining objects are all
             # smaller and almost certainly NODATA too — stop reading this source. A cold source (no
@@ -1220,6 +1637,25 @@ def _read_s3_records(
             f"unrecognised format. Check the flow log's TrafficType/format, or narrow the window."
         )
     return records, objects_read, tracker.failed
+
+
+def _account_object_to_vpc(
+    per_vpc: dict[str, dict[str, int]] | None,
+    fl_to_vpc: dict[str, str] | None,
+    key: str,
+    parsed: int,
+) -> None:
+    """Attribute one read S3 object (+ its parsed records) to the VPC of the flow-log id in its key,
+    for the per-VPC completeness accounting (§5.7 D). No-op when accounting isn't requested."""
+    if per_vpc is None or not fl_to_vpc:
+        return
+    fid = _flow_log_id_from_key(key)
+    vpc = fl_to_vpc.get(fid) if fid else None
+    if vpc is None:
+        return
+    acc = per_vpc.setdefault(vpc, {"objects": 0, "records": 0})
+    acc["objects"] += 1
+    acc["records"] += parsed
 
 
 def _list_s3_flow_log_objects(
@@ -1421,12 +1857,17 @@ ROLE_COLLECTORS: dict[str, list[Collector]] = {
     ],
     # flow_logs (§5.7): IP-allocation history + VPC flow-log config/records. Opt-in via
     # ``--flow-logs`` (the CLI adds the role to the active set); needs extra read-only IAM
-    # (ec2:DescribeFlowLogs, cloudtrail:LookupEvents, logs:FilterLogEvents).
+    # (ec2:DescribeFlowLogs, cloudtrail:LookupEvents, logs:FilterLogEvents in the *network* account;
+    # s3:ListBucket + s3:GetObject in the *archive* account). NOTE: unlike ``network``, this role is
+    # **not** run by the generic driver loop — :func:`collect_all` special-cases it via
+    # :func:`_collect_flow_logs_role`, because the four collectors span **two** accounts (config +
+    # CloudTrail + CloudWatch in the network account; S3 object I/O in the archive account). The
+    # registry entry documents the collectors + result keys; the account split lives in the driver.
     "flow_logs": [
-        collect_flow_logs,  # aws ec2        describe-flow-logs   -> .FlowLogs[]
-        collect_ip_allocation_events,  # aws cloudtrail lookup-events        -> allocation records
-        collect_historical_enis,  # aws cloudtrail lookup-events (x4)   -> reconstructed ENIs
-        collect_flow_log_records,  # aws logs       filter-log-events    -> parsed flow records
+        collect_flow_logs,  # aws ec2        describe-flow-logs   -> .FlowLogs[]   (network acct)
+        collect_ip_allocation_events,  # aws cloudtrail lookup-events -> allocations (network acct)
+        collect_historical_enis,  # aws cloudtrail lookup-events (x4)   -> historical (network acct)
+        collect_flow_log_records,  # readers: CloudWatch (network) / S3 (archive) -> flow records
     ],
 }
 
@@ -1450,6 +1891,96 @@ ROLE_RESULT_KEYS: dict[str, list[str]] = {
 
 
 # --------------------------------------------------------------------------- #
+# flow_logs role driver (§5.7 cross-account split) — config/CloudTrail/CloudWatch in the network
+# account, S3 object I/O in the archive account, with the coverage/precision/completeness checks.
+# --------------------------------------------------------------------------- #
+def _collect_flow_logs_role(resolved, bundle: dict, archive_access: ArchiveAccess | None) -> None:
+    """Collect the ``flow_logs`` role across the network + archive accounts and gate on coverage.
+
+    Runs ``describe-flow-logs`` **once** (network account) and reuses that config for both the graph
+    nodes and the record fetch. The coverage check runs **before** any S3 download so a
+    config-in-wrong-account mistake fails fast; the fetch is scoped to the in-scope ``fl-…`` objects
+    and reconciled per VPC for completeness. Writes the four ``flow_logs`` result keys plus
+    ``meta.flow_log_coverage`` into ``bundle`` and records both accounts under ``meta.accounts``."""
+    net = resolved.roles.get("network") or resolved.roles["flow_logs"]
+    fl_role_acct = resolved.roles["flow_logs"]
+
+    # Config, IP-allocation history and historical-ENI reconstruction are EC2/CloudTrail resources
+    # of the VPC account — run them under the network account (§5.7 A).
+    flow_logs = collect_flow_logs(net.profile, net.region)
+    bundle["flow_logs"] = flow_logs
+    bundle["ip_allocations"] = collect_ip_allocation_events(net.profile, net.region)
+    bundle["historical_enis"] = collect_historical_enis(net.profile, net.region)
+
+    # Validate destination types up front (raises FlowLogDestinationError for an unreadable type
+    # like kinesis-data-firehose) — a distinct fail-loud that precedes the coverage check.
+    _group_flow_logs_by_dest(flow_logs)
+
+    # Coverage reconciliation BEFORE any S3 I/O (§5.7 C): a wrong-account config fails here, not
+    # after thousands of unrelated gets. Uncovered VPCs are a soft warning (§9), not fatal.
+    coverage = check_vpc_coverage(
+        flow_logs,
+        bundle.get("vpcs", []),
+        bundle.get("subnets", []),
+        bundle.get("network_interfaces", []),
+    )
+    _warn_uncovered_vpcs(coverage)
+
+    # Records: CloudWatch under the network account, S3 under the resolved archive account. When the
+    # CLI didn't supply an ArchiveAccess (--from-cache / simple callers), use the flow_logs role's
+    # own account directly as an explicit binding — so single-account runs are unchanged.
+    archive = archive_access or ArchiveAccess(primary=net, explicit=fl_role_acct)
+    records, per_vpc, resolved_archive = fetch_flow_log_records(
+        flow_logs,
+        net,
+        archive,
+        coverage=coverage,
+        network_account_id=net.account_id,
+    )
+    bundle["flow_log_records"] = records
+
+    _check_flow_log_completeness(coverage, per_vpc)
+    bundle["meta"]["flow_log_coverage"] = coverage.meta(per_vpc)
+    bundle["meta"]["accounts"]["network"] = net.account_id
+    # Provenance: the account the S3 objects were actually read under (the resolved archive, which
+    # may differ from the bound flow_logs account after an auto-resolution fallback).
+    archive_acct = resolved_archive or fl_role_acct
+    bundle["meta"]["accounts"]["flow_logs"] = archive_acct.account_id
+
+
+def _check_flow_log_completeness(
+    coverage: FlowLogCoverage, per_vpc: dict[str, dict[str, int]]
+) -> None:
+    """Reconcile the fetch against coverage (``§5.7`` D completeness).
+
+    A covered VPC (one with an in-scope flow log) that yielded **zero** in-window objects/events is
+    suspicious (wrong prefix/region/window, or the archive account resolved wrong) — warn per VPC.
+    If **every** covered VPC came back empty, that's the "downloading logs unrelated to my VPCs"
+    caught on the fetch side: raise :class:`FlowLogCoverageError`. A covered VPC whose objects exist
+    but are all NODATA is *not* empty here (it has objects) — that case is the reader's own NODATA
+    handling."""
+    covered = coverage.covered_vpcs
+    if not covered:
+        return
+    empty = [v for v in covered if per_vpc.get(v, {}).get("objects", 0) == 0]
+    if len(empty) == len(covered):
+        raise FlowLogCoverageError(
+            f"aborting flow-log fetch: all {len(covered)} covered VPC(s) "
+            f"({', '.join(sorted(covered))}) yielded zero in-window flow-log objects. The flow-log "
+            f"configuration references these VPCs, but no delivered log data was found for them — "
+            f"check the record window (--flow-log-days/--flow-log-start), the destination "
+            f"bucket/region, or whether the archive account resolved to the right bucket."
+        )
+    for vpc in sorted(empty):
+        print(
+            f"cloudbreachgraph: warning: VPC {vpc} has a flow log configured but no in-window "
+            f"flow-log data was fetched for it (empty window, wrong prefix/region, or an archive "
+            f"account without that VPC's objects).",
+            file=sys.stderr,
+        )
+
+
+# --------------------------------------------------------------------------- #
 # Driver loop (§11.7)
 # --------------------------------------------------------------------------- #
 def collect_all(
@@ -1457,6 +1988,7 @@ def collect_all(
     *,
     roles: tuple[str, ...] | list[str] = ("network",),
     cache_dir: str | None = None,
+    archive_access: ArchiveAccess | None = None,
 ) -> dict:
     """Run every collector for each requested role and bundle the results (§11.7).
 
@@ -1464,6 +1996,14 @@ def collect_all(
     with its own resolved ``profile``/``region``, so a multi-account target can pull
     different roles from different accounts in one call. Per-role account provenance is
     recorded under ``meta.accounts``.
+
+    The ``flow_logs`` role is special-cased (``§5.7`` cross-account split): its config, CloudTrail
+    history and CloudWatch reads run in the **network** account, while only the S3 object I/O runs
+    the **archive** account resolved from ``archive_access`` (explicit binding, else primary→
+    AccessDenied fallback across the configured candidates). ``archive_access`` is built by the CLI
+    where both accounts are in hand; when omitted (``--from-cache`` and simple callers) the S3 read
+    uses the ``flow_logs`` role's own resolved account directly, so single-account runs are
+    unchanged.
 
     Returns the exact Phase 1 interface contract (``docs/03_phase_plan.md``)::
 
@@ -1491,6 +2031,9 @@ def collect_all(
     }
 
     for role in roles:
+        if role == "flow_logs":
+            _collect_flow_logs_role(resolved, bundle, archive_access)
+            continue
         acct = resolved.roles[role]
         collectors = ROLE_COLLECTORS[role]
         keys = ROLE_RESULT_KEYS[role]
