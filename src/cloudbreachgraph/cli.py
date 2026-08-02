@@ -36,6 +36,7 @@ from .config import (
     ConfigError,
     ResolvedAccount,
     ResolvedTarget,
+    archive_fallback_candidates,
     load_config,
     resolve_target,
     verify_target,
@@ -290,7 +291,10 @@ def _collect_from_cache(cache_dir: str, region: str | None, roles: tuple[str, ..
 # Live collection
 # --------------------------------------------------------------------------- #
 def _collect_live(
-    resolved: ResolvedTarget, args: argparse.Namespace, roles: tuple[str, ...]
+    resolved: ResolvedTarget,
+    args: argparse.Namespace,
+    roles: tuple[str, ...],
+    cfg: AccountConfig,
 ) -> dict:
     # Verification defaults ON only when at least one role has a known expected account id.
     if args.verify_account is None:
@@ -300,7 +304,50 @@ def _collect_live(
     if verify_enabled:
         # Resolve run_aws at call time so --from-cache/tests can swap the boundary.
         verify_target(resolved, enabled=True, run_aws=runner.run_aws)
-    return collectors.collect_all(resolved, roles=roles, cache_dir=args.cache_dir)
+    archive_access = _build_archive_access(cfg, args, resolved, roles)
+    return collectors.collect_all(
+        resolved, roles=roles, cache_dir=args.cache_dir, archive_access=archive_access
+    )
+
+
+def _flow_logs_explicitly_bound(cfg: AccountConfig, args: argparse.Namespace) -> bool:
+    """Whether the ``flow_logs`` role is **explicitly** bound to an account (so the S3 read uses it
+    directly, skipping the primary→AccessDenied trial, §5.7 B).
+
+    True when ``--profile`` forces one profile for every role (the escape hatch), or when the
+    selected target (``--target``, else the config ``default_target``) has a
+    ``[targets.<name>.roles]`` ``flow_logs`` entry. Otherwise the archive account is
+    auto-resolved."""
+    if args.profile is not None:
+        return True
+    target = args.target or cfg.default_target
+    if target is not None:
+        tgt = cfg.targets.get(target)
+        if tgt is not None and "flow_logs" in tgt.roles:
+            return True
+    return False
+
+
+def _build_archive_access(
+    cfg: AccountConfig,
+    args: argparse.Namespace,
+    resolved: ResolvedTarget,
+    roles: tuple[str, ...],
+) -> collectors.ArchiveAccess | None:
+    """Build the S3 archive-account resolution strategy for the ``flow_logs`` role (§5.7 B).
+
+    An explicit binding (see :func:`_flow_logs_explicitly_bound`) is used directly; otherwise the
+    S3 read is attempted under the primary/network profile first and falls back through the other
+    configured accounts on ``AccessDenied``. ``None`` when the ``flow_logs`` role isn't active."""
+    if "flow_logs" not in roles:
+        return None
+    net = resolved.roles["network"]
+    if _flow_logs_explicitly_bound(cfg, args):
+        return collectors.ArchiveAccess(primary=net, explicit=resolved.roles["flow_logs"])
+    candidates = tuple(
+        archive_fallback_candidates(cfg, exclude_profile=net.profile, region=args.region)
+    )
+    return collectors.ArchiveAccess(primary=net, explicit=None, candidates=candidates)
 
 
 # --------------------------------------------------------------------------- #
@@ -399,7 +446,7 @@ def _run_live(
         region=args.region,
         roles=roles,
     )
-    collected = _collect_live(resolved, args, roles)
+    collected = _collect_live(resolved, args, roles, cfg)
     _write_outputs(collected, out_dir, "graph", args)
     return 0
 
@@ -444,7 +491,7 @@ def _run_all_accounts(cfg: AccountConfig, out_dir: Path, args: argparse.Namespac
     for alias in sorted(cfg.accounts):
         resolved = resolve_target(cfg, account=alias, region=args.region, roles=roles)
         print(f"== account {alias} ==")
-        collected = _collect_live(resolved, args, roles)
+        collected = _collect_live(resolved, args, roles, cfg)
         _write_outputs(collected, out_dir, f"graph.{alias}", args)
     return 0
 
@@ -545,6 +592,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"cloudbreachgraph: config error: {exc}", file=sys.stderr)
         return 2
     except collectors.FlowLogDestinationError as exc:
+        print(f"cloudbreachgraph: {exc}", file=sys.stderr)
+        return 1
+    except collectors.FlowLogCoverageError as exc:
         print(f"cloudbreachgraph: {exc}", file=sys.stderr)
         return 1
     except collectors.FlowLogFetchError as exc:

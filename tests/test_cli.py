@@ -584,6 +584,18 @@ def test_flow_log_days_and_start_are_mutually_exclusive(tmp_path):
         )
 
 
+def test_from_cache_flow_logs_records_coverage_meta(tmp_path):
+    # --from-cache (no live accounts) still builds a graph and records the VPC coverage in meta,
+    # degrading the two-account split to the single cached source without error (§5.7).
+    out = tmp_path / "out"
+    assert cli.main(["--from-cache", str(FIXTURES), "--flow-logs", "--output-dir", str(out)]) == 0
+    meta = json.loads((out / "graph.json").read_text())["meta"]
+    cov = meta["flow_log_coverage"]
+    # The fixture flow logs cover vpc-0aaa... (VPC + subnet scope); vpc-0defdef... has none.
+    assert cov["covered_vpcs"] == ["vpc-0aaaaaaaaaaaaaaaa"]
+    assert cov["uncovered_vpcs"] == ["vpc-0defdefdefdefdefd"]
+
+
 def test_historical_enis_present_by_default_under_flow_logs(tmp_path):
     out = tmp_path / "out"
     assert cli.main(["--from-cache", str(FIXTURES), "--flow-logs", "--output-dir", str(out)]) == 0

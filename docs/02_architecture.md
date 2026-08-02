@@ -425,17 +425,60 @@ deterministic. `--verbose` (`runner.set_verbose`, mirroring the `configure_cache
 every `aws` command actually run — including every `get-object`, each retry, and the `aws sso login`
 calls — to **stderr** with a short OK/NOT OK, keeping stdout and the graph files clean.
 
+**Cross-account split (config vs. storage).** A VPC Flow Log's **configuration** is an EC2 resource
+that lives in the **same account as the VPCs** it is attached to (the `network` account); only the
+delivered log **objects** live in the archive account (the S3 bucket, often a separate log-archive
+account). So the work is split by account (`aws/collectors.py::_collect_flow_logs_role`, driven by
+`collect_all` outside the generic role loop): `ec2 describe-flow-logs`, the CloudTrail history
+(`cloudtrail lookup-events`) and the CloudWatch reads (`logs filter-log-events`) run in the
+**network** account; only the S3 object I/O (`s3api list-objects-v2` + `get-object`) runs in the
+**archive** (`flow_logs`) account. `describe-flow-logs` is queried **once** (in the network account)
+and that one config drives both the config nodes and the record fetch (the reader no longer re-runs
+it). When `network` and `flow_logs` resolve to the same account (the default), behaviour is
+identical to before. *(CloudWatch-in-network is an assumption; a future cross-account CloudWatch
+setup would need revisiting.)*
+
+**Archive-account auto-resolution.** The `flow_logs` role need not be hand-bound. The S3 read is
+attempted under the **primary/network** profile first — the `list-objects-v2` we already make *is*
+the access probe, no extra call — and on an `AccessDenied`/`Forbidden` it falls back through the
+configured `account_id → profile` accounts (`_ArchiveResolver`), first success wins; if none can
+read the bucket it raises `FlowLogFetchError` naming the bucket and the profiles tried. An explicit
+`[targets.<t>.roles].flow_logs` binding (or `--profile`) uses that account directly, skipping the
+trial. This is why S3 `AccessDenied`/`Forbidden` is **reclassified** from hard-abort to
+fallback-then-abort in the error tiers; `SignatureDoesNotMatch` and other systemic errors still
+abort. The bucket **owner** account is *not* derivable from config (the `LogDestination` ARN carries
+no account, the object key's `AWSLogs/<acctId>/` is the *source* account, `DeliverLogsPermissionArn`
+is a role in the source account), so resolution is "try the configured profiles", not "compute the
+owner". `--expected-bucket-owner` is **not** used to discover the owner (it 403s on both
+owner-mismatch and no-access, and rejects the valid cross-account-read case); it is only viable as a
+post-resolution guard using the *resolved* account id.
+
+**VPC coverage + fetch precision/completeness.** Because the config-in-wrong-account mistake is a
+*silent success* (`describe-flow-logs` returns the wrong account's logs with no error), a
+permission fallback can't catch it — the **coverage check** does (`check_vpc_coverage`, run **before**
+any S3 I/O). It reconciles the discovered flow logs against the discovered `vpc-`/`subnet-`/`eni-`
+ids: if **no** discovered VPC is covered by **any** flow log it raises `FlowLogCoverageError` with the
+counts and the likely cause; VPCs with no flow log are a stderr warning (per §9), not fatal. The
+download is then scoped for **precision** — only objects whose embedded `fl-…` id maps to a
+discovered VPC (secondary guard: the key's `AWSLogs/<acct>/` matches the network account) are
+fetched, so a shared/central bucket never drags in other VPCs'/accounts' objects — and reconciled
+for **completeness**: per-VPC object/record counts are tracked, a covered VPC that yielded zero
+in-window objects is warned, and if *every* covered VPC is empty the run raises `FlowLogCoverageError`
+(the "downloading logs unrelated to my VPCs" symptom, caught on the fetch side). Coverage is surfaced
+deterministically in `graph.meta.flow_log_coverage` (`vpcs_total`, `vpcs_covered`, `covered_vpcs`,
+`uncovered_vpcs`, per-VPC counts).
+
 **Scope & simplifications.** Both the **CloudWatch-Logs** and **S3** record paths are analysed
 (destination type dispatched, above); a `kinesis-data-firehose` destination isn't implemented and
-raises. All flow-log commands run against the account bound to the `flow_logs` role (§11) — which
-defaults to the same account as `network`, so the common single-account case needs no config. The S3
-reader lists under the destination prefix and filters by `LastModified`; for a very large bucket
-that listing/download can be heavy (a future optimisation could narrow to date-partitioned prefixes).
-Required read-only IAM adds `s3:ListBucket` + `s3:GetObject` on the destination bucket. Reading flow-log *records* (not just their config/destination)
-goes beyond the original roadmap's "show the destination, don't parse traffic" line — a deliberate
-extension for this feature. Determinism holds: allocation times and record timestamps come from the
-data, and the 60-day bound is applied at the *collection* query (not from wall-clock in the output),
-so a fixed capture always yields the same graph.
+raises. The S3 reader lists under the destination prefix and filters by `LastModified`; for a very
+large bucket that listing/download can be heavy (a future optimisation could narrow to
+date-partitioned prefixes). Required read-only IAM: the **network** account needs
+`ec2:DescribeFlowLogs`, `cloudtrail:LookupEvents` and `logs:FilterLogEvents`; the **archive** account
+needs `s3:ListBucket` + `s3:GetObject` on the bucket. Reading flow-log *records* (not just their
+config/destination) goes beyond the original roadmap's "show the destination, don't parse traffic"
+line — a deliberate extension for this feature. Determinism holds: allocation times and record
+timestamps come from the data, and the 60-day bound is applied at the *collection* query (not from
+wall-clock in the output), so a fixed capture always yields the same graph.
 
 ### 5.7.1 Historical ENIs + time-aware resolution (configurable window, ASG collapse)
 
@@ -1016,6 +1059,19 @@ def collect_all(resolved: ResolvedTarget, *, roles: list[str] = ["network"]) -> 
 ```
 
 So the path is always: **role → `resolved.roles[role]` (profile) + `ROLE_COLLECTORS[role]` (commands)
-→ `collector(profile, region)` → `runner.run_aws(...)` → one `aws` subprocess.** In v1 the loop
-runs a single iteration (`network`); binding `flow_logs` later just adds a second iteration that
-happens to use a different account's profile.
+→ `collector(profile, region)` → `runner.run_aws(...)` → one `aws` subprocess.** The `network` role
+runs exactly this loop.
+
+**The `flow_logs` role is the one exception** and is special-cased by `collect_all`
+(`_collect_flow_logs_role`) rather than run by the generic loop, because its four collectors span
+**two** accounts (§5.7): `describe-flow-logs`, `cloudtrail lookup-events` and the CloudWatch reader
+run under the **network** account (`resolved.roles["network"]`), while only the S3 object I/O runs
+under the **archive** account. The archive account is either the explicit `flow_logs` binding
+(`resolved.roles["flow_logs"]`) or auto-resolved from the primary/network profile with an
+`AccessDenied` fallback across the configured accounts (an `ArchiveAccess` built by the CLI, where
+both `ResolvedAccount`s and the `AccountConfig` are in hand). `meta.accounts` still records both:
+`network` (the config/CloudTrail/CloudWatch account) and `flow_logs` (the account the S3 objects
+were actually read under). The registry entry (§11.6) still documents the role's collectors + result
+keys — the account split lives in the driver, not the registry. When `network` and `flow_logs`
+resolve to the same account (the default), this is behaviourally identical to a second loop
+iteration.

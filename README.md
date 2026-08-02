@@ -74,7 +74,7 @@ account_id = "111111111111"
 profile    = "prod-audit"
 region     = "us-east-1"
 
-[accounts.log_archive]           # a central logging account (for future flow_logs)
+[accounts.log_archive]           # a central logging account (holds the flow-log S3 bucket)
 account_id = "999999999999"
 profile    = "log-archive-ro"
 
@@ -82,8 +82,13 @@ profile    = "log-archive-ro"
 [targets.prod]
 default_account = "workload_prod"   # every role uses this...
 [targets.prod.roles]
-flow_logs = "log_archive"           # ...except flow logs, from the logging account (future role)
+flow_logs = "log_archive"           # ...except the flow-log S3 objects, from the logging account
 ```
+
+> The `flow_logs` binding sets **only** where the log *objects* are read (S3). The flow-log
+> *configuration* (`describe-flow-logs`) and CloudTrail/CloudWatch reads always run in the VPC's
+> (`network`) account. The binding is optional — without it the archive account is auto-resolved
+> (see [Flow-log analysis](#network-account-vs-archive-account-cross-account-flow-logs)).
 
 ## Selecting an account (precedence)
 
@@ -340,11 +345,45 @@ cloudbreachgraph --from-cache tests/fixtures --flow-logs --output-dir out/   # o
 ```
 
 Both **CloudWatch-Logs** and **S3** flow-record paths are read (chosen per flow log's destination
-type). All flow-log data is read from the account bound to the `flow_logs` role — which defaults to
-the same account as `network`, so in the common single-account case `--flow-logs` "just works" (see
-`docs/02_architecture.md §5.7`). Reading S3 records needs `s3:ListBucket` + `s3:GetObject` on the
-destination bucket, in addition to `ec2:DescribeFlowLogs`, `cloudtrail:LookupEvents` and
-`logs:FilterLogEvents`.
+type). In the common single-account case `--flow-logs` "just works" (see
+`docs/02_architecture.md §5.7`).
+
+#### Network account vs. archive account (cross-account flow logs)
+
+A VPC Flow Log's **configuration** is an EC2 resource that lives in the **same account as the VPCs**
+(the `network` account), while only the delivered log **objects** live in the **archive** account
+(the S3 bucket — often a separate, centralized log-archive account). CloudBreachGraph honours that
+split: `ec2 describe-flow-logs`, the CloudTrail history (`cloudtrail lookup-events`) and any
+CloudWatch reads (`logs filter-log-events`) run in the **network** account, and only the S3 object
+I/O (`s3api list-objects-v2` + `get-object`) runs in the **archive** account. When the two are the
+same account (the default), nothing changes.
+
+- **Auto-resolving the archive account.** You usually don't need to hand-bind it. The S3 read is
+  attempted under the **primary/network** profile first (centralized-logging buckets are commonly
+  readable cross-account by the source account); on an `AccessDenied`/`Forbidden` it falls back
+  through the other configured `account_id → profile` accounts, first success wins. If none can read
+  the bucket it errors, naming the bucket and the profiles tried. To skip the trial, **bind the
+  archive account explicitly**:
+
+  ```toml
+  [targets.prod.roles]
+  flow_logs = "log_archive"   # S3 objects read under this account; config still read under network
+  ```
+
+- **VPC coverage check.** After mapping the VPCs, the discovered flow-log config is reconciled
+  against them. If the flow logs reference **none** of the discovered VPCs/subnets/ENIs — the exact
+  symptom of a config queried in the wrong account — the run **fails loudly before downloading a
+  single object**, naming the mismatch and the likely cause. Discovered VPCs with no flow log
+  configured are reported (stderr), not fatal. The counts are surfaced in
+  `graph.meta.flow_log_coverage` (`vpcs_total`, `vpcs_covered`, and per-VPC object/record counts).
+
+- **Precise downloads.** On a shared/central bucket the download is filtered to the objects whose
+  embedded `fl-…` id belongs to a flow log for one of *your* discovered VPCs (and whose
+  `AWSLogs/<account>/` path matches the network account), so a bucket holding many accounts'/VPCs'
+  logs never drags in unrelated objects.
+
+Required read-only IAM: **network account** — `ec2:DescribeFlowLogs`, `cloudtrail:LookupEvents`,
+`logs:FilterLogEvents`; **archive account** — `s3:ListBucket` + `s3:GetObject` on the bucket.
 
 ### Historical ENIs & ASG collapse
 

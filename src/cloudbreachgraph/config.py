@@ -287,6 +287,34 @@ def _resolve_target_binding(
     return resolved
 
 
+def archive_fallback_candidates(
+    cfg: AccountConfig, *, exclude_profile: str | None, region: str | None
+) -> list[ResolvedAccount]:
+    """The configured accounts to try when auto-resolving the flow-log archive account (§11 / §5.7).
+
+    Every distinct ``[accounts.*]`` profile except ``exclude_profile`` (the primary/network profile
+    already tried first), as :class:`ResolvedAccount`s, ordered by alias for determinism. The bucket
+    **owner** account isn't derivable from config (the ``LogDestination`` ARN carries no account,
+    the object key's ``AWSLogs/<acctId>/`` segment is the *source* account, and
+    ``DeliverLogsPermissionArn`` is a role in the source account), so resolution is "try the
+    configured profiles", not "compute the owner"."""
+    out: list[ResolvedAccount] = []
+    seen: set[str | None] = {exclude_profile}
+    for alias in sorted(cfg.accounts):
+        acct = cfg.accounts[alias]
+        if acct.profile in seen:
+            continue
+        seen.add(acct.profile)
+        out.append(
+            ResolvedAccount(
+                profile=acct.profile,
+                account_id=acct.account_id,
+                region=region or acct.region,
+            )
+        )
+    return out
+
+
 def resolve_profile(
     cfg: AccountConfig,
     *,
