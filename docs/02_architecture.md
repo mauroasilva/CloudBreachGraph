@@ -338,17 +338,19 @@ into the already-built graph:
    - **S3** (`s3`): `s3api list-objects-v2` under the destination ARN's bucket/prefix (filtered to
      `.gz` objects modified within the window), then `s3api get-object` on each, gunzipped and parsed.
      With `--cache-dir` set, downloaded objects are cached under `<cache-dir>/s3-objects/` and reused
-     for 30 days (they're immutable), so re-runs don't re-download. A **per-source fast-fail probe**
-     (`_FLOW_LOG_PROBE_OBJECTS`, 25) samples the **largest** objects of each source first
-     (`_probe_order`, using the `Size` that `list-objects-v2` already returns — no extra call): an
-     all-NODATA object compresses tiny, so if even the biggest objects parse **zero** usable records
-     the small ones won't either. Sampling the largest is more robust than the earliest keys, which
-     are a single (often quiet) time-window. When a source's probe comes back empty, its remaining
-     objects are **skipped** (warned) and the next source is tried — a single all-NODATA VPC never
-     aborts a run whose other VPCs have data. The run raises `FlowLogFetchError` only if **every**
-     probed source yields zero records (preserving the loud single-VPC signal). Any single parsed
-     record keeps that source's objects flowing. Download order never affects output — records are
-     sorted downstream — so this only changes *which* objects are sampled before the probe decides.
+     for 30 days (they're immutable), so re-runs don't re-download. Each source is read **largest
+     object first** (`_size_descending_keys`, using the `Size` that `list-objects-v2` already returns
+     — no extra call): an all-NODATA object compresses tiny, so descending size front-loads the
+     data-bearing objects and pushes NODATA to the tail. Reading then stops early on a run of NODATA
+     (consecutive empty parses), with two thresholds: a **cold** source that has produced no records
+     is abandoned after `_FLOW_LOG_PROBE_OBJECTS` (25) consecutive empties (all-NODATA/unrecognised —
+     a conservative sample, since there's no positive evidence yet); a source that has **already**
+     yielded records has its smaller NODATA **tail trimmed** after just `_FLOW_LOG_TAIL_STREAK` (3)
+     consecutive empties (strong evidence once the source is known-real). So a 15k-data + 5k-NODATA
+     source reads the 15k data and skips the dead tail instead of downloading it. A single all-NODATA
+     VPC never aborts a run whose other VPCs have data; the run raises `FlowLogFetchError` only if
+     **every** source yields zero records (preserving the loud single-VPC signal). Download order
+     never affects output — records are sorted downstream.
    A destination type with **no implemented reader** (e.g. `kinesis-data-firehose`) raises
    `FlowLogDestinationError` — the run fails loudly rather than silently omitting those flows.
    Records are parsed by **field position derived from the format** — a CloudWatch group's own
