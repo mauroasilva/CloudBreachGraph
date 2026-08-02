@@ -342,6 +342,12 @@ into the already-built graph:
      (`_FLOW_LOG_PROBE_OBJECTS`, 25) aborts with `FlowLogFetchError` if that many objects download but
      parse **zero** usable records — the flow log is all-NODATA or an unrecognised format — rather
      than downloading the (potentially tens of thousands) rest; any single parsed record disables it.
+     The probe samples the **largest** objects first (`_probe_order`, using the `Size` that
+     `list-objects-v2` already returns — no extra call): an all-NODATA object compresses tiny, so if
+     even the biggest objects parse nothing the small ones won't either. This is more robust than
+     sampling the earliest keys, which are a single (often quiet) time-window. Download order never
+     affects output — records are sorted downstream — so this only changes *which* objects are
+     sampled before the probe decides.
    A destination type with **no implemented reader** (e.g. `kinesis-data-firehose`) raises
    `FlowLogDestinationError` — the run fails loudly rather than silently omitting those flows.
    Records are parsed by **field position derived from the format** — a CloudWatch group's own

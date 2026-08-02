@@ -728,7 +728,11 @@ _FAILURE_RATE_THRESHOLD = 0.5
 # Fast-fail probe for S3 flow-log objects: if this many objects download successfully but yield
 # **zero** usable flow records, abort rather than download the (possibly tens of thousands) rest —
 # the flow log is almost certainly all-NODATA or an unrecognised format (``docs/02_architecture.md
-# §5.7``). Sized as a representative sample; a run that finds even one record disables the probe.
+# §5.7``). The probe samples the **largest** objects first (see :func:`_probe_order`): an all-NODATA
+# object compresses tiny (repetitive ``- - -`` lines), so if even the biggest objects parse nothing
+# the small ones will too — far more robust than sampling the earliest keys (one time-window, which
+# can be atypically quiet). Sizes come free from ``list-objects-v2``; no extra call. A run that
+# finds even one record disables the probe and downloads the rest.
 _FLOW_LOG_PROBE_OBJECTS = 25
 
 
@@ -1133,17 +1137,20 @@ def _read_s3_records(
     tracker = _FailureTracker("s3")
     for bucket, prefix in sorted(sources):
         iam = f"s3:ListBucket and s3:GetObject on bucket '{bucket}'"
-        keys_outcome = _run_unit(
-            lambda b=bucket, p=prefix: _list_s3_flow_log_keys(
+        objects_outcome = _run_unit(
+            lambda b=bucket, p=prefix: _list_s3_flow_log_objects(
                 b, p, since_epoch, until_epoch, profile, region
             ),
             source="s3",
             unit=f"s3://{bucket}/{prefix} (list)",
             iam_hint=iam,
         )
-        if not keys_outcome.ok:
+        if not objects_outcome.ok:
             continue  # couldn't list this source (skippable/transient-exhausted) — move on
-        for key in keys_outcome.value:
+        objects = objects_outcome.value
+        total = len(objects)
+        largest = max((size for _, size in objects), default=0)
+        for key in _probe_order(objects):
             outcome = _run_unit(
                 lambda b=bucket, k=key: _read_s3_object_records(b, k, profile, region),
                 source="s3",
@@ -1154,36 +1161,42 @@ def _read_s3_records(
             if outcome.ok:
                 objects_read += 1
                 records.extend(outcome.value)
-                # Fast-fail: if a representative sample of objects downloaded but nothing parsed,
-                # abort instead of downloading the rest (the flow log is all-NODATA / unrecognised).
+                # Fast-fail: the probe downloads the largest objects first, so if a representative
+                # sample of the biggest objects parsed nothing, the rest (smaller, more compressed)
+                # won't either — abort instead of downloading them all (all-NODATA / unrecognised).
                 if objects_read >= _FLOW_LOG_PROBE_OBJECTS and not records:
                     raise FlowLogFetchError(
-                        f"aborting flow-log fetch: downloaded {objects_read} S3 objects from "
-                        f"'{bucket}' but parsed 0 usable flow records (e.g. s3://{bucket}/{key}). "
-                        f"The objects appear to contain no usable records (all NODATA/SKIPDATA) or "
-                        f"an unrecognised format — not downloading the rest. Check the flow log's "
-                        f"TrafficType/format, or narrow the window."
+                        f"aborting flow-log fetch: probed the {objects_read} largest of "
+                        f"{total} S3 object(s) under 's3://{bucket}/{prefix}' (largest "
+                        f"~{largest:,} B) but parsed 0 usable flow records (e.g. "
+                        f"s3://{bucket}/{key}). Even the largest objects contain no usable "
+                        f"records (all NODATA/SKIPDATA) or an unrecognised format — not "
+                        f"downloading the remaining {total - objects_read}. Check the flow "
+                        f"log's TrafficType/format, or narrow the window."
                     )
     return records, objects_read, tracker.failed
 
 
-def _list_s3_flow_log_keys(
+def _list_s3_flow_log_objects(
     bucket: str,
     prefix: str,
     since_epoch: float,
     until_epoch: float | None,
     profile: str | None,
     region: str | None,
-) -> list[str]:
-    """The ``.gz`` object keys under ``bucket``/``prefix`` last modified within the window.
+) -> list[tuple[str, int]]:
+    """The ``.gz`` objects under ``bucket``/``prefix`` last modified within the window, as
+    ``(key, size_bytes)`` pairs sorted by key.
 
     ``since_epoch`` lower-bounds ``LastModified``; ``until_epoch`` (from ``--flow-log-end``) upper-
-    bounds it when set. Objects with an unknown timestamp are kept."""
+    bounds it when set. Objects with an unknown timestamp are kept. ``Size`` comes back in the same
+    ``list-objects-v2`` response (no extra call) and feeds the size-aware fast-fail probe; a missing
+    or non-numeric size is treated as ``0``."""
     args = ["s3api", "list-objects-v2", f"--bucket={bucket}"]
     if prefix:
         args.append(f"--prefix={prefix}")
     data = runner.run_aws(args, profile=profile, region=region)
-    keys: list[str] = []
+    objects: list[tuple[str, int]] = []
     for obj in data.get("Contents", []):
         key = obj.get("Key")
         if not key or not key.endswith(".gz"):
@@ -1193,8 +1206,26 @@ def _list_s3_flow_log_keys(
             continue  # older than the window start — skip (keep it if the timestamp is unknown)
         if modified is not None and until_epoch is not None and modified > until_epoch:
             continue  # newer than the window end (--flow-log-end)
-        keys.append(key)
-    return sorted(keys)
+        raw_size = obj.get("Size")
+        size = int(raw_size) if isinstance(raw_size, (int, float)) else 0
+        objects.append((key, size))
+    return sorted(objects)
+
+
+def _probe_order(objects: list[tuple[str, int]]) -> list[str]:
+    """Download order for a source's objects: the ``_FLOW_LOG_PROBE_OBJECTS`` **largest** first (the
+    fast-fail probe set), then every remaining key in sorted order.
+
+    Largest-first makes the probe robust — an all-NODATA object compresses tiny, so if even the
+    biggest objects parse zero records the small ones will too. Ties (equal size, or all sizes
+    unknown/0) fall back to key order, so the ordering stays deterministic. Output is unaffected by
+    download order (records are sorted downstream); this only changes *which* objects are sampled
+    before the probe decides whether to abort."""
+    by_size = sorted(objects, key=lambda o: (-o[1], o[0]))
+    probe = by_size[:_FLOW_LOG_PROBE_OBJECTS]
+    probe_keys = {k for k, _ in probe}
+    rest = sorted(k for k, _ in objects if k not in probe_keys)
+    return [k for k, _ in probe] + rest
 
 
 def _read_s3_object_records(
