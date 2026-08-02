@@ -110,7 +110,9 @@ with `--no-verify-account`; note verification is a no-op under `--profile` (no e
 
 ## Offline: build from cached JSON
 
-`--cache-dir DIR` writes each raw AWS JSON response to disk during a live run.
+`--cache-dir DIR` writes each raw AWS JSON response to disk during a live run, and (under
+`--flow-logs`) **caches the downloaded S3 flow-log objects** there too — they're immutable, so a
+cached body under 30 days old is reused with no re-download, making repeat runs far cheaper.
 `--from-cache DIR` then rebuilds the graph from those files with **no** live AWS calls —
 handy for iterating on output, diffing over time, or working from a colleague's capture:
 
@@ -137,7 +139,9 @@ cloudbreachgraph --from-cache tests/fixtures --output-dir out/
   --no-verify-account        (default: on when the account id is known)
 --all-accounts             loop over every configured account, one graph each
 --region REGION            AWS region (overrides the per-account default)
---cache-dir DIR            also write raw AWS JSON responses here
+--cache-dir DIR            also write raw AWS JSON responses here, and cache downloaded
+                             S3 flow-log objects (reused for 30 days, so a re-run won't
+                             re-download them)
 --from-cache DIR           build from cached AWS JSON in DIR, no live calls
 --include-orphans          also emit collected resources no ENI references
 --flow-logs                also gather IP-allocation history and analyse VPC flow

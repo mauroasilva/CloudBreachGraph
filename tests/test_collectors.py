@@ -583,6 +583,57 @@ def test_collect_flow_log_records_reads_s3(monkeypatch):
     assert rec["LogGroup"] == "s3://my-bucket/AWSLogs/x/flow.log.gz"
 
 
+def test_s3_all_nodata_fast_fails_without_downloading_everything(monkeypatch):
+    import gzip
+
+    header = (
+        "version account-id interface-id srcaddr dstaddr srcport dstport "
+        "protocol packets bytes start end action log-status"
+    )
+    # A NODATA record: no addresses, so nothing is parseable (the exact shape the user hit).
+    nodata = "2 062317582477 eni-0bb770af8ddc25a3e - - - - - - - 1785577119 1785577200 - NODATA"
+    recent = datetime.now(UTC).isoformat()
+    n_objects = 10_000  # far more than the probe; we must NOT download them all
+
+    def _run(args, *, profile=None, region=None, cache_dir=None):
+        key = tuple(args[:2])
+        if key == ("ec2", "describe-flow-logs"):
+            return {
+                "FlowLogs": [
+                    {
+                        "FlowLogId": "fl",
+                        "LogDestinationType": "s3",
+                        "LogDestination": "arn:aws:s3:::b/p/",
+                        "LogFormat": None,
+                    }
+                ]
+            }
+        if key == ("s3api", "list-objects-v2"):
+            return {
+                "Contents": [
+                    {"Key": f"p/{i:05d}.log.gz", "LastModified": recent} for i in range(n_objects)
+                ]
+            }
+        raise AssertionError(f"unexpected run_aws call: {key}")
+
+    downloads = {"n": 0}
+
+    def _download(args, dest, *, profile=None, region=None):
+        downloads["n"] += 1
+        with gzip.open(dest, "wt", encoding="utf-8") as fh:
+            fh.write(header + "\n" + nodata + "\n")
+        return dest
+
+    monkeypatch.setattr(runner, "run_aws", _run)
+    monkeypatch.setattr(runner, "download_object", _download)
+
+    with pytest.raises(collectors.FlowLogFetchError) as excinfo:
+        collectors.collect_flow_log_records("p", "eu-west-1")
+    assert "0 usable flow records" in str(excinfo.value)
+    # Bounded to the probe — nowhere near the 10k objects.
+    assert downloads["n"] == collectors._FLOW_LOG_PROBE_OBJECTS
+
+
 def test_unsupported_flow_log_destination_raises(monkeypatch):
     def _run(args, *, profile=None, region=None, cache_dir=None):
         if tuple(args[:2]) == ("ec2", "describe-flow-logs"):
