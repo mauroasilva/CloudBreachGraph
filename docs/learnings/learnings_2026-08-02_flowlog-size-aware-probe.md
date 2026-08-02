@@ -33,16 +33,35 @@ reasoning is worth keeping:
   order* and enriches the abort message — it never labels an object NODATA without reading it, and it
   never skips objects that would otherwise be read once a record is found.
 
-## 3. Determinism
+## 3. Per-source, not global (fixed the same day)
+The original fast-fail probe (2026-08-01) shared **one** `records`/`objects_read` counter across all
+S3 sources and `raise`d out of the whole function. That made it **global and order-dependent**: an
+all-NODATA VPC that sorted first (or several small NODATA sources reaching 25 objects cumulatively
+before any record parsed) aborted the entire run — data-rich VPCs that sorted later were never read.
+Asymmetric, too: a data-rich first source disabled the probe for the rest, so a *later* NODATA VPC
+was harmless. That asymmetry was the tell that the scoping was wrong.
+
+Fix: the probe is now **per-source**. Each source tracks its own `src_read`/`src_parsed`; when a
+source's largest `_FLOW_LOG_PROBE_OBJECTS` objects parse nothing, its remaining objects are skipped
+(a stderr warning names the source, count, and largest size) and the loop moves to the next source.
+The hard `FlowLogFetchError` fires only **after** all sources, and only if `records` is still empty
+and we probed enough objects to be confident (`objects_read >= _FLOW_LOG_PROBE_OBJECTS`). Net effect:
+- one all-NODATA VPC + one data-rich VPC → empty VPC skipped after 25 objects, data VPC read, run
+  succeeds with a partial graph (matches §9 "partial over abort");
+- every VPC all-NODATA → still raises loudly (non-zero exit), preserving the original intent;
+- tiny all-NODATA source (< 25 objects) → read fully, no raise (nothing meaningful to save).
+
+## 4. Determinism
 Reordering downloads is safe because **output never depends on download order** — flow-log records are
 sorted downstream (`mapping/flowlogs.py`, `mapping/builder.py`) before serialization. `_probe_order`
 is itself deterministic (`(-size, key)` then sorted remainder). Existing fixtures without a `Size`
 field are unaffected: all sizes 0 → order collapses to sorted-key order, exactly the prior behavior.
 
-## 4. Gotchas / follow-ups
-- The probe's `objects_read` counter is cumulative across S3 sources, but `total`/`largest` in the
-  abort message are per-source (the current listing). Fine for the common single-source case; if
-  multi-source diagnostics ever matter, thread per-source stats through.
-- The size-aware probe is orthogonal to the still-outstanding **response cache** work queued in
+## 5. Gotchas / follow-ups
+- The final all-empty `FlowLogFetchError` uses the cumulative `objects_read` and lists the abandoned
+  sources; the *per-source* skip warning carries that source's `total`/`largest`. The threshold for
+  the hard raise is cumulative (`objects_read >= _FLOW_LOG_PROBE_OBJECTS`), so several small
+  all-NODATA sources still trip it once their combined reads pass the probe size.
+- The probe is orthogonal to the still-outstanding **response cache** work queued in
   `docs/prompts/queue/response_and_s3_ttl_cache.md`. A future optimization noted there but *not* done
   here: skip objects below a tiny-size floor outright (a minor download saver, not the main win).

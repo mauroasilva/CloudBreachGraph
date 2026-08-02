@@ -661,7 +661,7 @@ def test_s3_all_nodata_fast_fails_without_downloading_everything(monkeypatch):
         collectors.collect_flow_log_records("p", "eu-west-1")
     msg = str(excinfo.value)
     assert "0 usable flow records" in msg
-    assert "largest" in msg  # the abort message cites the size-aware probe
+    assert "probed" in msg  # the abort message cites the probe
     # Bounded to the probe — nowhere near the 10k objects.
     assert downloads["n"] == collectors._FLOW_LOG_PROBE_OBJECTS
 
@@ -724,6 +724,80 @@ def test_s3_probe_samples_largest_first_finds_data_a_key_probe_would_miss(monkey
     assert any(r["InterfaceId"] == "eni-real" for r in records)
     # The large real-data object was among the first objects sampled (largest-first).
     assert "p/zzzz-real.log.gz" in downloaded_keys[: collectors._FLOW_LOG_PROBE_OBJECTS]
+
+
+def test_s3_all_nodata_source_is_skipped_not_fatal_when_another_source_has_data(monkeypatch):
+    """Two S3 sources (VPCs): the one that sorts FIRST is all-NODATA, the later one has data. The
+    per-source fast-fail must skip the empty source's remaining objects and still read the data-rich
+    source — a single all-NODATA VPC must not abort the whole run. (The old global probe aborted on
+    the first source and never reached the second.)"""
+    import gzip
+
+    header = (
+        "version account-id interface-id srcaddr dstaddr srcport dstport "
+        "protocol packets bytes start end action log-status"
+    )
+    nodata = "2 062317582477 eni-nodata - - - - - - - 1785577119 1785577200 - NODATA"
+    real = (
+        "2 111111111111 eni-real 10.0.0.1 10.0.0.2 40000 443 6 5 500 "
+        "1785577119 1785577200 ACCEPT OK"
+    )
+    recent = datetime.now(UTC).isoformat()
+
+    # bucket-a sorts before bucket-b, so the all-NODATA VPC is processed first.
+    nodata_contents = [
+        {"Key": f"aaa/{i:05d}.log.gz", "LastModified": recent, "Size": 200} for i in range(5000)
+    ]
+    data_contents = [{"Key": "bbb/real.log.gz", "LastModified": recent, "Size": 9000}]
+
+    def _run(args, *, profile=None, region=None, cache_dir=None):
+        key = tuple(args[:2])
+        if key == ("ec2", "describe-flow-logs"):
+            return {
+                "FlowLogs": [
+                    {
+                        "FlowLogId": "fl-a",
+                        "LogDestinationType": "s3",
+                        "LogDestination": "arn:aws:s3:::bucket-a/aaa/",
+                        "LogFormat": None,
+                    },
+                    {
+                        "FlowLogId": "fl-b",
+                        "LogDestinationType": "s3",
+                        "LogDestination": "arn:aws:s3:::bucket-b/bbb/",
+                        "LogFormat": None,
+                    },
+                ]
+            }
+        if key == ("s3api", "list-objects-v2"):
+            bucket = next(a[len("--bucket=") :] for a in args if a.startswith("--bucket="))
+            return {"Contents": nodata_contents if bucket == "bucket-a" else data_contents}
+        raise AssertionError(f"unexpected run_aws call: {key}")
+
+    downloads = {"a": 0, "b": 0}
+
+    def _download(args, dest, *, profile=None, region=None):
+        obj_key = next(a[len("--key=") :] for a in args if a.startswith("--key="))
+        if obj_key.startswith("aaa/"):
+            downloads["a"] += 1
+            line = nodata
+        else:
+            downloads["b"] += 1
+            line = real
+        with gzip.open(dest, "wt", encoding="utf-8") as fh:
+            fh.write(header + "\n" + line + "\n")
+        return dest
+
+    monkeypatch.setattr(runner, "run_aws", _run)
+    monkeypatch.setattr(runner, "download_object", _download)
+
+    # The run completes (no FlowLogFetchError) and returns the data-rich VPC's records.
+    records = collectors.collect_flow_log_records("p", "eu-west-1")
+    assert any(r["InterfaceId"] == "eni-real" for r in records)
+    # The all-NODATA VPC was probed then skipped (bounded), not downloaded in full...
+    assert downloads["a"] == collectors._FLOW_LOG_PROBE_OBJECTS
+    # ...and the data-rich VPC was still read.
+    assert downloads["b"] == 1
 
 
 def test_unsupported_flow_log_destination_raises(monkeypatch):

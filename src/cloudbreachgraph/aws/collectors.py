@@ -1125,7 +1125,13 @@ def _read_s3_records(
     bounds the objects' ``LastModified`` when set. Distinct ``(bucket, prefix)`` sources are read
     once. The per-source *list* and each per-object *get* are units run through :func:`_run_unit`,
     so a corrupt/missing object (``NoSuchKey``/bad gzip) or a transient stall is warned + skipped
-    (with backoff) while the rest are read — a systemic error (``AccessDenied``) still aborts."""
+    (with backoff) while the rest are read — a systemic error (``AccessDenied``) still aborts.
+
+    The fast-fail probe is **per-source**: if a source's ``_FLOW_LOG_PROBE_OBJECTS`` largest objects
+    parse zero usable records it is all-NODATA/unrecognised, so its remaining objects are skipped
+    (warned) and the next source is tried — one empty VPC never aborts a run whose other VPCs have
+    data. The run raises :class:`FlowLogFetchError` only if **every** probed source came back
+    empty."""
     sources: dict[tuple[str, str], None] = {}
     for fl in flow_logs:
         bp = _parse_s3_arn(fl.get("LogDestination"))
@@ -1135,6 +1141,7 @@ def _read_s3_records(
     records: list[dict] = []
     objects_read = 0
     tracker = _FailureTracker("s3")
+    empty_sources: list[str] = []  # sources abandoned as all-NODATA (largest objects parse nothing)
     for bucket, prefix in sorted(sources):
         iam = f"s3:ListBucket and s3:GetObject on bucket '{bucket}'"
         objects_outcome = _run_unit(
@@ -1150,6 +1157,8 @@ def _read_s3_records(
         objects = objects_outcome.value
         total = len(objects)
         largest = max((size for _, size in objects), default=0)
+        src_read = 0  # objects successfully read from THIS source
+        src_parsed = 0  # records parsed from THIS source
         for key in _probe_order(objects):
             outcome = _run_unit(
                 lambda b=bucket, k=key: _read_s3_object_records(b, k, profile, region),
@@ -1160,20 +1169,34 @@ def _read_s3_records(
             tracker.record(outcome)
             if outcome.ok:
                 objects_read += 1
+                src_read += 1
                 records.extend(outcome.value)
-                # Fast-fail: the probe downloads the largest objects first, so if a representative
-                # sample of the biggest objects parsed nothing, the rest (smaller, more compressed)
-                # won't either — abort instead of downloading them all (all-NODATA / unrecognised).
-                if objects_read >= _FLOW_LOG_PROBE_OBJECTS and not records:
-                    raise FlowLogFetchError(
-                        f"aborting flow-log fetch: probed the {objects_read} largest of "
-                        f"{total} S3 object(s) under 's3://{bucket}/{prefix}' (largest "
-                        f"~{largest:,} B) but parsed 0 usable flow records (e.g. "
-                        f"s3://{bucket}/{key}). Even the largest objects contain no usable "
-                        f"records (all NODATA/SKIPDATA) or an unrecognised format — not "
-                        f"downloading the remaining {total - objects_read}. Check the flow "
-                        f"log's TrafficType/format, or narrow the window."
+                src_parsed += len(outcome.value)
+                # Per-source fast-fail: the probe reads THIS source's largest objects first, so if a
+                # representative sample of its biggest objects parsed nothing, the rest (smaller,
+                # more compressed) won't either. Skip the remainder of this source and move to the
+                # next — a single all-NODATA VPC must not abort a run whose other VPCs have data.
+                # The run only fails hard (below) if EVERY probed source turns out empty.
+                if src_read >= _FLOW_LOG_PROBE_OBJECTS and src_parsed == 0:
+                    print(
+                        f"cloudbreachgraph: warning: flow-log s3 source s3://{bucket}/{prefix}: "
+                        f"probed the {src_read} largest of {total} object(s) (largest "
+                        f"~{largest:,} B) but parsed 0 usable records — skipping the remaining "
+                        f"{total - src_read} (all NODATA/SKIPDATA or an unrecognised format).",
+                        file=sys.stderr,
                     )
+                    empty_sources.append(f"s3://{bucket}/{prefix}")
+                    break
+
+    if not records and objects_read >= _FLOW_LOG_PROBE_OBJECTS:
+        # Every S3 source we probed came back empty (all-NODATA / unrecognised) — fail loudly rather
+        # than hand back an empty graph, preserving the original single-VPC fast-fail intent.
+        where = ", ".join(empty_sources) or "the configured S3 destination(s)"
+        raise FlowLogFetchError(
+            f"aborting flow-log fetch: probed {objects_read} S3 object(s) across {where} but "
+            f"parsed 0 usable flow records — the flow logs appear to be all NODATA/SKIPDATA or an "
+            f"unrecognised format. Check the flow log's TrafficType/format, or narrow the window."
+        )
     return records, objects_read, tracker.failed
 
 
