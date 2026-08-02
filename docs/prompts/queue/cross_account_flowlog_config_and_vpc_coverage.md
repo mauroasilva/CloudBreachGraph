@@ -1,4 +1,4 @@
-## CHANGE REQUEST — Cross-account flow logs: discover config in the VPC account, auto-resolve the archive account for S3, and validate VPC coverage
+## CHANGE REQUEST — Cross-account flow logs: discover config in the VPC account, auto-resolve the archive account for S3, and fetch exactly the discovered VPCs (coverage in + precision/completeness)
 
 **What I want**
 Two related fixes to the `--flow-logs` path, both triggered by a real cross-account run:
@@ -140,9 +140,11 @@ account is often granted read on the archive bucket). Resolution order for the *
 
 1. If `flow_logs` is **explicitly bound** to an account (`[targets.<name>.roles]`), use that profile
    directly — no trial.
-2. Otherwise attempt the S3 `list-objects-v2`/`get-object` under the **primary/network** profile.
+2. Otherwise attempt the **`list-objects-v2`** we already make under the **primary/network** profile.
+   Use that existing call as the access probe — do **not** add a separate probe or a wasted
+   `get-object`.
 3. On `AccessDenied`/`Forbidden`, **fall back**: from `AccountConfig` build the `account_id → profile`
-   map and retry the read under each configured profile (each distinct from the primary), first
+   map and retry the list under each configured profile (each distinct from the primary), first
    success wins. Bounded (config is small), read-only, and — since a candidate may be an expired SSO
    session — reuse the existing `CredentialsExpiredError`/`aws sso login` recovery. Optionally
    **prioritize** candidates using the object key's `AWSLogs/<acctId>/` segment or the flow log's
@@ -150,6 +152,15 @@ account is often granted read on the archive bucket). Resolution order for the *
    hints only (they name the **source** account, not necessarily the bucket owner).
 4. If no configured profile can read the bucket, **error** with an actionable message: the bucket,
    the profiles tried, and how to bind the archive account explicitly.
+
+**Do not use `--expected-bucket-owner` to *discover* the owner.** It's a guard, not a discovery
+mechanism: it returns 403 on **both** owner-mismatch and no-access (indistinguishable from outside),
+and — critically — pairing `--expected-bucket-owner <A>` with account A's own profile *rejects* the
+common case where the source account has cross-account read but is **not** the bucket owner (a plain
+read succeeds there; the expected-owner check 403s). So it cannot select the working profile. It is
+fine as **defense-in-depth once the account is resolved**: pass `--expected-bucket-owner <resolved
+account id>` on the actual `list`/`get` to prevent reading a typo'd or hijacked bucket. Add it only
+if it doesn't break the cross-account-read case (i.e. use the *resolved* account id, not a guess).
 
 Reclassify S3 `AccessDenied`/`Forbidden` in the error tiers (`aws/collectors.py`): today it's
 SYSTEMIC → hard-abort; it must instead **drive this fallback** and only abort once the candidates are
@@ -176,6 +187,32 @@ downloading):
   analysis) — informational, not fatal, per §9.
 - Consider surfacing coverage in `meta` (e.g. `meta.flow_log_coverage: {vpcs_total, vpcs_covered}`)
   so it's visible in `graph.json`. Deterministic (sorted), no wall-clock.
+
+### D. Fetch exactly the right objects — no more (precision), no less (completeness)
+The coverage check (C) validates *config*; this scopes the actual *download* to the discovered VPCs,
+so we neither over-fetch unrelated VPCs/accounts nor silently miss a VPC we know about.
+
+- **Precision — download only in-scope objects.** `_read_s3_records` currently lists a flow log's
+  `LogDestination` prefix and downloads every `.gz`. When that prefix is shared (a bucket root, or a
+  central bucket holding many accounts'/VPCs' logs) this drags in objects for VPCs — even accounts —
+  we never discovered. Filter the listed keys to the flow logs we care about: **every flow-log object
+  filename embeds its `fl-…` id** (e.g. `…_vpcflowlogs_<region>_fl-037982815c3773d43_…log.gz`), and
+  the key path carries `AWSLogs/<sourceAccountId>/`. Keep only objects whose flow-log id belongs to a
+  flow log whose `ResourceId` maps to a discovered VPC/subnet/ENI (and, as a secondary guard, whose
+  `AWSLogs/<acct>/` segment matches the network account id). Build the allowed `fl-…` set from the
+  config discovered in the network account; drop non-matching keys **before** downloading. This
+  composes with the existing size-descending/tail-trim reader (filter first, then order+read).
+- **Completeness — every known-and-covered VPC actually yields data.** Track objects fetched and
+  records parsed **per flow log → per VPC**. After the fetch, for each discovered VPC that *has* an
+  in-scope flow log, assert it produced at least some in-window objects; a covered VPC that yielded
+  **zero** is suspicious (wrong prefix/region/window, or the archive account resolved wrong) and must
+  be surfaced — warn per VPC, and consider a hard error if *every* covered VPC came back empty (that
+  is the "downloading logs unrelated to my 4 VPCs" symptom, caught on the fetch side rather than the
+  config side). Distinguish this from a genuinely idle VPC where objects exist but are all NODATA
+  (the existing reader already reports that).
+- Surface per-VPC results deterministically (sorted) in the stderr diagnostic and/or
+  `meta.flow_log_coverage` (e.g. `{vpc-…: {objects, records}}`), so "all 4 VPCs, N records each" is
+  visible and a missing VPC is obvious.
 
 ## Hard rules (docs/04_conventions.md)
 - Python 3.11+, full type hints, **stdlib only**. Read-only: only `describe-*`/`list-*`/`get-*`/
@@ -205,6 +242,14 @@ downloading):
 - **Coverage hard-fail:** discovered VPCs {A,B,C,D}; flow logs all reference foreign `ResourceId`s ->
   actionable error raised **before** any `get-object`. Assert no S3 download happened.
 - **Coverage partial:** some VPCs covered, one not -> run proceeds, warns about the uncovered VPC.
+- **Precision filter:** `list-objects-v2` returns a shared prefix mixing objects for in-scope
+  flow-log ids and out-of-scope ones (other VPCs/accounts) -> only the in-scope `fl-…` objects are
+  downloaded; assert the out-of-scope keys were never fetched.
+- **Completeness:** two covered VPCs, but only one has objects in-window -> the empty covered VPC is
+  warned about (per-VPC), and if *every* covered VPC yields zero objects the run errors.
+- **No `--expected-bucket-owner` for discovery:** assert the resolution path does not issue an
+  owner-probe per account id (it uses the existing `list-objects-v2`); if the guard is added, it uses
+  the resolved account id on the real read.
 - **`--from-cache`** with flow logs still builds a graph offline (no live accounts) and doesn't crash
   on the split.
 
@@ -217,6 +262,10 @@ downloading):
       when exhausted; S3 `AccessDenied` reclassified from hard-abort to fallback-then-abort.
 - [ ] VPC-coverage reconciliation: hard-fail (before S3 downloads) when no discovered VPC is covered;
       warn on VPCs without a flow log; optional `meta.flow_log_coverage`.
+- [ ] Fetch precision + completeness: downloads filtered to in-scope `fl-…` objects (no over-fetch on
+      a shared prefix); per-VPC object/record accounting with a warning on a covered-but-empty VPC and
+      a hard error if every covered VPC is empty; `--expected-bucket-owner` used (if at all) only as a
+      post-resolution guard, never for owner discovery.
 - [ ] `pytest` passes offline with the new tests; `ruff check` + `ruff format --check` clean.
 - [ ] Read-only + determinism preserved; `--from-cache` still works.
 - [ ] Docs updated: `README.md` (the network-vs-flow_logs account model, the auto-resolution/fallback,
@@ -227,8 +276,10 @@ downloading):
 - [ ] Write `docs/learnings/learnings_<YYYY-MM-DD>_<slug>.md` (per docs/04_conventions.md), committed
       with the code — capture the config-vs-storage account model, the two-account threading choice,
       the primary→AccessDenied auto-resolution (and why it can't catch the silent config bug), the
-      bucket-owner-not-derivable finding, the CloudWatch-in-network assumption, and the coverage-check
-      placement (before S3 I/O).
+      bucket-owner-not-derivable finding, why `--expected-bucket-owner` is a guard and not an
+      owner-discovery tool (it 403s on both mismatch and no-access, and rejects the valid
+      cross-account-read case), the `fl-…`-id precision filter, the per-VPC completeness accounting,
+      the CloudWatch-in-network assumption, and the coverage-check placement (before S3 I/O).
 
 ## Git
 - Branch off the latest `main`. Commit in logical chunks; push. Do **not** open a PR unless asked.
