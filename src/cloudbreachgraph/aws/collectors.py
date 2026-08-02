@@ -725,11 +725,23 @@ _FAILURE_STREAK_ABORT = 5
 _FAILURE_MIN_SAMPLE = 4
 _FAILURE_RATE_THRESHOLD = 0.5
 
-# Fast-fail probe for S3 flow-log objects: if this many objects download successfully but yield
-# **zero** usable flow records, abort rather than download the (possibly tens of thousands) rest —
-# the flow log is almost certainly all-NODATA or an unrecognised format (``docs/02_architecture.md
-# §5.7``). Sized as a representative sample; a run that finds even one record disables the probe.
+# S3 flow-log objects are read **largest first** (see :func:`_size_descending_keys`): an all-NODATA
+# object compresses tiny (repetitive ``- - -`` lines), so descending size front-loads the
+# data-bearing objects and pushes NODATA to the tail. Sizes come free from ``list-objects-v2`` (no
+# extra call). Two consecutive-**zero-record** streak thresholds then decide when to stop reading a
+# source (``docs/02_architecture.md §5.7``):
+#
+# * ``_FLOW_LOG_PROBE_OBJECTS`` — cold-start probe. If a source yields **zero** records across this
+#   many of its largest objects, it's all-NODATA/unrecognised: skip the rest. Kept conservative (a
+#   representative sample) because we have no positive evidence yet. If *every* source ends empty
+#   the run fails loudly rather than build an empty graph.
+# * ``_FLOW_LOG_TAIL_STREAK`` — tail trim. **After** a source has yielded records, this many
+#   consecutive NODATA objects (now in the small-size tail) is strong evidence the rest of the tail
+#   is dead too — skip the remaining, smaller objects. Short because we already have positive
+#   evidence the source is real; the cost of over-skipping is at most a few tiny data objects, and
+#   NODATA is dropped by design anyway.
 _FLOW_LOG_PROBE_OBJECTS = 25
+_FLOW_LOG_TAIL_STREAK = 3
 
 
 class CredentialsExpiredError(RuntimeError):
@@ -1121,7 +1133,15 @@ def _read_s3_records(
     bounds the objects' ``LastModified`` when set. Distinct ``(bucket, prefix)`` sources are read
     once. The per-source *list* and each per-object *get* are units run through :func:`_run_unit`,
     so a corrupt/missing object (``NoSuchKey``/bad gzip) or a transient stall is warned + skipped
-    (with backoff) while the rest are read — a systemic error (``AccessDenied``) still aborts."""
+    (with backoff) while the rest are read — a systemic error (``AccessDenied``) still aborts.
+
+    Each source is read **largest object first** (:func:`_size_descending_keys`) and stops early on
+    a run of NODATA (empty parses): a cold source with no records is abandoned after
+    ``_FLOW_LOG_PROBE_OBJECTS`` consecutive empties (all-NODATA/unrecognised); a source that has
+    already yielded records has its smaller NODATA tail trimmed after ``_FLOW_LOG_TAIL_STREAK``
+    consecutive empties. One empty VPC never aborts a run whose other VPCs have data; the run raises
+    :class:`FlowLogFetchError` only if **every** source came back empty (and enough objects were
+    read to be sure)."""
     sources: dict[tuple[str, str], None] = {}
     for fl in flow_logs:
         bp = _parse_s3_arn(fl.get("LogDestination"))
@@ -1131,19 +1151,27 @@ def _read_s3_records(
     records: list[dict] = []
     objects_read = 0
     tracker = _FailureTracker("s3")
+    empty_sources: list[str] = []  # sources abandoned as all-NODATA (largest objects parse nothing)
     for bucket, prefix in sorted(sources):
         iam = f"s3:ListBucket and s3:GetObject on bucket '{bucket}'"
-        keys_outcome = _run_unit(
-            lambda b=bucket, p=prefix: _list_s3_flow_log_keys(
+        objects_outcome = _run_unit(
+            lambda b=bucket, p=prefix: _list_s3_flow_log_objects(
                 b, p, since_epoch, until_epoch, profile, region
             ),
             source="s3",
             unit=f"s3://{bucket}/{prefix} (list)",
             iam_hint=iam,
         )
-        if not keys_outcome.ok:
+        if not objects_outcome.ok:
             continue  # couldn't list this source (skippable/transient-exhausted) — move on
-        for key in keys_outcome.value:
+        objects = objects_outcome.value
+        total = len(objects)
+        largest = max((size for _, size in objects), default=0)
+        order = _size_descending_keys(objects)
+        src_read = 0  # objects successfully read from THIS source
+        src_parsed = 0  # records parsed from THIS source
+        zero_streak = 0  # consecutive successfully-read objects (in size order) that parsed nothing
+        for i, key in enumerate(order):
             outcome = _run_unit(
                 lambda b=bucket, k=key: _read_s3_object_records(b, k, profile, region),
                 source="s3",
@@ -1151,39 +1179,69 @@ def _read_s3_records(
                 iam_hint=iam,
             )
             tracker.record(outcome)
-            if outcome.ok:
-                objects_read += 1
-                records.extend(outcome.value)
-                # Fast-fail: if a representative sample of objects downloaded but nothing parsed,
-                # abort instead of downloading the rest (the flow log is all-NODATA / unrecognised).
-                if objects_read >= _FLOW_LOG_PROBE_OBJECTS and not records:
-                    raise FlowLogFetchError(
-                        f"aborting flow-log fetch: downloaded {objects_read} S3 objects from "
-                        f"'{bucket}' but parsed 0 usable flow records (e.g. s3://{bucket}/{key}). "
-                        f"The objects appear to contain no usable records (all NODATA/SKIPDATA) or "
-                        f"an unrecognised format — not downloading the rest. Check the flow log's "
-                        f"TrafficType/format, or narrow the window."
+            if not outcome.ok:
+                continue  # download failure (skippable/transient-exhausted) — streak untouched
+            objects_read += 1
+            src_read += 1
+            parsed = len(outcome.value)
+            records.extend(outcome.value)
+            src_parsed += parsed
+            zero_streak = zero_streak + 1 if parsed == 0 else 0
+            # Read largest first, so once a run of NODATA builds up the remaining objects are all
+            # smaller and almost certainly NODATA too — stop reading this source. A cold source (no
+            # records yet) needs a conservative probe (_FLOW_LOG_PROBE_OBJECTS) before we give up; a
+            # source that has already yielded records only needs a short streak (TAIL_STREAK)
+            # to trim its dead tail. One all-NODATA VPC never aborts a run with data elsewhere; the
+            # run fails hard (below) only if EVERY source is empty.
+            threshold = _FLOW_LOG_TAIL_STREAK if src_parsed else _FLOW_LOG_PROBE_OBJECTS
+            if zero_streak >= threshold:
+                remaining = len(order) - (i + 1)
+                if remaining:
+                    _warn_nodata_skip(
+                        bucket,
+                        prefix,
+                        read=src_read,
+                        total=total,
+                        largest=largest,
+                        parsed=src_parsed,
+                        remaining=remaining,
                     )
+                break
+        if src_parsed == 0:
+            empty_sources.append(f"s3://{bucket}/{prefix}")
+
+    if not records and objects_read >= _FLOW_LOG_PROBE_OBJECTS:
+        # Every S3 source we probed came back empty (all-NODATA / unrecognised) — fail loudly rather
+        # than hand back an empty graph, preserving the original single-VPC fast-fail intent.
+        where = ", ".join(empty_sources) or "the configured S3 destination(s)"
+        raise FlowLogFetchError(
+            f"aborting flow-log fetch: probed {objects_read} S3 object(s) across {where} but "
+            f"parsed 0 usable flow records — the flow logs appear to be all NODATA/SKIPDATA or an "
+            f"unrecognised format. Check the flow log's TrafficType/format, or narrow the window."
+        )
     return records, objects_read, tracker.failed
 
 
-def _list_s3_flow_log_keys(
+def _list_s3_flow_log_objects(
     bucket: str,
     prefix: str,
     since_epoch: float,
     until_epoch: float | None,
     profile: str | None,
     region: str | None,
-) -> list[str]:
-    """The ``.gz`` object keys under ``bucket``/``prefix`` last modified within the window.
+) -> list[tuple[str, int]]:
+    """The ``.gz`` objects under ``bucket``/``prefix`` last modified within the window, as
+    ``(key, size_bytes)`` pairs sorted by key.
 
     ``since_epoch`` lower-bounds ``LastModified``; ``until_epoch`` (from ``--flow-log-end``) upper-
-    bounds it when set. Objects with an unknown timestamp are kept."""
+    bounds it when set. Objects with an unknown timestamp are kept. ``Size`` comes back in the same
+    ``list-objects-v2`` response (no extra call) and feeds the size-aware fast-fail probe; a missing
+    or non-numeric size is treated as ``0``."""
     args = ["s3api", "list-objects-v2", f"--bucket={bucket}"]
     if prefix:
         args.append(f"--prefix={prefix}")
     data = runner.run_aws(args, profile=profile, region=region)
-    keys: list[str] = []
+    objects: list[tuple[str, int]] = []
     for obj in data.get("Contents", []):
         key = obj.get("Key")
         if not key or not key.endswith(".gz"):
@@ -1193,8 +1251,42 @@ def _list_s3_flow_log_keys(
             continue  # older than the window start — skip (keep it if the timestamp is unknown)
         if modified is not None and until_epoch is not None and modified > until_epoch:
             continue  # newer than the window end (--flow-log-end)
-        keys.append(key)
-    return sorted(keys)
+        raw_size = obj.get("Size")
+        size = int(raw_size) if isinstance(raw_size, (int, float)) else 0
+        objects.append((key, size))
+    return sorted(objects)
+
+
+def _size_descending_keys(objects: list[tuple[str, int]]) -> list[str]:
+    """A source's object keys ordered **largest first** (ties broken by key for determinism).
+
+    NODATA objects compress tiny, so descending size front-loads the data-bearing objects and pushes
+    NODATA to the tail — letting :func:`_read_s3_records` consume real data first and then skip a
+    trailing run of NODATA. Output is unaffected by download order (records are sorted downstream);
+    this only changes the order in which objects are read."""
+    return [k for k, _ in sorted(objects, key=lambda o: (-o[1], o[0]))]
+
+
+def _warn_nodata_skip(
+    bucket: str, prefix: str, *, read: int, total: int, largest: int, parsed: int, remaining: int
+) -> None:
+    """Warn (stderr) that a source's remaining smaller objects are skipped as a NODATA tail."""
+    src = f"s3://{bucket}/{prefix}"
+    if parsed == 0:
+        reason = (
+            f"probed the {read} largest of {total} object(s) (largest ~{largest:,} B) "
+            f"but parsed 0 usable records"
+        )
+    else:
+        reason = (
+            f"parsed records from the largest objects, then hit {_FLOW_LOG_TAIL_STREAK} "
+            f"consecutive NODATA object(s) in the small-size tail"
+        )
+    print(
+        f"cloudbreachgraph: warning: flow-log s3 source {src}: {reason} — skipping the "
+        f"remaining {remaining} smaller object(s) (all NODATA/SKIPDATA or an unrecognised format).",
+        file=sys.stderr,
+    )
 
 
 def _read_s3_object_records(

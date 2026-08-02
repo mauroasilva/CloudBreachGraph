@@ -338,10 +338,19 @@ into the already-built graph:
    - **S3** (`s3`): `s3api list-objects-v2` under the destination ARN's bucket/prefix (filtered to
      `.gz` objects modified within the window), then `s3api get-object` on each, gunzipped and parsed.
      With `--cache-dir` set, downloaded objects are cached under `<cache-dir>/s3-objects/` and reused
-     for 30 days (they're immutable), so re-runs don't re-download. A **fast-fail probe**
-     (`_FLOW_LOG_PROBE_OBJECTS`, 25) aborts with `FlowLogFetchError` if that many objects download but
-     parse **zero** usable records — the flow log is all-NODATA or an unrecognised format — rather
-     than downloading the (potentially tens of thousands) rest; any single parsed record disables it.
+     for 30 days (they're immutable), so re-runs don't re-download. Each source is read **largest
+     object first** (`_size_descending_keys`, using the `Size` that `list-objects-v2` already returns
+     — no extra call): an all-NODATA object compresses tiny, so descending size front-loads the
+     data-bearing objects and pushes NODATA to the tail. Reading then stops early on a run of NODATA
+     (consecutive empty parses), with two thresholds: a **cold** source that has produced no records
+     is abandoned after `_FLOW_LOG_PROBE_OBJECTS` (25) consecutive empties (all-NODATA/unrecognised —
+     a conservative sample, since there's no positive evidence yet); a source that has **already**
+     yielded records has its smaller NODATA **tail trimmed** after just `_FLOW_LOG_TAIL_STREAK` (3)
+     consecutive empties (strong evidence once the source is known-real). So a 15k-data + 5k-NODATA
+     source reads the 15k data and skips the dead tail instead of downloading it. A single all-NODATA
+     VPC never aborts a run whose other VPCs have data; the run raises `FlowLogFetchError` only if
+     **every** source yields zero records (preserving the loud single-VPC signal). Download order
+     never affects output — records are sorted downstream.
    A destination type with **no implemented reader** (e.g. `kinesis-data-firehose`) raises
    `FlowLogDestinationError` — the run fails loudly rather than silently omitting those flows.
    Records are parsed by **field position derived from the format** — a CloudWatch group's own

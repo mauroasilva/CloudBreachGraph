@@ -474,23 +474,49 @@ def test_flow_log_explicit_range_sets_start_and_end(fake_aws):
     assert f"--end-time={int(end_epoch * 1000)}" in filt["args"]
 
 
-def test_list_s3_flow_log_keys_filters_by_range():
+def test_list_s3_flow_log_objects_filters_by_range_and_carries_size():
     # An object before the start and one after the end are dropped; one inside is kept.
+    # Each surviving object carries its Size (from the same list-objects-v2 response).
     def _run(args, *, profile=None, region=None, cache_dir=None):
         return {
             "Contents": [
-                {"Key": "a/before.log.gz", "LastModified": "2026-04-01T00:00:00+00:00"},
-                {"Key": "a/inside.log.gz", "LastModified": "2026-05-15T00:00:00+00:00"},
-                {"Key": "a/after.log.gz", "LastModified": "2026-07-01T00:00:00+00:00"},
-                {"Key": "a/notgz.txt", "LastModified": "2026-05-15T00:00:00+00:00"},
+                {"Key": "a/before.log.gz", "LastModified": "2026-04-01T00:00:00+00:00", "Size": 9},
+                {"Key": "a/inside.log.gz", "LastModified": "2026-05-15T00:00:00+00:00", "Size": 5},
+                {"Key": "a/after.log.gz", "LastModified": "2026-07-01T00:00:00+00:00", "Size": 9},
+                {"Key": "a/notgz.txt", "LastModified": "2026-05-15T00:00:00+00:00", "Size": 9},
             ]
         }
 
     start = datetime(2026, 5, 1, tzinfo=UTC).timestamp()
     end = datetime(2026, 6, 1, tzinfo=UTC).timestamp()
     with mock.patch.object(collectors.runner, "run_aws", _run):
-        keys = collectors._list_s3_flow_log_keys("b", "a/", start, end, "p", "r")
-    assert keys == ["a/inside.log.gz"]
+        objects = collectors._list_s3_flow_log_objects("b", "a/", start, end, "p", "r")
+    assert objects == [("a/inside.log.gz", 5)]
+
+
+def test_list_s3_flow_log_objects_missing_size_defaults_to_zero():
+    def _run(args, *, profile=None, region=None, cache_dir=None):
+        # No "Size" field, and a non-numeric one -> both coerced to 0 (never a crash).
+        return {
+            "Contents": [
+                {"Key": "a/x.log.gz", "LastModified": "2026-05-15T00:00:00+00:00"},
+                {"Key": "a/y.log.gz", "LastModified": "2026-05-15T00:00:00+00:00", "Size": "big"},
+            ]
+        }
+
+    start = datetime(2026, 5, 1, tzinfo=UTC).timestamp()
+    with mock.patch.object(collectors.runner, "run_aws", _run):
+        objects = collectors._list_s3_flow_log_objects("b", "a/", start, None, "p", "r")
+    assert objects == [("a/x.log.gz", 0), ("a/y.log.gz", 0)]
+
+
+def test_size_descending_keys_orders_largest_first_ties_by_key():
+    # Size increases with key, so descending size is the reverse of key order (29 biggest -> first).
+    objects = [(f"{i:02d}.gz", i) for i in range(30)]
+    assert collectors._size_descending_keys(objects) == [f"{i:02d}.gz" for i in range(29, -1, -1)]
+    # Equal sizes fall back to key order, so the ordering stays deterministic.
+    same = [("c.gz", 5), ("a.gz", 5), ("b.gz", 5)]
+    assert collectors._size_descending_keys(same) == ["a.gz", "b.gz", "c.gz"]
 
 
 def test_field_index_from_format_default_and_custom():
@@ -611,7 +637,8 @@ def test_s3_all_nodata_fast_fails_without_downloading_everything(monkeypatch):
         if key == ("s3api", "list-objects-v2"):
             return {
                 "Contents": [
-                    {"Key": f"p/{i:05d}.log.gz", "LastModified": recent} for i in range(n_objects)
+                    {"Key": f"p/{i:05d}.log.gz", "LastModified": recent, "Size": 200}
+                    for i in range(n_objects)
                 ]
             }
         raise AssertionError(f"unexpected run_aws call: {key}")
@@ -629,9 +656,215 @@ def test_s3_all_nodata_fast_fails_without_downloading_everything(monkeypatch):
 
     with pytest.raises(collectors.FlowLogFetchError) as excinfo:
         collectors.collect_flow_log_records("p", "eu-west-1")
-    assert "0 usable flow records" in str(excinfo.value)
+    msg = str(excinfo.value)
+    assert "0 usable flow records" in msg
+    assert "probed" in msg  # the abort message cites the probe
     # Bounded to the probe — nowhere near the 10k objects.
     assert downloads["n"] == collectors._FLOW_LOG_PROBE_OBJECTS
+
+
+def test_s3_probe_samples_largest_first_finds_data_a_key_probe_would_miss(monkeypatch):
+    """One object with real records is far larger but sorts LAST by key; the many small NODATA
+    objects sort first. A first-25-keys probe would abort before reaching it; the size-aware probe
+    samples the largest first, finds the record, and completes the run."""
+    import gzip
+
+    header = (
+        "version account-id interface-id srcaddr dstaddr srcport dstport "
+        "protocol packets bytes start end action log-status"
+    )
+    nodata = "2 062317582477 eni-0bb770af8ddc25a3e - - - - - - - 1785577119 1785577200 - NODATA"
+    real = (
+        "2 111111111111 eni-real 10.0.0.1 10.0.0.2 40000 443 6 5 500 "
+        "1785577119 1785577200 ACCEPT OK"
+    )
+    recent = datetime.now(UTC).isoformat()
+
+    # 40 small NODATA objects (keys sort first) + 1 large real-data object (key sorts last).
+    contents = [
+        {"Key": f"p/{i:05d}.log.gz", "LastModified": recent, "Size": 300} for i in range(40)
+    ]
+    contents.append({"Key": "p/zzzz-real.log.gz", "LastModified": recent, "Size": 50_000})
+
+    def _run(args, *, profile=None, region=None, cache_dir=None):
+        key = tuple(args[:2])
+        if key == ("ec2", "describe-flow-logs"):
+            return {
+                "FlowLogs": [
+                    {
+                        "FlowLogId": "fl",
+                        "LogDestinationType": "s3",
+                        "LogDestination": "arn:aws:s3:::b/p/",
+                        "LogFormat": None,
+                    }
+                ]
+            }
+        if key == ("s3api", "list-objects-v2"):
+            return {"Contents": contents}
+        raise AssertionError(f"unexpected run_aws call: {key}")
+
+    downloaded_keys: list[str] = []
+
+    def _download(args, dest, *, profile=None, region=None):
+        obj_key = next(a[len("--key=") :] for a in args if a.startswith("--key="))
+        downloaded_keys.append(obj_key)
+        line = real if obj_key.endswith("zzzz-real.log.gz") else nodata
+        with gzip.open(dest, "wt", encoding="utf-8") as fh:
+            fh.write(header + "\n" + line + "\n")
+        return dest
+
+    monkeypatch.setattr(runner, "run_aws", _run)
+    monkeypatch.setattr(runner, "download_object", _download)
+
+    # No abort: the large object is in the probe set, so a record is found and the run completes.
+    records = collectors.collect_flow_log_records("p", "eu-west-1")
+    assert any(r["InterfaceId"] == "eni-real" for r in records)
+    # The large real-data object was among the first objects sampled (largest-first).
+    assert "p/zzzz-real.log.gz" in downloaded_keys[: collectors._FLOW_LOG_PROBE_OBJECTS]
+
+
+def test_s3_all_nodata_source_is_skipped_not_fatal_when_another_source_has_data(monkeypatch):
+    """Two S3 sources (VPCs): the one that sorts FIRST is all-NODATA, the later one has data. The
+    per-source fast-fail must skip the empty source's remaining objects and still read the data-rich
+    source — a single all-NODATA VPC must not abort the whole run. (The old global probe aborted on
+    the first source and never reached the second.)"""
+    import gzip
+
+    header = (
+        "version account-id interface-id srcaddr dstaddr srcport dstport "
+        "protocol packets bytes start end action log-status"
+    )
+    nodata = "2 062317582477 eni-nodata - - - - - - - 1785577119 1785577200 - NODATA"
+    real = (
+        "2 111111111111 eni-real 10.0.0.1 10.0.0.2 40000 443 6 5 500 "
+        "1785577119 1785577200 ACCEPT OK"
+    )
+    recent = datetime.now(UTC).isoformat()
+
+    # bucket-a sorts before bucket-b, so the all-NODATA VPC is processed first.
+    nodata_contents = [
+        {"Key": f"aaa/{i:05d}.log.gz", "LastModified": recent, "Size": 200} for i in range(5000)
+    ]
+    data_contents = [{"Key": "bbb/real.log.gz", "LastModified": recent, "Size": 9000}]
+
+    def _run(args, *, profile=None, region=None, cache_dir=None):
+        key = tuple(args[:2])
+        if key == ("ec2", "describe-flow-logs"):
+            return {
+                "FlowLogs": [
+                    {
+                        "FlowLogId": "fl-a",
+                        "LogDestinationType": "s3",
+                        "LogDestination": "arn:aws:s3:::bucket-a/aaa/",
+                        "LogFormat": None,
+                    },
+                    {
+                        "FlowLogId": "fl-b",
+                        "LogDestinationType": "s3",
+                        "LogDestination": "arn:aws:s3:::bucket-b/bbb/",
+                        "LogFormat": None,
+                    },
+                ]
+            }
+        if key == ("s3api", "list-objects-v2"):
+            bucket = next(a[len("--bucket=") :] for a in args if a.startswith("--bucket="))
+            return {"Contents": nodata_contents if bucket == "bucket-a" else data_contents}
+        raise AssertionError(f"unexpected run_aws call: {key}")
+
+    downloads = {"a": 0, "b": 0}
+
+    def _download(args, dest, *, profile=None, region=None):
+        obj_key = next(a[len("--key=") :] for a in args if a.startswith("--key="))
+        if obj_key.startswith("aaa/"):
+            downloads["a"] += 1
+            line = nodata
+        else:
+            downloads["b"] += 1
+            line = real
+        with gzip.open(dest, "wt", encoding="utf-8") as fh:
+            fh.write(header + "\n" + line + "\n")
+        return dest
+
+    monkeypatch.setattr(runner, "run_aws", _run)
+    monkeypatch.setattr(runner, "download_object", _download)
+
+    # The run completes (no FlowLogFetchError) and returns the data-rich VPC's records.
+    records = collectors.collect_flow_log_records("p", "eu-west-1")
+    assert any(r["InterfaceId"] == "eni-real" for r in records)
+    # The all-NODATA VPC was probed then skipped (bounded), not downloaded in full...
+    assert downloads["a"] == collectors._FLOW_LOG_PROBE_OBJECTS
+    # ...and the data-rich VPC was still read.
+    assert downloads["b"] == 1
+
+
+def test_s3_skips_nodata_tail_after_consuming_data(monkeypatch):
+    """One source, largest-first: 10 large data objects, then 20 small NODATA objects. The data is
+    all consumed; the NODATA tail is skipped after `_FLOW_LOG_TAIL_STREAK` consecutive empties
+    instead of downloading all 20 (the motivating '15k data + 5k NODATA' case, scaled down)."""
+    import gzip
+
+    header = (
+        "version account-id interface-id srcaddr dstaddr srcport dstport "
+        "protocol packets bytes start end action log-status"
+    )
+
+    def data_line(i: int) -> str:
+        return (
+            f"2 111111111111 eni-d{i:02d} 10.0.0.1 10.0.0.2 40000 443 6 5 500 "
+            f"1785577119 1785577200 ACCEPT OK"
+        )
+
+    nodata = "2 062317582477 eni-nodata - - - - - - - 1785577119 1785577200 - NODATA"
+    recent = datetime.now(UTC).isoformat()
+
+    # Data objects are larger (5000 B) than NODATA (500 B), so descending size reads all data first.
+    contents = [
+        {"Key": f"d/{i:02d}.log.gz", "LastModified": recent, "Size": 5000} for i in range(10)
+    ]
+    contents += [
+        {"Key": f"n/{i:02d}.log.gz", "LastModified": recent, "Size": 500} for i in range(20)
+    ]
+
+    def _run(args, *, profile=None, region=None, cache_dir=None):
+        key = tuple(args[:2])
+        if key == ("ec2", "describe-flow-logs"):
+            return {
+                "FlowLogs": [
+                    {
+                        "FlowLogId": "fl",
+                        "LogDestinationType": "s3",
+                        "LogDestination": "arn:aws:s3:::b/",
+                        "LogFormat": None,
+                    }
+                ]
+            }
+        if key == ("s3api", "list-objects-v2"):
+            return {"Contents": contents}
+        raise AssertionError(f"unexpected run_aws call: {key}")
+
+    downloads = {"d": 0, "n": 0}
+
+    def _download(args, dest, *, profile=None, region=None):
+        obj_key = next(a[len("--key=") :] for a in args if a.startswith("--key="))
+        if obj_key.startswith("d/"):
+            downloads["d"] += 1
+            line = data_line(int(obj_key[2:4]))
+        else:
+            downloads["n"] += 1
+            line = nodata
+        with gzip.open(dest, "wt", encoding="utf-8") as fh:
+            fh.write(header + "\n" + line + "\n")
+        return dest
+
+    monkeypatch.setattr(runner, "run_aws", _run)
+    monkeypatch.setattr(runner, "download_object", _download)
+
+    records = collectors.collect_flow_log_records("p", "eu-west-1")
+    # Every data object was consumed (largest-first) and produced its record...
+    assert downloads["d"] == 10
+    assert len({r["InterfaceId"] for r in records}) == 10
+    # ...and the NODATA tail was trimmed after the short streak, not downloaded in full.
+    assert downloads["n"] == collectors._FLOW_LOG_TAIL_STREAK
 
 
 def test_unsupported_flow_log_destination_raises(monkeypatch):
