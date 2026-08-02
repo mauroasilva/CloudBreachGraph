@@ -1,4 +1,4 @@
-## CHANGE REQUEST — Cross-account flow logs: discover config in the VPC account, fetch objects from the log-archive account; validate VPC coverage
+## CHANGE REQUEST — Cross-account flow logs: discover config in the VPC account, auto-resolve the archive account for S3, and validate VPC coverage
 
 **What I want**
 Two related fixes to the `--flow-logs` path, both triggered by a real cross-account run:
@@ -22,6 +22,20 @@ Two related fixes to the `--flow-logs` path, both triggered by a real cross-acco
    run there were **4 VPCs**, and the flow logs being downloaded had nothing to do with any of them —
    the tool should have caught that immediately instead of fetching thousands of unrelated objects.
 
+3. **Auto-resolve the archive account for the S3 read (don't force an explicit binding).** By default,
+   attempt the S3 object I/O with the **primary/network** profile first (in many centralized setups
+   the source account is granted read on the bucket). Only on a permission failure
+   (`AccessDenied`/`Forbidden`) fall back: resolve an alternate profile from the config's
+   `account_id → profile` map and retry; if no configured profile can read the bucket, error out with
+   a clear message. An explicit `flow_logs` role binding, when present, is used directly as a fast
+   path (skip the trial). **Scope note:** this auto-fallback is **S3-access-only** — the config bug
+   (#1) is a *silent success* (`describe-flow-logs` returns the wrong account's logs with no error),
+   so a permission-triggered fallback cannot catch it; the coverage check (#2) is what catches that.
+   And note the bucket **owner** account is *not* derivable from the config: the `LogDestination` ARN
+   carries no account, the object key's `AWSLogs/<acctId>/` segment is the **source** account (not the
+   bucket owner), and `DeliverLogsPermissionArn` is a role in the source account. So resolution is
+   "try configured profiles" (optionally prioritized by those hints), not "compute the owner".
+
 **Acceptance criteria**
 - With `network` bound to account X and `flow_logs` bound to account Y (a `[targets.<name>.roles]`
   binding), `describe-flow-logs`, `cloudtrail lookup-events` (IP-allocation + historical ENIs) and
@@ -30,6 +44,11 @@ Two related fixes to the `--flow-logs` path, both triggered by a real cross-acco
   X's flow logs deliver to.
 - Single-account runs (network and flow_logs resolve to the same account, the common case) behave
   exactly as before — no regression.
+- **Auto-resolution:** with no explicit `flow_logs` binding, the S3 read is attempted under the
+  primary profile; on `AccessDenied`/`Forbidden` it retries under the configured profile(s) resolved
+  by `account_id`, using the first that succeeds; if none can read the bucket it errors with a message
+  naming the bucket, the profiles tried, and how to bind the archive account. An explicit binding
+  skips the trial. `AccessDenied` no longer hard-aborts the S3 read before the fallback is exhausted.
 - Coverage check: if the discovered flow logs reference none of the discovered VPC/subnet/ENI ids,
   the run fails with an actionable message naming the mismatch (and the likely cause: config queried
   in the wrong account). VPCs with no flow log configured are reported (stderr), not fatal.
@@ -115,7 +134,31 @@ network-account operations; only S3 object I/O uses the archive account.**
 - **`--from-cache`** must keep working: the cache replay path (`_collect_from_cache`) has no live
   accounts, so the two-account split must degrade to the single cached source without error.
 
-### B. Validate VPC coverage (would have caught this immediately)
+### B. Resolve the archive account automatically (primary → AccessDenied fallback)
+Don't force users to hand-bind `flow_logs` for the common centralized-logging case (the source
+account is often granted read on the archive bucket). Resolution order for the **S3 read**:
+
+1. If `flow_logs` is **explicitly bound** to an account (`[targets.<name>.roles]`), use that profile
+   directly — no trial.
+2. Otherwise attempt the S3 `list-objects-v2`/`get-object` under the **primary/network** profile.
+3. On `AccessDenied`/`Forbidden`, **fall back**: from `AccountConfig` build the `account_id → profile`
+   map and retry the read under each configured profile (each distinct from the primary), first
+   success wins. Bounded (config is small), read-only, and — since a candidate may be an expired SSO
+   session — reuse the existing `CredentialsExpiredError`/`aws sso login` recovery. Optionally
+   **prioritize** candidates using the object key's `AWSLogs/<acctId>/` segment or the flow log's
+   `DeliverLogsPermissionArn` (map that account id to a profile and try it first) — treat these as
+   hints only (they name the **source** account, not necessarily the bucket owner).
+4. If no configured profile can read the bucket, **error** with an actionable message: the bucket,
+   the profiles tried, and how to bind the archive account explicitly.
+
+Reclassify S3 `AccessDenied`/`Forbidden` in the error tiers (`aws/collectors.py`): today it's
+SYSTEMIC → hard-abort; it must instead **drive this fallback** and only abort once the candidates are
+exhausted. Keep other systemic errors (clock skew, `SignatureDoesNotMatch`) aborting as they do.
+**Important scope limit:** this permission-triggered fallback is S3-only and cannot detect the
+config-in-wrong-account bug — `describe-flow-logs` in the wrong account *succeeds* and returns the
+wrong logs. Section C is what catches that; do not rely on auth errors for it.
+
+### C. Validate VPC coverage (would have caught this immediately)
 After the `network` role has produced `vpcs`/`subnets`/`network_interfaces` and the flow-log config
 is known, reconcile them (a good home is `mapping/builder.py` / `mapping/flowlogs.py`, where both are
 already in scope, or a small helper called from `cli.py` before the S3 fetch to fail *before*
@@ -151,6 +194,14 @@ downloading):
 - **Single account:** network and flow_logs resolve to one account -> every flow-log command runs
   under that one profile (no regression); `--profile`/`--account` paths unaffected.
 - **Config queried once:** `describe-flow-logs` is not run twice under different profiles.
+- **Auto-fallback success:** no `flow_logs` binding; the S3 read raises `AccessDenied` under the
+  primary profile, then succeeds under a second configured profile -> assert the retry ran under that
+  profile and records were parsed. (Mock `download_object`/`run_aws` to deny for profile X and serve
+  for profile Y.)
+- **Auto-fallback exhausted:** `AccessDenied` under every configured profile -> actionable error
+  naming the bucket and the profiles tried; no silent empty graph.
+- **Explicit binding skips the trial:** with `flow_logs` bound, the S3 read runs only under the bound
+  profile (no attempt under the primary).
 - **Coverage hard-fail:** discovered VPCs {A,B,C,D}; flow logs all reference foreign `ResourceId`s ->
   actionable error raised **before** any `get-object`. Assert no S3 download happened.
 - **Coverage partial:** some VPCs covered, one not -> run proceeds, warns about the uncovered VPC.
@@ -161,17 +212,23 @@ downloading):
 - [ ] `describe-flow-logs` + CloudTrail history + CloudWatch reads run in the **network** account;
       S3 `list-objects-v2`/`get-object` in the **flow_logs (archive)** account; single-account runs
       unchanged; `describe-flow-logs` queried once.
+- [ ] Archive-account auto-resolution: primary profile first, `AccessDenied` fallback across
+      configured `account_id → profile` candidates (explicit binding skips the trial), clear error
+      when exhausted; S3 `AccessDenied` reclassified from hard-abort to fallback-then-abort.
 - [ ] VPC-coverage reconciliation: hard-fail (before S3 downloads) when no discovered VPC is covered;
       warn on VPCs without a flow log; optional `meta.flow_log_coverage`.
 - [ ] `pytest` passes offline with the new tests; `ruff check` + `ruff format --check` clean.
 - [ ] Read-only + determinism preserved; `--from-cache` still works.
-- [ ] Docs updated: `README.md` (the network-vs-flow_logs account model + the coverage check),
-      `docs/02_architecture.md` (§5.7 the cross-account split + coverage; §11 how the two roles map
-      to accounts), IAM notes (network account needs `ec2:DescribeFlowLogs`, `cloudtrail:LookupEvents`,
-      `logs:FilterLogEvents`; archive account needs `s3:ListBucket`+`s3:GetObject`).
+- [ ] Docs updated: `README.md` (the network-vs-flow_logs account model, the auto-resolution/fallback,
+      and the coverage check), `docs/02_architecture.md` (§5.7 the cross-account split + auto-resolution
+      + coverage; §11 how the two roles map to accounts), IAM notes (network account needs
+      `ec2:DescribeFlowLogs`, `cloudtrail:LookupEvents`, `logs:FilterLogEvents`; archive account needs
+      `s3:ListBucket`+`s3:GetObject`).
 - [ ] Write `docs/learnings/learnings_<YYYY-MM-DD>_<slug>.md` (per docs/04_conventions.md), committed
       with the code — capture the config-vs-storage account model, the two-account threading choice,
-      the CloudWatch-in-network assumption, and the coverage-check placement (before S3 I/O).
+      the primary→AccessDenied auto-resolution (and why it can't catch the silent config bug), the
+      bucket-owner-not-derivable finding, the CloudWatch-in-network assumption, and the coverage-check
+      placement (before S3 I/O).
 
 ## Git
 - Branch off the latest `main`. Commit in logical chunks; push. Do **not** open a PR unless asked.
