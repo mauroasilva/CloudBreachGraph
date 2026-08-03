@@ -385,6 +385,16 @@ same account (the default), nothing changes.
 Required read-only IAM: **network account** — `ec2:DescribeFlowLogs`, `cloudtrail:LookupEvents`,
 `logs:FilterLogEvents`; **archive account** — `s3:ListBucket` + `s3:GetObject` on the bucket.
 
+#### Bounded memory
+
+A flow-log account can hold **millions** of records, so the fetch never keeps them all in RAM: S3
+objects are gunzipped **line by line**, CloudWatch is read in bounded pages (`--max-items` +
+`--starting-token`), and parsed records **stream through a temp file** rather than a giant in-memory
+list. The graph is built from that stream, so peak memory stays bounded (only the per-VPC/per-edge
+aggregates are held) regardless of how much traffic the logs contain. Output is byte-for-byte
+unchanged. (Needs temp-file disk space proportional to the records fetched — set `TMPDIR` to point
+it at a roomy volume for a very large run.)
+
 ### Historical ENIs & ASG collapse
 
 `--flow-logs` only knows the ENIs that exist **right now**. In an Auto Scaling group, instances and

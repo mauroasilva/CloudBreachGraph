@@ -28,6 +28,7 @@ reshapes an in-memory :class:`~cloudbreachgraph.model.graph.Graph`.
 from __future__ import annotations
 
 import ipaddress
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -173,11 +174,18 @@ def map_flow_logs(
     enis: list[Eni],
     flow_logs: list[FlowLog],
     allocations: list[IpAllocation],
-    records: list[FlowLogRecord],
+    records: Iterable[dict],
     historical: list[HistoricalEni] | None = None,
     vpcs: list[Vpc] | None = None,
 ) -> None:
     """Fold IP history, per-VPC flow-log config, and observed connections into ``graph`` (§5.7).
+
+    ``records`` is a **re-iterable** of raw record dicts (a ``list`` or a disk-backed
+    :class:`~cloudbreachgraph.aws.collectors.FlowLogRecordStream`) — it is iterated **twice** (once
+    to surface unrecognised ENIs, once to map connections), converting each dict to a
+    :class:`FlowLogRecord` lazily, so the full record set is never held in memory. An account with
+    millions of flow records maps in bounded RAM (only the per-ENI inference counts + per-edge port
+    aggregates are kept); the records themselves stream from disk (§5.7 bounded-memory fetch).
 
     ``historical`` are the CloudTrail-reconstructed ENIs; the caller (``mapping/builder.py``) is
     responsible for having already added their **nodes** (flagged ``historical``/terminated), so
@@ -354,23 +362,19 @@ def _in_any_network(addr: str, nets: list[ipaddress.IPv4Network | ipaddress.IPv6
 
 
 def _infer_own_ip(
-    records: list[FlowLogRecord],
+    freq: dict[str, int],
     nets: list[ipaddress.IPv4Network | ipaddress.IPv6Network],
 ) -> dict[str, str] | None:
-    """Guess an unrecognised ENI's own private IP from the flows captured on it, flagging *how*.
+    """Guess an unrecognised ENI's own private IP from its address-frequency map, flagging *how*.
 
     Every flow captured on the ENI has the ENI's own address on one side and a peer on the other, so
-    the ENI's IP is the address that **recurs** across its records. Preferring an address that also
-    falls inside a **known VPC CIDR** (``method = "vpc_cidr"``, high confidence) pins the internal
-    side; with no VPC-internal candidate we fall back to the most-recurring address overall
-    (``method = "recurring_side"``, low confidence). Returns ``{"ip", "method", "confidence"}`` or
-    ``None`` when the records carry no address at all. Deterministic (ties break to the lexically
-    smallest address)."""
-    freq: dict[str, int] = {}
-    for rec in records:
-        for addr in (rec.srcaddr, rec.dstaddr):
-            if addr:
-                freq[addr] = freq.get(addr, 0) + 1
+    the ENI's IP is the address that **recurs** across its records — ``freq`` counts each address's
+    occurrences (built incrementally by :func:`_add_unrecognised_enis`, so the records themselves
+    aren't held). Preferring an address that also falls inside a **known VPC CIDR**
+    (``method = "vpc_cidr"``, high confidence) pins the internal side; with no VPC-internal
+    candidate we fall back to the most-recurring address overall (``method = "recurring_side"``,
+    low confidence). Returns ``{"ip", "method", "confidence"}`` or ``None`` when there is no
+    address at all. Deterministic (ties break to the lexically smallest address)."""
     if not freq:
         return None
     in_vpc = [a for a in freq if _in_any_network(a, nets)]
@@ -383,7 +387,7 @@ def _infer_own_ip(
 
 def _add_unrecognised_enis(
     graph: Graph,
-    records: list[FlowLogRecord],
+    records: Iterable[dict],
     inventory: _Inventory,
     nets: list[ipaddress.IPv4Network | ipaddress.IPv6Network],
 ) -> None:
@@ -396,16 +400,22 @@ def _add_unrecognised_enis(
     ``confidence``) — **never** in ``private_ips`` (kept empty; confirmed addresses only). The
     inferred IP is added to the resolver's inventory (unbounded lifetime) so the ENI's own flows map
     and a peer matching that IP forms an ENI↔ENI edge. Deterministic: processed in sorted id order.
-    """
-    records_by_eni: dict[str, list[FlowLogRecord]] = {}
-    for rec in records:
-        if rec.interface_id:
-            records_by_eni.setdefault(rec.interface_id, []).append(rec)
 
-    for eni_id in sorted(records_by_eni):
-        if eni_id in inventory.entries:
-            continue  # a current or historical ENI — already a (richer) node
-        inferred = _infer_own_ip(records_by_eni[eni_id], nets)
+    Streams ``records`` once, keeping only a compact per-unknown-ENI **address-frequency** map
+    (never the records themselves) — bounded to O(unknown ENIs × distinct addresses)."""
+    freq_by_eni: dict[str, dict[str, int]] = {}
+    for raw in records:
+        rec = FlowLogRecord.from_collected(raw)
+        iface = rec.interface_id
+        if not iface or iface in inventory.entries:
+            continue  # unknown home ids only — a known ENI already has a (richer) node
+        freq = freq_by_eni.setdefault(iface, {})
+        for addr in (rec.srcaddr, rec.dstaddr):
+            if addr:
+                freq[addr] = freq.get(addr, 0) + 1
+
+    for eni_id in sorted(freq_by_eni):
+        inferred = _infer_own_ip(freq_by_eni[eni_id], nets)
         inferred_list = [inferred] if inferred is not None else []
         entry = inventory._entry(eni_id)  # created/deleted stay None -> alive at every record time
         if inferred is not None:
@@ -426,7 +436,7 @@ def _add_unrecognised_enis(
         )
 
 
-def _map_connections(graph: Graph, records: list[FlowLogRecord], inventory: _Inventory) -> None:
+def _map_connections(graph: Graph, records: Iterable[dict], inventory: _Inventory) -> None:
     """Turn flow records into ``connects_to`` edges (+ ``flow_peer`` nodes for external peers).
 
     For each record captured on an ENI ``A`` (current or historical — the *home*, resolved by
@@ -441,12 +451,14 @@ def _map_connections(graph: Graph, records: list[FlowLogRecord], inventory: _Inv
       (held by some inventory ENI at another time), in which case the record is dropped so a reused
       internal address never surfaces as a spurious external peer.
 
-    Ports are aggregated per directed edge so repeated flows collapse to one edge.
-    """
+    Ports are aggregated per directed edge so repeated flows collapse to one edge. ``records`` is
+    streamed once and each dict converted to a :class:`FlowLogRecord` lazily, so only the bounded
+    ``agg`` (one entry per distinct directed edge) is held — not the records."""
     # (source_id, target_id) -> {ports, peer_ip (set only for a flow_peer node)}
     agg: dict[tuple[str, str], dict] = {}
 
-    for rec in records:
+    for raw in records:
+        rec = FlowLogRecord.from_collected(raw)
         home = inventory.entries.get(rec.interface_id) if rec.interface_id else None
         if home is None:
             continue  # the home ENI isn't in the combined inventory — nothing to anchor on

@@ -1085,6 +1085,72 @@ class _FailureTracker:
 
 
 # --------------------------------------------------------------------------- #
+# Bounded-memory record sink (§5.7) — a flow-log account can hold millions of records; keeping them
+# all in RAM as dicts (then a second dataclass copy in the mapping layer) OOMs the process. The
+# record fetch therefore **streams** records through this disk-backed sink instead of holding a
+# giant list: each record is one NDJSON line on a temp file, and the mapping layer re-reads the file
+# in its two passes (see mapping/flowlogs.py), so RAM holds only the *bounded* aggregates (per-ENI
+# inference counts + per-edge port sets), never the full record set. Determinism is unaffected —
+# records are written in read order and the graph sorts its output.
+# --------------------------------------------------------------------------- #
+class FlowLogRecordStream:
+    """A re-iterable, disk-backed sequence of flow-log record dicts (bounded RAM, §5.7).
+
+    Duck-types the ``list`` interface the readers use (``.extend(iterable)``), but spills each
+    record to a temp NDJSON file instead of holding it in memory. Iterating re-reads the file (so
+    the two mapping passes both work), and :meth:`close` (also called from ``__del__`` as a safety
+    net)
+    deletes the file. ``count`` is the number of records written (for the diagnostic), without
+    materializing them."""
+
+    def __init__(self) -> None:
+        fd, self._path = tempfile.mkstemp(prefix="cbg-flowrecords-", suffix=".ndjson")
+        self._fh: Any = os.fdopen(fd, "w", encoding="utf-8")
+        self._count = 0
+
+    def extend(self, records: Any) -> None:
+        """Append records (any iterable of JSON-serializable dicts) — one NDJSON line each."""
+        if self._fh is None:
+            raise RuntimeError("cannot extend a closed FlowLogRecordStream")
+        write = self._fh.write
+        dumps = _json.dumps
+        n = 0
+        for rec in records:
+            write(dumps(rec, separators=(",", ":")))
+            write("\n")
+            n += 1
+        self._count += n
+
+    def __iter__(self):
+        if self._fh is not None:
+            self._fh.flush()
+        with open(self._path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    yield _json.loads(line)
+
+    @property
+    def count(self) -> int:
+        return self._count
+
+    def close(self) -> None:
+        """Close the write handle and delete the temp file (idempotent, best-effort)."""
+        if self._fh is not None:
+            try:
+                self._fh.close()
+            finally:
+                self._fh = None
+        try:
+            os.unlink(self._path)
+        except OSError:
+            pass
+
+    def __del__(self) -> None:  # safety net if an error path skips close()
+        self.close()
+
+
+# --------------------------------------------------------------------------- #
 # VPC coverage reconciliation (§5.7 design guidance C) — validate that the discovered flow-log
 # config actually references the discovered VPCs *before* downloading a single object, so a
 # config-in-wrong-account mistake fails fast instead of after thousands of unrelated gets.
@@ -1232,7 +1298,11 @@ def collect_flow_log_records(profile: str | None, region: str | None) -> list[di
     reads up to the configured :func:`get_flow_log_window` days back (``--flow-log-days N``, default
     :data:`FLOW_LOG_MAX_LOOKBACK_DAYS`) and is read-only. Returns a flat list
     of normalized flow records; emits a one-line stderr diagnostic so an empty result is
-    explainable."""
+    explainable.
+
+    This single-account convenience path materializes a list (used by the offline tests); the
+    production two-account path (:func:`fetch_flow_log_records`) streams into a disk-backed
+    :class:`FlowLogRecordStream` instead, to bound memory."""
     config = runner.run_aws(["ec2", "describe-flow-logs"], profile=profile, region=region)
     flow_logs = config.get("FlowLogs", [])
 
@@ -1243,10 +1313,9 @@ def collect_flow_log_records(profile: str | None, region: str | None) -> list[di
     fetched_by_type: dict[str, int] = {}
     skipped_by_type: dict[str, int] = {}
     for dest, fls in by_type.items():
-        recs, fetched, skipped = FLOW_LOG_READERS[dest](
-            fls, profile, region, since_epoch, until_epoch
+        fetched, skipped = FLOW_LOG_READERS[dest](
+            fls, profile, region, since_epoch, until_epoch, sink=records
         )
-        records.extend(recs)
         fetched_by_type[dest] = fetched
         skipped_by_type[dest] = skipped
 
@@ -1280,17 +1349,20 @@ def fetch_flow_log_records(
     *,
     coverage: FlowLogCoverage | None = None,
     network_account_id: str | None = None,
-) -> tuple[list[dict], dict[str, dict[str, int]], ResolvedAccount | None]:
+) -> tuple[FlowLogRecordStream, dict[str, dict[str, int]], ResolvedAccount | None]:
     """Fetch flow-log *records* across two accounts (``§5.7`` cross-account split), given the config
-    already discovered (in the **network** account — queried once, not re-run here).
+    already discovered in the **network** account (queried once, not re-run here).
 
     CloudWatch reads (``logs filter-log-events``) run under ``network`` (the log group lives with
     the VPCs); S3 reads (``list-objects-v2`` + ``get-object``) run under the **archive** account
     resolved by :class:`_ArchiveResolver` (explicit binding, else primary→AccessDenied fallback).
-    ``coverage``
-    scopes the S3 download to the in-scope ``fl-…`` objects (precision) and drives per-VPC
-    object/record accounting (completeness). Returns ``(records, per_vpc, resolved_archive)`` — the
-    per-VPC counts and the account the S3 objects were actually read under (for provenance)."""
+    ``coverage`` scopes the S3 download to the in-scope ``fl-…`` objects (precision) and drives
+    per-VPC object/record accounting (completeness).
+
+    Records stream into a disk-backed :class:`FlowLogRecordStream` (bounded memory, §5.7) rather
+    than a list. Returns ``(stream, per_vpc, resolved_archive)`` — the caller owns the stream and
+    must :meth:`FlowLogRecordStream.close` it (the mapping layer does, in ``build_graph``); on any
+    error here the stream is closed before propagating."""
     by_type, dest_counts = _group_flow_logs_by_dest(flow_logs)
     since_epoch, until_epoch = _flow_log_window_bounds()
     fl_to_vpc = coverage.fl_to_vpc if coverage else None
@@ -1300,39 +1372,50 @@ def fetch_flow_log_records(
 
     resolver = _ArchiveResolver(archive)
     per_vpc: dict[str, dict[str, int]] = {}
-    records: list[dict] = []
+    stream = FlowLogRecordStream()
     fetched_by_type: dict[str, int] = {}
     skipped_by_type: dict[str, int] = {}
-    for dest, fls in by_type.items():
-        if dest == "s3":
-            recs, fetched, skipped = _read_s3_records(
-                fls,
-                network.profile,
-                network.region,
-                since_epoch,
-                until_epoch,
-                resolver=resolver,
-                allowed_fl_ids=allowed,
-                fl_to_vpc=fl_to_vpc,
-                network_account_id=network_account_id,
-                per_vpc=per_vpc,
-            )
-        else:  # cloud-watch-logs — validated by _group_flow_logs_by_dest
-            recs, fetched, skipped = _read_cloudwatch_records(
-                fls,
-                network.profile,
-                network.region,
-                since_epoch,
-                until_epoch,
-                fl_to_vpc=fl_to_vpc,
-                per_vpc=per_vpc,
-            )
-        records.extend(recs)
-        fetched_by_type[dest] = fetched
-        skipped_by_type[dest] = skipped
+    try:
+        for dest, fls in by_type.items():
+            if dest == "s3":
+                fetched, skipped = _read_s3_records(
+                    fls,
+                    network.profile,
+                    network.region,
+                    since_epoch,
+                    until_epoch,
+                    sink=stream,
+                    resolver=resolver,
+                    allowed_fl_ids=allowed,
+                    fl_to_vpc=fl_to_vpc,
+                    network_account_id=network_account_id,
+                    per_vpc=per_vpc,
+                )
+            else:  # cloud-watch-logs — validated by _group_flow_logs_by_dest
+                fetched, skipped = _read_cloudwatch_records(
+                    fls,
+                    network.profile,
+                    network.region,
+                    since_epoch,
+                    until_epoch,
+                    sink=stream,
+                    fl_to_vpc=fl_to_vpc,
+                    per_vpc=per_vpc,
+                )
+            fetched_by_type[dest] = fetched
+            skipped_by_type[dest] = skipped
+    except BaseException:
+        stream.close()  # don't leak the temp file when the fetch aborts
+        raise
 
-    _report_flow_log_records(flow_logs, dest_counts, fetched_by_type, skipped_by_type, len(records))
-    return records, per_vpc, resolver.resolved
+    _report_flow_log_records(flow_logs, dest_counts, fetched_by_type, skipped_by_type, stream.count)
+    return stream, per_vpc, resolver.resolved
+
+
+# Each CloudWatch ``filter-log-events`` invocation is capped to this many events (``--max-items``)
+# so a busy log group is read one bounded **page** at a time and streamed into the sink, instead of
+# the AWS CLI auto-paginating the whole group into one buffered response (which OOMs a large group).
+_CLOUDWATCH_PAGE_SIZE = 10_000
 
 
 def _read_cloudwatch_records(
@@ -1342,15 +1425,20 @@ def _read_cloudwatch_records(
     since_epoch: float,
     until_epoch: float | None = None,
     *,
+    sink: Any,
     fl_to_vpc: dict[str, str] | None = None,
     per_vpc: dict[str, dict[str, int]] | None = None,
-) -> tuple[list[dict], int, int]:
-    """Read records from each CloudWatch log group (``logs filter-log-events``). Returns
-    ``(records, events_fetched, groups_skipped)``. Each group's fields come from its own
-    ``LogFormat``. ``until_epoch`` (from ``--flow-log-end``) bounds the query with ``--end-time``
-    when set. Each group is one **unit** run through :func:`_run_unit`, so a missing group
-    (``ResourceNotFoundException``) or a transient stall on one group is warned + skipped (with
-    backoff/retry) while the others are read — a systemic error (``AccessDenied``) still aborts.
+) -> tuple[int, int]:
+    """Read records from each CloudWatch log group (``logs filter-log-events``) into ``sink``.
+
+    Returns ``(events_fetched, pages_skipped)``. Records are streamed into ``sink`` (a list or a
+    :class:`FlowLogRecordStream`) per **page**, never accumulated here. Each group is read in
+    bounded pages of :data:`_CLOUDWATCH_PAGE_SIZE` events (``--max-items`` + ``--starting-token``)
+    so a busy group doesn't buffer its whole history in one response. Each **page** is a
+    :func:`_run_unit` unit, so a missing group (``ResourceNotFoundException``) or a transient stall
+    is warned + skipped (with backoff/retry) while the rest are read; a systemic error
+    (``AccessDenied``) still aborts. Because a page's records are only emitted **after** the page
+    succeeds, a retried page never double-emits.
 
     The CloudWatch reader runs under the **network** account (the log group lives with the VPCs).
     When ``per_vpc`` is provided, each group's events/records are attributed to the VPC(s) the group
@@ -1370,46 +1458,59 @@ def _read_cloudwatch_records(
 
     start_ms = int(since_epoch * 1000)
     end_ms = int(until_epoch * 1000) if until_epoch is not None else None
-    records: list[dict] = []
     fetched = 0
     tracker = _FailureTracker("cloud-watch-logs")
     for group in sorted(group_fields):
+        field_idx = group_fields[group]
+        group_events = 0
+        group_parsed = 0
+        token: str | None = None
+        while True:
 
-        def _fetch(g: str = group) -> list[dict]:
-            args = [
-                "logs",
-                "filter-log-events",
-                f"--log-group-name={g}",
-                f"--start-time={start_ms}",
-            ]
-            if end_ms is not None:
-                args.append(f"--end-time={end_ms}")
-            data = runner.run_aws(args, profile=profile, region=region)
-            return data.get("events", [])
+            def _fetch_page(
+                g: str = group, tok: str | None = token
+            ) -> tuple[list[dict], str | None]:
+                args = [
+                    "logs",
+                    "filter-log-events",
+                    f"--log-group-name={g}",
+                    f"--start-time={start_ms}",
+                    f"--max-items={_CLOUDWATCH_PAGE_SIZE}",
+                ]
+                if end_ms is not None:
+                    args.append(f"--end-time={end_ms}")
+                if tok is not None:
+                    args.append(f"--starting-token={tok}")
+                data = runner.run_aws(args, profile=profile, region=region)
+                return data.get("events", []), data.get("NextToken")
 
-        outcome = _run_unit(
-            _fetch,
-            source="cloud-watch-logs",
-            unit=group,
-            iam_hint=f"logs:FilterLogEvents on log group '{group}'",
-        )
-        tracker.record(outcome)
-        if not outcome.ok:
-            continue
-        events = outcome.value
-        fetched += len(events)
-        parsed_here = 0
-        for event in events:
-            rec = _parse_flow_log_message(event.get("message", ""), group, group_fields[group])
-            if rec is not None:
-                records.append(rec)
-                parsed_here += 1
+            outcome = _run_unit(
+                _fetch_page,
+                source="cloud-watch-logs",
+                unit=group,
+                iam_hint=f"logs:FilterLogEvents on log group '{group}'",
+            )
+            tracker.record(outcome)
+            if not outcome.ok:
+                break  # skip the rest of this group (best-effort); other groups still read
+            events, token = outcome.value
+            fetched += len(events)
+            group_events += len(events)
+            batch: list[dict] = []
+            for event in events:
+                rec = _parse_flow_log_message(event.get("message", ""), group, field_idx)
+                if rec is not None:
+                    batch.append(rec)
+            sink.extend(batch)  # emit only after the page succeeded -> retry never double-emits
+            group_parsed += len(batch)
+            if token is None:
+                break
         if per_vpc is not None:
             for vpc in group_to_vpcs.get(group, set()):
                 acc = per_vpc.setdefault(vpc, {"objects": 0, "records": 0})
-                acc["objects"] += len(events)
-                acc["records"] += parsed_here
-    return records, fetched, tracker.failed
+                acc["objects"] += group_events
+                acc["records"] += group_parsed
+    return fetched, tracker.failed
 
 
 class _ArchiveResolver:
@@ -1521,16 +1622,20 @@ def _read_s3_records(
     since_epoch: float,
     until_epoch: float | None = None,
     *,
+    sink: Any,
     resolver: _ArchiveResolver | None = None,
     allowed_fl_ids: set[str] | None = None,
     fl_to_vpc: dict[str, str] | None = None,
     network_account_id: str | None = None,
     per_vpc: dict[str, dict[str, int]] | None = None,
-) -> tuple[list[dict], int, int]:
-    """Read records from each S3 destination: list the gzipped objects modified within the window
-    (``s3api list-objects-v2``), download and parse each (``s3api get-object`` + gunzip). Returns
-    ``(records, objects_read, objects_skipped)``. ``until_epoch`` (from ``--flow-log-end``) upper-
-    bounds the objects' ``LastModified`` when set. Distinct ``(bucket, prefix)`` sources are read
+) -> tuple[int, int]:
+    """Read records from each S3 destination into ``sink``: list the gzipped objects modified within
+    the window (``s3api list-objects-v2``), download and parse each (``s3api get-object`` +
+    gunzip). Records are streamed into ``sink`` (a list or a :class:`FlowLogRecordStream`) one
+    object at a time — never accumulated here. Returns ``(objects_read, objects_skipped)``.
+    ``until_epoch`` (from ``--flow-log-end``) upper-bounds the objects' ``LastModified`` when set.
+    Distinct
+    ``(bucket, prefix)`` sources are read
     once. The per-source *list* and each per-object *get* are units run through :func:`_run_unit`,
     so a corrupt/missing object (``NoSuchKey``/bad gzip) or a transient stall is warned + skipped
     (with backoff) while the rest are read — a systemic error (``AccessDenied``) still aborts.
@@ -1553,8 +1658,8 @@ def _read_s3_records(
         if bp is not None:
             sources.setdefault(bp, None)
 
-    records: list[dict] = []
     objects_read = 0
+    emitted = 0  # records streamed into the sink across all sources (for the all-empty fast-fail)
     tracker = _FailureTracker("s3")
     empty_sources: list[str] = []  # sources abandoned as all-NODATA (largest objects parse nothing)
     for bucket, prefix in sorted(sources):
@@ -1600,7 +1705,8 @@ def _read_s3_records(
             objects_read += 1
             src_read += 1
             parsed = len(outcome.value)
-            records.extend(outcome.value)
+            sink.extend(outcome.value)  # stream this object's records; don't hold them
+            emitted += parsed
             src_parsed += parsed
             _account_object_to_vpc(per_vpc, fl_to_vpc, key, parsed)
             zero_streak = zero_streak + 1 if parsed == 0 else 0
@@ -1627,7 +1733,7 @@ def _read_s3_records(
         if src_parsed == 0:
             empty_sources.append(f"s3://{bucket}/{prefix}")
 
-    if not records and objects_read >= _FLOW_LOG_PROBE_OBJECTS:
+    if emitted == 0 and objects_read >= _FLOW_LOG_PROBE_OBJECTS:
         # Every S3 source we probed came back empty (all-NODATA / unrecognised) — fail loudly rather
         # than hand back an empty graph, preserving the original single-VPC fast-fail intent.
         where = ", ".join(empty_sources) or "the configured S3 destination(s)"
@@ -1636,7 +1742,7 @@ def _read_s3_records(
             f"parsed 0 usable flow records — the flow logs appear to be all NODATA/SKIPDATA or an "
             f"unrecognised format. Check the flow log's TrafficType/format, or narrow the window."
         )
-    return records, objects_read, tracker.failed
+    return objects_read, tracker.failed
 
 
 def _account_object_to_vpc(
@@ -1728,33 +1834,37 @@ def _warn_nodata_skip(
 def _read_s3_object_records(
     bucket: str, key: str, profile: str | None, region: str | None
 ) -> list[dict]:
-    """Download one gzipped flow-log object and parse its records. The object's **first line is the
+    """Download one gzipped flow-log object and parse its records, **streaming** the gunzip line by
+    line (never materializing the whole decompressed object). The object's **first line is the
     field-name header** (VPC flow-log S3 files always carry one), so the field index is read from it
-    (falling back to the default layout if it isn't a header). A corrupt/unreadable object is
-    skipped, never fatal."""
-    lines = _download_gz_lines(bucket, key, profile, region)
-    if not lines:
-        return []
-    header_idx = _field_index_from_format(lines[0])
-    if header_idx is not None:
-        field_idx, data_lines = header_idx, lines[1:]
-    else:
-        field_idx, data_lines = dict(_FLOW_FIELD_IDX), lines
+    (falling back to the default layout if it isn't a header). The returned list holds only **this
+    one** object's records (bounded), which the caller streams into the sink and discards. A
+    corrupt/unreadable object is skipped, never fatal."""
     source = f"s3://{bucket}/{key}"
+    field_idx: dict[str, int] | None = None
     out: list[dict] = []
-    for line in data_lines:
-        rec = _parse_flow_log_message(line, source, field_idx)
+    for i, line in enumerate(_iter_gz_lines(bucket, key, profile, region)):
+        if i == 0:
+            header_idx = _field_index_from_format(line)
+            if header_idx is not None:
+                field_idx = header_idx
+                continue  # first line was the header row — consumed, not a record
+            field_idx = dict(_FLOW_FIELD_IDX)  # not a header: use default layout, parse this line
+        rec = _parse_flow_log_message(line, source, field_idx)  # type: ignore[arg-type]
         if rec is not None:
             out.append(rec)
     return out
 
 
-def _download_gz_lines(bucket: str, key: str, profile: str | None, region: str | None) -> list[str]:
-    """``s3api get-object`` the key to a temp file, gunzip it, return its text lines.
+def _iter_gz_lines(bucket: str, key: str, profile: str | None, region: str | None):
+    """``s3api get-object`` the key to a temp file, then **yield** its gunzipped text lines one at a
+    time (bounded memory — the whole object is never held decompressed in RAM).
 
     A failed ``get-object`` raises :class:`~cloudbreachgraph.aws.runner.AwsCliError` (classified and
-    handled by :func:`_run_unit`); a corrupt/undecodable body raises :class:`_SkippableUnitError`
-    (warned + skipped + counted toward the failure-rate safeguard) rather than silently vanish."""
+    handled by :func:`_run_unit`) before any line is yielded; a corrupt/undecodable body raises
+    :class:`_SkippableUnitError` (warned + skipped + counted toward the failure-rate safeguard)
+    rather than silently vanish. The temp file is deleted when iteration finishes (or the generator
+    is closed)."""
     fd, dest = tempfile.mkstemp(suffix=".gz")
     os.close(fd)
     try:
@@ -1764,10 +1874,12 @@ def _download_gz_lines(bucket: str, key: str, profile: str | None, region: str |
             profile=profile,
             region=region,
         )
-        with gzip.open(dest, "rt", encoding="utf-8", errors="replace") as fh:
-            return fh.read().splitlines()
-    except (OSError, EOFError, gzip.BadGzipFile) as exc:
-        raise _SkippableUnitError(f"corrupt/unreadable gzip object: {exc}") from exc
+        try:
+            with gzip.open(dest, "rt", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    yield line.rstrip("\n")
+        except (OSError, EOFError, gzip.BadGzipFile) as exc:
+            raise _SkippableUnitError(f"corrupt/unreadable gzip object: {exc}") from exc
     finally:
         try:
             os.unlink(dest)
@@ -1788,12 +1900,10 @@ def _epoch_from_iso(value: str | None) -> float | None:
 # Registry: LogDestinationType -> the reader that pulls its records. Adding a new destination type
 # (e.g. kinesis-data-firehose) is one entry here + its reader; until then such a type raises
 # FlowLogDestinationError, so the tool always pulls from the right source or fails loudly (§5.7).
-FLOW_LOG_READERS: dict[
-    str,
-    Callable[
-        [list[dict], str | None, str | None, float, float | None], tuple[list[dict], int, int]
-    ],
-] = {
+# Each reader is ``reader(flow_logs, profile, region, since, until, *, sink, ...) -> (fetched,
+# skipped)``; it streams parsed records into ``sink`` (list or FlowLogRecordStream) rather than
+# returning them, so a huge account never accumulates all records in memory (§5.7).
+FLOW_LOG_READERS: dict[str, Callable[..., tuple[int, int]]] = {
     "cloud-watch-logs": _read_cloudwatch_records,
     "s3": _read_s3_records,
 }
