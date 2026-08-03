@@ -16,7 +16,7 @@ import pytest
 from conftest import FIXTURES, load_fixture
 
 from cloudbreachgraph import cli
-from cloudbreachgraph.aws import runner
+from cloudbreachgraph.aws import collectors, runner
 from cloudbreachgraph.output import dot_export, html_export
 
 _COMMAND_FIXTURES = {
@@ -378,6 +378,31 @@ def test_flow_logs_off_by_default(tmp_path):
     assert not types & {"flow_log", "log_group", "log_bucket", "flow_peer"}
     vpc = next(n for n in data["nodes"] if n["id"] == "vpc-0aaaaaaaaaaaaaaaa")
     assert "flow_logs" not in vpc["attributes"]
+
+
+def test_flow_logs_spill_dir_is_honoured(tmp_path):
+    # --spill-dir threads to the record stream; the run builds a graph and leaves no spill behind.
+    out = tmp_path / "out"
+    spill = tmp_path / "spill"
+    spill.mkdir()
+    try:
+        rc = cli.main(
+            [
+                "--from-cache",
+                str(FIXTURES),
+                "--flow-logs",
+                "--spill-dir",
+                str(spill),
+                "--output-dir",
+                str(out),
+            ]
+        )
+        assert rc == 0
+        assert (out / "graph.json").is_file()
+        # The stream is closed after writing outputs — its temp file is cleaned up.
+        assert list(spill.glob("cbg-flowrecords-*")) == []
+    finally:
+        collectors.configure_spill_dir(None)  # don't leak the module knob to other tests
 
 
 def test_flow_logs_flag_adds_history_config_and_connections(tmp_path):

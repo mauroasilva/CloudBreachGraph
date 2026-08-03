@@ -110,6 +110,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="build from previously cached AWS JSON in DIR with no live AWS calls",
     )
     col.add_argument(
+        "--spill-dir",
+        metavar="DIR",
+        help="directory for the flow-log record spill file (a gzip temp file records stream "
+        "through so a huge --flow-logs run maps in bounded memory; default: $TMPDIR). Point it at "
+        "a roomy volume if a large run runs out of temp space",
+    )
+    col.add_argument(
         "--include-orphans",
         action="store_true",
         help="also emit collected resources that no ENI references (subnets, VPCs, EC2, LBs)",
@@ -576,6 +583,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"cloudbreachgraph: {window_error}", file=sys.stderr)
         return 2
     collectors.set_historical_enis(args.flow_logs and args.historical_enis)
+    collectors.configure_spill_dir(args.spill_dir)
 
     if args.optimize_passes < 0:
         print("cloudbreachgraph: --optimize-passes must be >= 0", file=sys.stderr)

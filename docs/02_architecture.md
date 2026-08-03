@@ -436,17 +436,30 @@ records in RAM. Three seams keep peak memory bounded regardless of traffic volum
   buffers a busy group's entire history. Each **page** is a `_run_unit` unit and its records are
   emitted only **after** the page succeeds, so a retried page never double-emits.
 - **Disk-backed record stream.** Both readers stream parsed records into a `FlowLogRecordStream`
-  (`aws/collectors.py`) — one NDJSON line per record on a temp file — instead of accumulating a
-  giant list in the bundle. The mapping layer (`mapping/flowlogs.py`) then re-reads that stream in
-  its **two passes** (unrecognised-ENI inference, then connection mapping), converting each dict to a
+  (`aws/collectors.py`) — one NDJSON line per record on a **gzip-compressed** temp file (flow records
+  are highly repetitive, so this cuts the spill footprint ~5-10x) — instead of accumulating a giant
+  list in the bundle. The mapping layer (`mapping/flowlogs.py`) then re-reads that stream in its
+  **two passes** (unrecognised-ENI inference, then connection mapping), converting each dict to a
   `FlowLogRecord` lazily, so RAM holds only the **bounded** aggregates (per-ENI address-frequency
   counts + per-edge port sets), not the records. Two passes are inherent — the connection pass needs
   the *complete* inventory (including unrecognised ENIs inferred in the first pass) **and** each
   record's timestamp for time-aware peer resolution — so the records must be re-read; spilling them
   to disk (rather than re-downloading, or holding them in RAM) is what bounds memory while preserving
-  the exact mapping semantics. `build_graph` doesn't close the caller-owned stream (so it stays
+  the exact mapping semantics. The stream is **append-only until the first read** (iterating seals
+  the gzip file, then re-reads it). `build_graph` doesn't close the caller-owned stream (so it stays
   reusable); the CLI closes it after writing outputs (`_write_outputs`), freeing the temp file.
   Determinism is unaffected — records are written in read order and the graph sorts its output.
+- **Disk-space guards (the spill trades RAM for disk, so guard the disk).** The spill dir is
+  `$TMPDIR` by default, overridable with `--spill-dir` (`configure_spill_dir`). Two guards make a run
+  that would exceed the volume **fail fast with an actionable message** rather than `ENOSPC`-crash:
+  (1) a **preflight** — once the S3 object listing is in hand (`_read_s3_records` phase 1), the summed
+  in-scope object sizes + a healthy margin (`_SPILL_FREE_MARGIN_BYTES`, plus 15%) are checked against
+  the spill volume's free space *before* any `get-object`; (2) a **per-write** check
+  (`FlowLogRecordStream.extend`) that re-reads free space before each object's/page's write and stops
+  if it's below the margin (catches concurrent disk pressure, and covers CloudWatch, which has no
+  up-front sizes). A raw `OSError`/`ENOSPC` from the writer is caught and re-raised as a
+  `FlowLogFetchError` too, as a last-resort backstop. All three name `--spill-dir` / `--flow-log-days`.
+  `shutil.disk_usage` is stdlib; a stat failure disables the pre-checks (the write backstop remains).
 
 **Cross-account split (config vs. storage).** A VPC Flow Log's **configuration** is an EC2 resource
 that lives in the **same account as the VPCs** it is attached to (the `network` account); only the

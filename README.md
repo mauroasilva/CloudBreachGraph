@@ -389,11 +389,17 @@ Required read-only IAM: **network account** — `ec2:DescribeFlowLogs`, `cloudtr
 
 A flow-log account can hold **millions** of records, so the fetch never keeps them all in RAM: S3
 objects are gunzipped **line by line**, CloudWatch is read in bounded pages (`--max-items` +
-`--starting-token`), and parsed records **stream through a temp file** rather than a giant in-memory
-list. The graph is built from that stream, so peak memory stays bounded (only the per-VPC/per-edge
-aggregates are held) regardless of how much traffic the logs contain. Output is byte-for-byte
-unchanged. (Needs temp-file disk space proportional to the records fetched — set `TMPDIR` to point
-it at a roomy volume for a very large run.)
+`--starting-token`), and parsed records **stream through a gzip-compressed temp file** rather than a
+giant in-memory list. The graph is built from that stream, so peak memory stays bounded (only the
+per-VPC/per-edge aggregates are held) regardless of how much traffic the logs contain. Output is
+byte-for-byte unchanged.
+
+That spill needs disk (far less than RAM, and gzip-compressed — but proportional to the records
+fetched). It defaults to `$TMPDIR`; point it at a roomy volume with **`--spill-dir DIR`** for a very
+large run. The tool guards the disk so a big run **fails fast with an actionable message rather than
+crashing**: it **preflights** the summed flow-log object sizes against the spill volume's free space
+(refusing to start if they won't fit with a healthy margin) and **re-checks free space before every
+write** (stopping cleanly if the volume runs low). Both point you at `--spill-dir`/`--flow-log-days`.
 
 ### Historical ENIs & ASG collapse
 
