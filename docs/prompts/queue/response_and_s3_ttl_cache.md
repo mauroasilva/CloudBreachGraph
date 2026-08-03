@@ -125,12 +125,12 @@ gates access, not content).
   single API call on a re-run — only `download_object` reuses fresh S3 bodies, and `--from-cache`
   is the only read-from-disk path. The new TTL cache is what adds the "reuse on a live re-run"
   behavior; wire it into `run_aws` (and the paginated readers, §E) without breaking the
-  write-only capture dump semantics of `--cache-dir`.
+  write-only capture dump semantics of `--cache-dir`. **(Design fix: §F.)**
 - **`--from-cache` does not serve `s3api get-object`.** `_make_cache_reader` swaps only `run_aws`,
   not `download_object`, so an offline `--from-cache --flow-logs` with **S3** destinations would
   hit the network on every object (today's tests avoid it with empty S3 listings). The unified
   cache should let `download_object` be served from the object cache under `--from-cache` too, so a
-  captured S3-backed flow-log run replays fully offline.
+  captured S3-backed flow-log run replays fully offline. **(Design fix: §F.)**
 
 ## Design guidance
 
@@ -228,6 +228,33 @@ data and/or re-OOM. Two hard requirements:
   A useful litmus test: **a cache hit on a huge `filter-log-events` group must not raise peak RSS
   meaningfully above a cache miss.** At minimum, assert the cache-read path goes through the sink
   (not a whole-file `json.loads`).
+
+### F. Three distinct read/write behaviours — make them coherent (added 2026-08-03)
+
+Today the three "cache" surfaces have subtly different and partly-broken read/write semantics.
+Unify them so a user can reason about one model:
+
+| Mechanism | Reads on a live run? | Writes? | Gap to close |
+|-----------|----------------------|---------|--------------|
+| `--cache-dir` (capture dump) | **No** — `run_aws` always shells out and only *writes* the JSON | yes (write-only) | the value-flag collision (§UPDATE/§B); it saves **zero** API calls today |
+| `--from-cache` (offline replay) | reads for `run_aws` only | no | **does not serve `s3api get-object`** — S3-backed flow logs hit the network |
+| TTL cache (this change) | **yes** — reuse fresh entries, skip the call | yes | new; must honour §B/§E |
+
+Required outcomes:
+
+- **The TTL cache is the only surface that *reads on a live run*.** Wire it into `run_aws` (and the
+  paginated/streaming readers, §E) so a fresh entry short-circuits the AWS call. Leave the
+  `--cache-dir` capture dump write-only (don't make it silently start serving stale data), but base
+  its filenames on the **unified key** so the dump is faithful (no collision).
+- **Make `--from-cache` a *true* offline replay for S3-backed flow logs.** It must serve
+  `download_object` (`s3api get-object`) from the object cache — same `s3://<bucket>/<key>` identity,
+  copy the cached gz body to `dest`, **zero** network — not just `run_aws`. Preserve the
+  no-live-call invariant for `download_object` under `--from-cache` (today it's only enforced for
+  `run_aws`, which is why the offline S3 path silently reaches out).
+- **One cache root, one opt-in, consistent bypass.** `--cache` (TTL), `--no-cache`/`--refresh`
+  (bypass), and the object cache all share the unified root (§A) and the unified key (§B); document
+  how the TTL cache relates to the two capture/replay flags so all three are distinguishable
+  (the README "Caching" section in the DoD).
 
 ## Proposed per-command TTLs (by volatility — adjust with justification)
 | TTL | Commands | Why |
