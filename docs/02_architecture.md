@@ -425,6 +425,29 @@ deterministic. `--verbose` (`runner.set_verbose`, mirroring the `configure_cache
 every `aws` command actually run — including every `get-object`, each retry, and the `aws sso login`
 calls — to **stderr** with a short OK/NOT OK, keeping stdout and the graph files clean.
 
+**Bounded memory (a flow-log account can hold millions of records).** The fetch never holds all
+records in RAM. Three seams keep peak memory bounded regardless of traffic volume:
+
+- **Streaming gunzip.** Each S3 object is downloaded to a temp file and gunzipped **line by line**
+  (`_iter_gz_lines`), so one object is parsed a record at a time — the whole decompressed object is
+  never materialized.
+- **Paged CloudWatch reads.** `logs filter-log-events` is read in bounded pages (`--max-items` +
+  `--starting-token`, `_CLOUDWATCH_PAGE_SIZE = 10000`) rather than one auto-paginated response that
+  buffers a busy group's entire history. Each **page** is a `_run_unit` unit and its records are
+  emitted only **after** the page succeeds, so a retried page never double-emits.
+- **Disk-backed record stream.** Both readers stream parsed records into a `FlowLogRecordStream`
+  (`aws/collectors.py`) — one NDJSON line per record on a temp file — instead of accumulating a
+  giant list in the bundle. The mapping layer (`mapping/flowlogs.py`) then re-reads that stream in
+  its **two passes** (unrecognised-ENI inference, then connection mapping), converting each dict to a
+  `FlowLogRecord` lazily, so RAM holds only the **bounded** aggregates (per-ENI address-frequency
+  counts + per-edge port sets), not the records. Two passes are inherent — the connection pass needs
+  the *complete* inventory (including unrecognised ENIs inferred in the first pass) **and** each
+  record's timestamp for time-aware peer resolution — so the records must be re-read; spilling them
+  to disk (rather than re-downloading, or holding them in RAM) is what bounds memory while preserving
+  the exact mapping semantics. `build_graph` doesn't close the caller-owned stream (so it stays
+  reusable); the CLI closes it after writing outputs (`_write_outputs`), freeing the temp file.
+  Determinism is unaffected — records are written in read order and the graph sorts its output.
+
 **Cross-account split (config vs. storage).** A VPC Flow Log's **configuration** is an EC2 resource
 that lives in the **same account as the VPCs** it is attached to (the `network` account); only the
 delivered log **objects** live in the archive account (the S3 bucket, often a separate log-archive

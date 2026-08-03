@@ -353,7 +353,28 @@ def _build_archive_access(
 # --------------------------------------------------------------------------- #
 # Writing
 # --------------------------------------------------------------------------- #
+def _close_record_source(collected: dict) -> None:
+    """Release the flow-log record source once outputs are written. The live fetch backs it with a
+    disk-backed :class:`~cloudbreachgraph.aws.collectors.FlowLogRecordStream` (a temp file); closing
+    it frees that file. A plain list (``--from-cache``/tests) has no ``close`` and is left alone."""
+    src = collected.get("flow_log_records")
+    close = getattr(src, "close", None)
+    if callable(close):
+        close()
+
+
 def _write_outputs(collected: dict, out_dir: Path, stem: str, args: argparse.Namespace) -> None:
+    try:
+        _write_outputs_inner(collected, out_dir, stem, args)
+    finally:
+        # The bundle's record source is consumed by build_graph above; free its temp file now
+        # (build_graph deliberately doesn't, so the source stays reusable for callers/tests).
+        _close_record_source(collected)
+
+
+def _write_outputs_inner(
+    collected: dict, out_dir: Path, stem: str, args: argparse.Namespace
+) -> None:
     graph = build_graph(
         collected,
         include_orphans=args.include_orphans,

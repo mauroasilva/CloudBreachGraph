@@ -252,7 +252,7 @@ def test_auto_fallback_retries_under_second_profile_on_access_denied(monkeypatch
     # The list was attempted under the primary (denied) and then succeeded under the candidate.
     assert world.profiles_for(("s3api", "list-objects-v2")) == {"net-prof", "arch-prof"}
     assert world.downloads and all(d["profile"] == "arch-prof" for d in world.downloads)
-    assert len(bundle["flow_log_records"]) >= 1
+    assert bundle["flow_log_records"].count >= 1
     # Provenance reflects the resolved archive account, not the primary.
     assert bundle["meta"]["accounts"]["flow_logs"] == "999999999999"
     # Resolution never issues an --expected-bucket-owner probe to discover the owner.

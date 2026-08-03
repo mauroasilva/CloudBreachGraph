@@ -34,7 +34,6 @@ from ..model.resources import (
     Elbv2LoadBalancer,
     Eni,
     FlowLog,
-    FlowLogRecord,
     HistoricalEni,
     IpAllocation,
     NatGateway,
@@ -350,8 +349,12 @@ def build_graph(
     if map_flow_logs:
         flow_log_models = [FlowLog.from_collected(x) for x in collected.get("flow_logs", [])]
         allocations = [IpAllocation.from_collected(x) for x in collected.get("ip_allocations", [])]
-        records = [FlowLogRecord.from_collected(x) for x in collected.get("flow_log_records", [])]
         historical = [HistoricalEni.from_collected(x) for x in collected.get("historical_enis", [])]
+        # The flow records are a re-iterable of raw dicts — a plain list (tests / --from-cache) or a
+        # disk-backed FlowLogRecordStream (live fetch). map_flow_logs iterates it twice, converting
+        # lazily, so the record set is never materialized. build_graph does NOT close the source
+        # (it's caller-owned and may be reused); the CLI closes it after writing (_write_outputs).
+        record_source = collected.get("flow_log_records", [])
         # Merge reconstructed historical ENIs (terminated ASG members, etc.) into the graph as
         # nodes before analysing connections, so a flow's peer can resolve to one of them (§5.7).
         current_eni_ids = {e.id for e in enis if e.id}
@@ -361,7 +364,7 @@ def build_graph(
             enis,
             flow_log_models,
             allocations,
-            records,
+            record_source,
             historical,
             vpcs=list(vpcs.values()),
         )
