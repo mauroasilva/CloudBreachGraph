@@ -15,6 +15,7 @@ collectors — no change to the driver loop, the config grammar, or the CLI.
 from __future__ import annotations
 
 import email.utils
+import errno
 import gzip
 import json as _json
 import os
@@ -1171,13 +1172,33 @@ def _spill_low_space_message(directory: str | None, free: int) -> str:
 
 
 def _spill_error_message(directory: str | None, exc: OSError) -> str:
+    """An actionable message for a spill ``OSError``, **routed by errno** so a missing directory
+    or a permission problem is never mislabelled as "out of space" (they read very differently to a
+    user who has hundreds of GB free)."""
     where = f"'{directory}'" if directory else "the system temp dir ($TMPDIR)"
+    code = getattr(exc, "errno", None)
+    if code == errno.ENOSPC:
+        cause = "out of disk space"
+        fix = (
+            "Point the spill at a roomier disk with --spill-dir DIR (or set TMPDIR), or narrow the "
+            "window with --flow-log-days N / --flow-log-start."
+        )
+    elif code == errno.ENOENT:
+        cause = "the spill directory does not exist"
+        fix = "Create it, or pass an existing writable directory with --spill-dir DIR."
+    elif code in (errno.EACCES, errno.EPERM):
+        cause = "permission denied"
+        fix = "Pass a writable directory with --spill-dir DIR (or set TMPDIR)."
+    elif code in (errno.ENOTDIR, errno.EEXIST):
+        cause = "the spill path is not a usable directory"
+        fix = "Pass a directory (not a file) with --spill-dir DIR."
+    else:
+        cause = "could not write the spill file"
+        fix = "Pass a writable directory with --spill-dir DIR (or set TMPDIR)."
     return (
-        f"aborting flow-log fetch: out of space writing the flow-log record spill file in {where} "
+        f"aborting flow-log fetch: {cause} writing the flow-log record spill file in {where} "
         f"({exc}). Records are buffered to disk (gzip-compressed) so the mapping can re-read them "
-        f"in bounded memory; a very large window can still exceed the volume. Point the spill at a "
-        f"roomier disk with --spill-dir DIR (or set TMPDIR), or narrow the window with "
-        f"--flow-log-days N / --flow-log-start."
+        f"in bounded memory. {fix}"
     )
 
 
@@ -1200,6 +1221,10 @@ class FlowLogRecordStream:
         directory = spill_dir if spill_dir is not None else _spill_dir
         self._dir = directory
         try:
+            if directory is not None:
+                # Create --spill-dir if it doesn't exist (mirrors --cache-dir), so a fresh path like
+                # ``./spill/`` just works instead of failing with a confusing ENOENT.
+                os.makedirs(directory, exist_ok=True)
             fd, self._path = tempfile.mkstemp(
                 prefix="cbg-flowrecords-", suffix=".ndjson.gz", dir=directory
             )

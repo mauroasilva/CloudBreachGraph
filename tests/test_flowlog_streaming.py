@@ -98,11 +98,33 @@ def test_spill_dir_places_file_in_the_configured_directory(tmp_path):
         collectors.configure_spill_dir(None)
 
 
-def test_spill_dir_missing_directory_errors_actionably(tmp_path):
-    missing = tmp_path / "does-not-exist"
+def test_spill_dir_is_created_if_missing(tmp_path):
+    # A fresh --spill-dir path (like ./spill/) is auto-created, not an error (mirrors --cache-dir).
+    missing = tmp_path / "new" / "spill"
+    stream = collectors.FlowLogRecordStream(spill_dir=str(missing))
+    try:
+        assert missing.is_dir()  # created
+        assert os.path.dirname(stream._path) == str(missing)
+    finally:
+        stream.close()
+
+
+def test_spill_dir_that_is_a_file_errors_without_mislabelling_as_out_of_space(tmp_path):
+    not_a_dir = tmp_path / "not-a-dir"
+    not_a_dir.write_text("x")
     with pytest.raises(collectors.FlowLogFetchError) as excinfo:
-        collectors.FlowLogRecordStream(spill_dir=str(missing))
-    assert "--spill-dir" in str(excinfo.value)
+        collectors.FlowLogRecordStream(spill_dir=str(not_a_dir))
+    msg = str(excinfo.value)
+    assert "--spill-dir" in msg
+    assert "space" not in msg.lower()  # NOT the "out of disk space" message — real cause differs
+
+
+def test_enoent_write_error_names_the_missing_directory_not_out_of_space():
+    # An ENOENT (No such file or directory) at write time must read as a missing dir, not ENOSPC —
+    # the exact confusion the user hit (400 GB free, but told "out of space").
+    msg = collectors._spill_error_message("./spill/", OSError(2, "No such file or directory"))
+    assert "does not exist" in msg
+    assert "out of disk space" not in msg and "out of space" not in msg
 
 
 # --------------------------------------------------------------------------- #
