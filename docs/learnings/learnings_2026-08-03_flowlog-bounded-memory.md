@@ -96,6 +96,47 @@ converts lazily), `mapping/builder.py` (pass the raw source, don't pre-materiali
   `FlowLogRecordStream` — the whole existing mapping suite already exercises the streaming path and
   proves output equivalence.
 
+## 5b. Follow-up (same day) — the spill hit `ENOSPC` in production; harden the disk trade-off
+Trading RAM for disk moved the failure mode: a real run crashed with a raw
+`OSError: [Errno 28] No space left on device` from `FlowLogRecordStream.extend`. Fixes, in order of
+how they defend:
+- **Gzip the spill.** The NDJSON temp file is now written through `gzip.open(..., "wt")` and read
+  back via `gzip.open(..., "rt")` (suffix `.ndjson.gz`). Flow records are extremely repetitive, so
+  this cuts the footprint ~5-10x — the single biggest lever for actually fitting on disk. Gzip
+  requires the write stream to be **finalized before reading** (an unterminated stream can raise at
+  EOF), so the stream became **append-only until the first read**: `__iter__` calls `_seal()` (close
+  the write handle) then re-reads. Our lifecycle already writes-all-then-reads-twice, so this is a
+  no-op in practice. Gzip's header carries an mtime → the `.gz` bytes aren't reproducible, but we
+  never hash the spill (only compare decompressed records / the sorted graph), so determinism holds.
+- **Guard 1 — preflight.** `_read_s3_records` now lists+filters **all** sources first (phase 1),
+  sums the in-scope object sizes, and calls `_preflight_spill_space(total, spill_dir)` **before any
+  `get-object`**. If free space < total + margin (`_SPILL_FREE_MARGIN_BYTES` = 128 MiB, or 15%),
+  it raises `FlowLogFetchError` immediately. Summed object size is a conservative proxy for the
+  parsed+gzipped spill (usually smaller). Gated on `isinstance(sink, FlowLogRecordStream)` so the
+  legacy in-RAM list path is unaffected; skipped when the estimate is 0 (no objects / no `Size`
+  metadata — common in fixtures) so it never false-aborts a sizeless run.
+- **Guard 2 — per-write.** `FlowLogRecordStream.extend` re-checks `shutil.disk_usage(...).free`
+  before each batch (one S3 object or one CloudWatch page — a cheap, natural granularity, *not*
+  per-record) and raises if it's below the margin. This catches concurrent disk pressure and covers
+  CloudWatch (no up-front sizes for a preflight).
+- **Backstop.** Any `OSError` from the write is still caught and re-raised as `FlowLogFetchError`
+  with the same actionable message, so even if the heuristics miss, there's never a raw traceback.
+- **`--spill-dir` flag** (+ `configure_spill_dir`, mirroring `configure_cache`) lets ops put the
+  spill on a roomy volume; default stays `$TMPDIR`. All three guards' messages name
+  `--spill-dir` / `--flow-log-days`.
+
+Gotchas:
+- **Don't `disk_usage` per record** — it's a syscall; do it per batch (per `extend`). Millions of
+  per-record stat calls would be a real slowdown.
+- **The margin can false-abort a tiny run on a nearly-full disk** (free < 128 MiB). That's an
+  accepted, documented stance ("disk nearly full → refuse to spill"), and the message points at
+  `--spill-dir`. Tune `_SPILL_FREE_MARGIN_BYTES` if it's too aggressive for an environment.
+- **`shutil.disk_usage` can raise** (missing dir, permissions) → `_free_bytes` returns `None` and the
+  pre-checks no-op; the write backstop still catches a real ENOSPC. A missing `--spill-dir` fails at
+  `mkstemp` with an actionable `FlowLogFetchError`.
+- Sandbox note: this repo's CI/sandbox has ~30 GiB free on `$TMPDIR`, so the 128 MiB margin doesn't
+  trip the flow-log tests; guard tests mock `collectors._free_bytes` to simulate a full disk.
+
 ## 6. Known gaps / TODO
 - `s3api list-objects-v2` and `cloudtrail lookup-events` are still single buffered responses (bounded
   by item count, not streamed). If a bucket's key count or CloudTrail event count ever dominates,
@@ -114,5 +155,8 @@ ruff check . && ruff format --check .
 #  - streaming gunzip parses header+records / no-header default layout / corrupt -> skippable / lazy
 #  - CloudWatch pagination follows NextToken, per-page emit, per-VPC accounting, idempotent retry
 #  - mapping via a stream == mapping via the equivalent list (output unchanged)
+#  - gzip spill round-trip; ENOSPC -> actionable FlowLogFetchError (not a traceback)
+#  - disk guards: preflight aborts before download when objects won't fit; per-write stops on low
+#    space; --spill-dir honoured (unit + tests/test_cli.py::test_flow_logs_spill_dir_is_honoured)
 # The whole tests/test_flowlogs.py suite runs the mapping through a stream (via the flow_bundle fixture).
 ```

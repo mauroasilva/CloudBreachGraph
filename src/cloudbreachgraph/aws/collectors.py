@@ -19,6 +19,7 @@ import gzip
 import json as _json
 import os
 import re
+import shutil
 import socket
 import struct
 import sys
@@ -1088,43 +1089,160 @@ class _FailureTracker:
 # Bounded-memory record sink (§5.7) — a flow-log account can hold millions of records; keeping them
 # all in RAM as dicts (then a second dataclass copy in the mapping layer) OOMs the process. The
 # record fetch therefore **streams** records through this disk-backed sink instead of holding a
-# giant list: each record is one NDJSON line on a temp file, and the mapping layer re-reads the file
-# in its two passes (see mapping/flowlogs.py), so RAM holds only the *bounded* aggregates (per-ENI
-# inference counts + per-edge port sets), never the full record set. Determinism is unaffected —
-# records are written in read order and the graph sorts its output.
+# giant list: each record is one NDJSON line on a temp file (gzip-compressed — flow records are
+# highly repetitive, so this cuts the spill footprint ~5-10x), and the mapping layer re-reads the
+# file in its two passes (see mapping/flowlogs.py), so RAM holds only the *bounded* aggregates
+# (per-ENI inference counts + per-edge port sets), never the full record set. Determinism is
+# unaffected — records are written in read order and the graph sorts its output.
 # --------------------------------------------------------------------------- #
+
+# Where the record spill file is written. ``None`` ⇒ the system temp dir (``$TMPDIR``). Set once by
+# the CLI via :func:`configure_spill_dir` (``--spill-dir``), mirroring the ``configure_cache`` knob,
+# so a very large run can put the spill on a roomier volume than ``/tmp``.
+_spill_dir: str | None = None
+
+
+def configure_spill_dir(path: str | None) -> None:
+    """Set the dir for the flow-log record spill file (``--spill-dir``); ``None`` ⇒ ``$TMPDIR``."""
+    global _spill_dir
+    _spill_dir = path
+
+
+# Never let the spill fill the disk. Two guards keep at least this much free (a healthy margin):
+# (1) a **preflight** — once the S3 object listing is in hand, refuse to start if the summed object
+# sizes + this margin won't fit on the spill volume; (2) a **per-write** check before each object's/
+# page's write. Both stop cleanly (``FlowLogFetchError``) *before* ``ENOSPC``; the OSError handler
+# in the writer is only the last-resort backstop. ``shutil.disk_usage`` is stdlib; a stat failure
+# disables the check (best-effort — the write handler still catches a real ENOSPC).
+_SPILL_FREE_MARGIN_BYTES = 128 * 1024 * 1024  # 128 MiB
+
+
+def _free_bytes(directory: str) -> int | None:
+    """Free bytes on the volume backing ``directory``, or ``None`` if it can't be determined."""
+    try:
+        return shutil.disk_usage(directory).free
+    except OSError:
+        return None
+
+
+def _human_bytes(n: int) -> str:
+    size = float(n)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if size < 1024:
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TiB"
+
+
+def _spill_target_dir(directory: str | None) -> str:
+    return directory or tempfile.gettempdir()
+
+
+def _preflight_spill_space(estimated_bytes: int, directory: str | None) -> None:
+    """Fail *before any download* if the spill volume can't hold the in-scope objects + a healthy
+    margin (``§5.7`` disk-space guard 1). ``estimated_bytes`` is the summed in-scope object size —
+    a conservative proxy for the parsed+gzipped spill (which is usually smaller). A zero estimate
+    (nothing to fetch, or no size metadata) skips the check; the per-write guard is the backstop."""
+    if estimated_bytes <= 0:
+        return
+    where = _spill_target_dir(directory)
+    free = _free_bytes(where)
+    if free is None:
+        return
+    needed = estimated_bytes + max(_SPILL_FREE_MARGIN_BYTES, int(estimated_bytes * 0.15))
+    if free < needed:
+        raise FlowLogFetchError(
+            f"aborting flow-log fetch before download: the record-spill volume ('{where}') has "
+            f"{_human_bytes(free)} free but this run needs ~{_human_bytes(needed)} "
+            f"({_human_bytes(estimated_bytes)} of in-scope flow-log objects + a safety margin). "
+            f"Point the spill at a roomier disk with --spill-dir DIR (or set TMPDIR), or narrow "
+            f"the window with --flow-log-days N / --flow-log-start."
+        )
+
+
+def _spill_low_space_message(directory: str | None, free: int) -> str:
+    where = f"'{directory}'" if directory else "the system temp dir ($TMPDIR)"
+    return (
+        f"aborting flow-log fetch: the record-spill volume {where} is down to {_human_bytes(free)} "
+        f"free (below the {_human_bytes(_SPILL_FREE_MARGIN_BYTES)} margin) — stopping before "
+        f"it fills. Point the spill at a roomier disk with --spill-dir DIR (or set TMPDIR), or "
+        f"narrow the window with --flow-log-days N / --flow-log-start."
+    )
+
+
+def _spill_error_message(directory: str | None, exc: OSError) -> str:
+    where = f"'{directory}'" if directory else "the system temp dir ($TMPDIR)"
+    return (
+        f"aborting flow-log fetch: out of space writing the flow-log record spill file in {where} "
+        f"({exc}). Records are buffered to disk (gzip-compressed) so the mapping can re-read them "
+        f"in bounded memory; a very large window can still exceed the volume. Point the spill at a "
+        f"roomier disk with --spill-dir DIR (or set TMPDIR), or narrow the window with "
+        f"--flow-log-days N / --flow-log-start."
+    )
+
+
 class FlowLogRecordStream:
     """A re-iterable, disk-backed sequence of flow-log record dicts (bounded RAM, §5.7).
 
     Duck-types the ``list`` interface the readers use (``.extend(iterable)``), but spills each
-    record to a temp NDJSON file instead of holding it in memory. Iterating re-reads the file (so
-    the two mapping passes both work), and :meth:`close` (also called from ``__del__`` as a safety
-    net)
-    deletes the file. ``count`` is the number of records written (for the diagnostic), without
-    materializing them."""
+    record to a **gzip-compressed** temp NDJSON file instead of holding it in memory. It is
+    **append-only until the first read**: iterating :meth:`_seal`\\ s the file (finalizing the gzip
+    stream) and re-reads it, so the two mapping passes both work but no further ``extend`` is
+    allowed once iteration begins (matches the fetch-then-map lifecycle). :meth:`close` (also called
+    from ``__del__`` as a safety net) deletes the file. ``count`` is the number of records written,
+    tracked without materializing them.
 
-    def __init__(self) -> None:
-        fd, self._path = tempfile.mkstemp(prefix="cbg-flowrecords-", suffix=".ndjson")
-        self._fh: Any = os.fdopen(fd, "w", encoding="utf-8")
+    Out-of-space (``ENOSPC``) or any other write ``OSError`` is turned into a
+    :class:`FlowLogFetchError` with an actionable message (``--spill-dir``/window guidance) rather
+    than crashing the run with a raw traceback."""
+
+    def __init__(self, spill_dir: str | None = None) -> None:
+        directory = spill_dir if spill_dir is not None else _spill_dir
+        self._dir = directory
+        try:
+            fd, self._path = tempfile.mkstemp(
+                prefix="cbg-flowrecords-", suffix=".ndjson.gz", dir=directory
+            )
+            os.close(fd)
+            self._fh: Any = gzip.open(self._path, "wt", encoding="utf-8")
+        except OSError as exc:
+            raise FlowLogFetchError(_spill_error_message(directory, exc)) from exc
         self._count = 0
 
     def extend(self, records: Any) -> None:
-        """Append records (any iterable of JSON-serializable dicts) — one NDJSON line each."""
-        if self._fh is None:
-            raise RuntimeError("cannot extend a closed FlowLogRecordStream")
-        write = self._fh.write
+        """Append records (any iterable of JSON-serializable dicts) — one NDJSON line each.
+
+        Guard 2 of the disk-space defence (``§5.7``): before writing this batch (one S3 object's or
+        one CloudWatch page's records) check the spill volume still has the safety margin free, and
+        stop cleanly *before* an ``ENOSPC`` if not. The ``OSError`` handler remains as a last-resort
+        backstop."""
+        fh = self._fh
+        if fh is None:
+            raise RuntimeError("cannot extend a sealed/closed FlowLogRecordStream")
+        free = _free_bytes(_spill_target_dir(self._dir))
+        if free is not None and free < _SPILL_FREE_MARGIN_BYTES:
+            raise FlowLogFetchError(_spill_low_space_message(self._dir, free))
         dumps = _json.dumps
-        n = 0
-        for rec in records:
-            write(dumps(rec, separators=(",", ":")))
-            write("\n")
-            n += 1
-        self._count += n
+        try:
+            for rec in records:
+                fh.write(dumps(rec, separators=(",", ":")))
+                fh.write("\n")
+                self._count += 1
+        except OSError as exc:
+            raise FlowLogFetchError(_spill_error_message(self._dir, exc)) from exc
+
+    def _seal(self) -> None:
+        """Finalize the gzip write stream so the file reads cleanly (idempotent)."""
+        fh, self._fh = self._fh, None
+        if fh is not None:
+            try:
+                fh.close()
+            except OSError as exc:
+                raise FlowLogFetchError(_spill_error_message(self._dir, exc)) from exc
 
     def __iter__(self):
-        if self._fh is not None:
-            self._fh.flush()
-        with open(self._path, encoding="utf-8") as fh:
+        self._seal()  # append-only until first read: finalize, then re-read the gzipped NDJSON
+        with gzip.open(self._path, "rt", encoding="utf-8") as fh:
             for line in fh:
                 line = line.strip()
                 if line:
@@ -1135,19 +1253,24 @@ class FlowLogRecordStream:
         return self._count
 
     def close(self) -> None:
-        """Close the write handle and delete the temp file (idempotent, best-effort)."""
-        if self._fh is not None:
+        """Close the write handle and delete the temp file (idempotent, best-effort — never raises,
+        so it's safe on the ENOSPC abort path and in ``__del__``)."""
+        fh, self._fh = self._fh, None
+        if fh is not None:
             try:
-                self._fh.close()
-            finally:
-                self._fh = None
+                fh.close()
+            except OSError:
+                pass
         try:
             os.unlink(self._path)
         except OSError:
             pass
 
     def __del__(self) -> None:  # safety net if an error path skips close()
-        self.close()
+        try:
+            self.close()
+        except Exception:  # noqa: BLE001 — never raise from a finalizer
+            pass
 
 
 # --------------------------------------------------------------------------- #
@@ -1658,10 +1781,10 @@ def _read_s3_records(
         if bp is not None:
             sources.setdefault(bp, None)
 
-    objects_read = 0
-    emitted = 0  # records streamed into the sink across all sources (for the all-empty fast-fail)
-    tracker = _FailureTracker("s3")
-    empty_sources: list[str] = []  # sources abandoned as all-NODATA (largest objects parse nothing)
+    # Phase 1 — list + filter every source up front (this also resolves the archive account, since
+    # the list *is* the access probe). Knowing the full in-scope object set + sizes lets us
+    # preflight the spill disk BEFORE downloading anything.
+    listed: list[tuple[str, str, str | None, str | None, list[tuple[str, int]]]] = []
     for bucket, prefix in sorted(sources):
         iam = f"s3:ListBucket and s3:GetObject on bucket '{bucket}'"
         if resolver is not None:
@@ -1684,6 +1807,21 @@ def _read_s3_records(
         objects = _filter_objects_in_scope(
             objects_outcome.value, allowed_fl_ids, network_account_id
         )
+        listed.append((bucket, prefix, get_profile, get_region, objects))
+
+    # Disk-space guard 1 (§5.7): refuse to start if the spill volume can't hold the in-scope objects
+    # + a healthy margin. Only meaningful for the disk-backed sink (the legacy list sink is in-RAM).
+    if isinstance(sink, FlowLogRecordStream):
+        total_bytes = sum(size for _, _, _, _, objs in listed for _, size in objs)
+        _preflight_spill_space(total_bytes, getattr(sink, "_dir", None))
+
+    # Phase 2 — read each source largest-first with the NODATA fast-fail / tail-trim.
+    objects_read = 0
+    emitted = 0  # records streamed into the sink across all sources (for the all-empty fast-fail)
+    tracker = _FailureTracker("s3")
+    empty_sources: list[str] = []  # sources abandoned as all-NODATA (largest objects parse nothing)
+    for bucket, prefix, get_profile, get_region, objects in listed:
+        iam = f"s3:ListBucket and s3:GetObject on bucket '{bucket}'"
         total = len(objects)
         largest = max((size for _, size in objects), default=0)
         order = _size_descending_keys(objects)

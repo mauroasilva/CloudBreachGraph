@@ -11,6 +11,7 @@ from __future__ import annotations
 import gzip
 import os
 import time
+from datetime import UTC, datetime
 
 import pytest
 
@@ -50,10 +51,131 @@ def test_record_stream_roundtrips_reiterates_counts_and_closes():
     assert first[1]["SrcAddr"] is None and first[1]["DstPort"] is None
 
     path = stream._path
+    assert path.endswith(".ndjson.gz")  # the spill is gzip-compressed
     assert os.path.exists(path)
     stream.close()
     assert not os.path.exists(path)  # close() deletes the temp file
     stream.close()  # idempotent — no raise
+
+
+class _BoomFH:
+    """A write handle whose every write fails as if the disk were full."""
+
+    def write(self, *_a):
+        raise OSError(28, "No space left on device")
+
+    def close(self):  # close must never raise (ENOSPC-abort path)
+        pass
+
+
+def test_spill_out_of_space_raises_actionable_error():
+    stream = collectors.FlowLogRecordStream()
+    stream._fh = _BoomFH()  # simulate ENOSPC on the next write
+    try:
+        with pytest.raises(collectors.FlowLogFetchError) as excinfo:
+            stream.extend([{"InterfaceId": "eni-1", "SrcAddr": "10.0.0.1"}])
+        msg = str(excinfo.value)
+        assert "space" in msg.lower()  # names the out-of-space cause
+        assert "--spill-dir" in msg and "--flow-log-days" in msg  # actionable guidance
+    finally:
+        stream.close()
+
+
+def test_spill_dir_places_file_in_the_configured_directory(tmp_path):
+    # Explicit constructor arg…
+    s1 = collectors.FlowLogRecordStream(spill_dir=str(tmp_path))
+    try:
+        assert os.path.dirname(s1._path) == str(tmp_path)
+    finally:
+        s1.close()
+    # …and the module knob the CLI sets from --spill-dir.
+    collectors.configure_spill_dir(str(tmp_path))
+    try:
+        s2 = collectors.FlowLogRecordStream()
+        assert os.path.dirname(s2._path) == str(tmp_path)
+        s2.close()
+    finally:
+        collectors.configure_spill_dir(None)
+
+
+def test_spill_dir_missing_directory_errors_actionably(tmp_path):
+    missing = tmp_path / "does-not-exist"
+    with pytest.raises(collectors.FlowLogFetchError) as excinfo:
+        collectors.FlowLogRecordStream(spill_dir=str(missing))
+    assert "--spill-dir" in str(excinfo.value)
+
+
+# --------------------------------------------------------------------------- #
+# Disk-space guards — stop cleanly BEFORE ENOSPC, never crash with a traceback
+# --------------------------------------------------------------------------- #
+def test_per_write_guard_stops_when_free_space_below_margin(monkeypatch):
+    # Guard 2: free space below the safety margin at the start of a write -> clean abort, no write.
+    monkeypatch.setattr(
+        collectors, "_free_bytes", lambda _d: collectors._SPILL_FREE_MARGIN_BYTES - 1
+    )
+    stream = collectors.FlowLogRecordStream()
+    try:
+        with pytest.raises(collectors.FlowLogFetchError) as excinfo:
+            stream.extend([{"InterfaceId": "eni-1", "SrcAddr": "10.0.0.1"}])
+        assert "margin" in str(excinfo.value) and "--spill-dir" in str(excinfo.value)
+        assert stream.count == 0  # nothing was written
+    finally:
+        stream.close()
+
+
+def test_preflight_aborts_before_download_when_objects_wont_fit(monkeypatch):
+    # Guard 1: the summed in-scope object sizes + margin exceed free space -> abort BEFORE any
+    # get-object. A huge listing (sizes in the GiBs) against a tiny free volume.
+    recent = datetime.now(UTC).isoformat()
+
+    def _run(args, *, profile=None, region=None, cache_dir=None):
+        assert tuple(args[:2]) == ("s3api", "list-objects-v2")  # listing only; no get here
+        return {
+            "Contents": [
+                {"Key": _obj_key(i), "LastModified": recent, "Size": 2**30}  # 1 GiB each
+                for i in range(8)  # ~8 GiB of in-scope objects
+            ]
+        }
+
+    downloads = {"n": 0}
+
+    def _download(args, dest, *, profile=None, region=None):
+        downloads["n"] += 1
+        return dest
+
+    monkeypatch.setattr(runner, "run_aws", _run)
+    monkeypatch.setattr(runner, "download_object", _download)
+    monkeypatch.setattr(
+        collectors, "_free_bytes", lambda _d: 100 * 1024 * 1024
+    )  # only 100 MiB free
+
+    stream = collectors.FlowLogRecordStream()
+    flow_logs = [_fl_s3_cfg("fl-0000000000000a53", "vpc-1", "bucket-a")]
+    try:
+        with pytest.raises(collectors.FlowLogFetchError) as excinfo:
+            collectors._read_s3_records(flow_logs, "prod", "us-east-1", 0.0, None, sink=stream)
+    finally:
+        stream.close()
+    msg = str(excinfo.value)
+    assert "before download" in msg and "--spill-dir" in msg
+    assert downloads["n"] == 0  # nothing was fetched — failed on the preflight
+
+
+def _fl_s3_cfg(fl_id: str, resource_id: str, bucket: str) -> dict:
+    return {
+        "FlowLogId": fl_id,
+        "ResourceId": resource_id,
+        "LogDestinationType": "s3",
+        "LogDestination": f"arn:aws:s3:::{bucket}/AWSLogs/",
+        "LogFormat": None,
+    }
+
+
+def _obj_key(n: int) -> str:
+    return (
+        f"AWSLogs/111111111111/vpcflowlogs/us-east-1/2026/08/01/"
+        f"111111111111_vpcflowlogs_us-east-1_fl-0000000000000a53_20260801T00{n:02d}Z_h.log.gz"
+    )
 
 
 def test_record_stream_mapping_matches_a_plain_list():
