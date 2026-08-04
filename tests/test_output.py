@@ -178,6 +178,21 @@ def test_write_dot_marks_synthetic_dashed(tmp_path):
     assert 'style="filled,dashed"' in text  # synthetic subnet / vpc rendered dashed
 
 
+def test_dot_label_never_exceeds_graphviz_quoted_string_limit(tmp_path):
+    # A pathologically long edge label (the real-world symptom: a connects_to edge with thousands of
+    # ports) must be truncated so `dot` can still parse the file (16384-char quoted-string limit).
+    huge = "x" * 40000
+    assert len(dot_export._label([huge])) <= dot_export._MAX_DOT_LABEL + 1  # +the ellipsis
+
+    g = Graph(meta={})
+    g.add_node(Node(id="a", type="eni", label="a"))
+    g.add_node(Node(id="b", type="eni", label="b"))
+    g.add_edge(Edge(source="a", target="b", relationship="connects_to", attributes={"ports": huge}))
+    text = dot_export.write_dot(g, tmp_path / "g.dot").read_text()
+    # No quoted string in the emitted DOT is anywhere near Graphviz's limit.
+    assert max(len(part) for part in text.split('"')) < 16384
+
+
 # --------------------------------------------------------------------------- #
 # HTML
 # --------------------------------------------------------------------------- #

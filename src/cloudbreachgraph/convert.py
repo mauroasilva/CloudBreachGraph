@@ -38,6 +38,7 @@ from pathlib import Path
 from . import __version__
 from .graph_io import GraphLoadError, load_graph
 from .mapping.collapse import collapse_autoscaling_groups, collapse_security_groups
+from .mapping.flowlogs import bound_connects_to_port_labels
 from .model.graph import Graph
 from .output import dot_export, html_export
 
@@ -159,6 +160,11 @@ def main(argv: list[str] | None = None) -> int:
     except GraphLoadError as exc:
         print(f"cloudbreachgraph-to-html: {exc}", file=sys.stderr)
         return 2
+
+    # Re-bound flow-log connects_to port labels (§5.7): a graph written by an older run can carry an
+    # unbounded port list that overflows Graphviz's quoted-string limit on the .dot fallback and
+    # clutters the HTML. Idempotent — a graph built by the current tool is already bounded.
+    bound_connects_to_port_labels(graph)
 
     if not args.security_groups:
         # Collapse the SG layer of the loaded graph (a view transform; can only remove SG nodes).

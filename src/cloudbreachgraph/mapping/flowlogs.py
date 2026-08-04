@@ -38,6 +38,13 @@ from ..model.resources import Eni, FlowLog, FlowLogRecord, HistoricalEni, IpAllo
 # Protocol numbers we bother to name in a port label; anything else keeps its number.
 _PROTO_NAMES = {"1": "icmp", "6": "tcp", "17": "udp", "58": "icmpv6"}
 
+# How many distinct ports a single ``connects_to`` edge lists before it collapses to a range. A busy
+# pair (e.g. a peer that fans out over thousands of ephemeral ports) would otherwise produce an
+# unreadable label — and one that overflows Graphviz's 16 KB quoted-string limit, so `dot` can't
+# render the .dot at all. Above this count the ports are aggregated to a ``<proto>/<min>-<max>``
+# range per protocol.
+_MAX_PORTS_IN_LABEL = 10
+
 
 def _port_label(protocol: str | None, port: int | None) -> str:
     """A short ``tcp/443``-style label for a flow's protocol/port (mirrors reachability ports)."""
@@ -48,6 +55,54 @@ def _port_label(protocol: str | None, port: int | None) -> str:
     if port is None:
         return proto
     return f"{proto}/{port}"
+
+
+def _ports_label(ports: set[str]) -> str:
+    """A bounded, deterministic ``ports`` label for a ``connects_to`` edge (§5.7).
+
+    Ten or fewer distinct ports are listed (sorted). More than :data:`_MAX_PORTS_IN_LABEL` — a busy
+    pair fanning out over many ephemeral ports — collapse to a ``<proto>/<min>-<max>`` range **per
+    protocol**, so the label stays short and never overflows Graphviz's quoted-string limit (an
+    unbounded list broke ``dot`` on real captures). Protocol is kept because ``tcp/443`` and
+    ``udp/443`` differ materially in a reachability graph. Port-less labels (``all``, ``icmp``) pass
+    through as-is."""
+    ordered = sorted(ports)
+    if len(ordered) <= _MAX_PORTS_IN_LABEL:
+        return ", ".join(ordered)
+    by_proto: dict[str, list[int]] = {}
+    portless: set[str] = set()
+    for label in ordered:
+        proto, sep, port = label.partition("/")
+        if sep and port.isdigit():
+            by_proto.setdefault(proto, []).append(int(port))
+        else:
+            portless.add(label)  # "all", "icmp", a bare protocol — no numeric port to range
+    parts: list[str] = []
+    for proto in sorted(by_proto):
+        nums = by_proto[proto]
+        lo, hi = min(nums), max(nums)
+        parts.append(f"{proto}/{lo}-{hi}" if lo != hi else f"{proto}/{lo}")
+    parts.extend(sorted(portless))
+    return ", ".join(parts)
+
+
+def bound_connects_to_port_labels(graph: Graph) -> None:
+    """Re-aggregate the ``ports`` label on every ``connects_to`` edge of ``graph`` (§5.7).
+
+    The build path already bounds these labels (:func:`_ports_label` in :func:`_map_connections`),
+    but ``cloudbreachgraph-to-html`` loads a graph a *previous* run wrote — possibly before that
+    bound existed — whose ``connects_to`` edges can still carry an unbounded, comma-joined port
+    list that overflows Graphviz's quoted-string limit and clutters the HTML. This splits each
+    stored label back into port tokens and re-applies :func:`_ports_label`, so the range aggregation
+    reaches the convert tool too. Idempotent: an already-ranged (or ≤10-port) label is unchanged."""
+    for edge in graph.edges:
+        if edge.relationship != "connects_to":
+            continue
+        ports = edge.attributes.get("ports")
+        if not ports:
+            continue
+        tokens = {tok.strip() for tok in str(ports).split(",") if tok.strip()}
+        edge.attributes["ports"] = _ports_label(tokens)
 
 
 def _epoch(iso: str | None) -> int | None:
@@ -504,7 +559,7 @@ def _map_connections(graph: Graph, records: Iterable[dict], inventory: _Inventor
         )
 
     for src, tgt in sorted(agg):
-        ports = ", ".join(sorted(agg[(src, tgt)]["ports"]))
+        ports = _ports_label(agg[(src, tgt)]["ports"])
         graph.add_edge(
             Edge(
                 source=src,
