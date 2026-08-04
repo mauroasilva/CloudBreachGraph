@@ -188,6 +188,35 @@ def test_convert_json_matches_direct_pipeline(graph, tmp_path):
     assert (tmp_path / "converted.html").read_text() == direct
 
 
+def test_convert_bounds_unbounded_connects_to_port_labels(tmp_path, monkeypatch):
+    # HTML omits port labels, so they only surface in cloudbreachgraph-to-html's .dot fallback —
+    # which is exactly where an unbounded connects_to list overflows Graphviz's quoted-string limit.
+    # A graph.json from an older run must be re-aggregated to a range there too (§5.7).
+    from cloudbreachgraph.model.graph import Edge, Graph, Node
+
+    monkeypatch.setattr(html_export, "MAX_NODES", 0)  # force the .dot fallback
+
+    g = Graph(meta={})
+    g.add_node(Node(id="eni-a", type="eni", label="eni-a"))
+    g.add_node(Node(id="eni-b", type="eni", label="eni-b"))
+    unbounded = ", ".join(sorted(f"tcp/{p}" for p in range(500)))
+    g.add_edge(
+        Edge(
+            source="eni-a",
+            target="eni-b",
+            relationship="connects_to",
+            attributes={"ports": unbounded, "via": "flow_log"},
+        )
+    )
+    jp = json_export.write_json(g, tmp_path / "graph.json")
+    rc = convert.main([str(jp), "-o", str(tmp_path / "out.html")])
+    assert rc == 0
+    dot = (tmp_path / "out.dot").read_text()
+    assert "tcp/0-499" in dot  # aggregated range in the DOT
+    assert "tcp/250" not in dot  # not the full per-port list
+    assert max(len(part) for part in dot.split('"')) < 16384  # no over-long quoted string
+
+
 # --------------------------------------------------------------------------- #
 # --no-security-groups: collapse the SG layer of a loaded (shown) graph
 # --------------------------------------------------------------------------- #

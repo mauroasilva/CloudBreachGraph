@@ -373,7 +373,16 @@ into the already-built graph:
      it has held the IP throughout) is treated as valid.
    - otherwise the peer is an external **`flow_peer`** node (`flow-peer:<ip>`).
    Ports are aggregated per directed edge into a `ports` label (e.g. `tcp/443`), with
-   `via = "flow_log"` so a `connects_to` edge is distinguishable from a reachability edge. Records
+   `via = "flow_log"` so a `connects_to` edge is distinguishable from a reachability edge. The label
+   is **bounded** (`_MAX_PORTS_IN_LABEL = 10`, `mapping/flowlogs.py::_ports_label`): 10 or fewer
+   distinct ports are listed; a busy pair that fans out over many ephemeral ports collapses to a
+   `<proto>/<min>-<max>` range **per protocol** (e.g. `tcp/1400-13377`) instead of every port —
+   protocol is kept because `tcp/443` and `udp/443` differ. An unbounded label is both unreadable
+   and overflows Graphviz's 16 KB quoted-string limit, which makes the `.dot` unrenderable
+   (`dot_export._label` also truncates any over-long label as a defensive backstop). The same bound
+   is re-applied to a loaded graph by `cloudbreachgraph-to-html`
+   (`mapping/flowlogs.py::bound_connects_to_port_labels`), so a graph written by an older run renders
+   too. Records
    with a missing address (`-`, e.g. NODATA/skipped) are dropped; the record's own `interface-id`
    (field 2) identifies the home ENI, and direction is decided by matching `srcaddr`/`dstaddr`
    against that ENI's *current* private IPs (so a record whose home-side address the ENI no longer

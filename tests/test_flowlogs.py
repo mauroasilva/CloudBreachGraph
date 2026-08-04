@@ -167,6 +167,52 @@ def test_eni_to_eni_edge_when_peer_ip_is_another_eni(flow_bundle):
     assert ("eni-00nlb00000000003", "eni-00instance0000001") in connects
 
 
+def test_ports_label_aggregates_a_busy_edge_to_a_range():
+    # A pair that fans out over thousands of ports collapses to <proto>/<min>-<max> so the label
+    # stays short (an unbounded list overflows Graphviz's quoted-string limit and breaks `dot`).
+    from cloudbreachgraph.mapping import flowlogs
+
+    # 10 or fewer distinct ports are listed verbatim (sorted).
+    assert flowlogs._ports_label({"tcp/443"}) == "tcp/443"
+    assert flowlogs._ports_label({"tcp/443", "tcp/22"}) == "tcp/22, tcp/443"
+
+    # More than 10 -> a per-protocol min-max range.
+    busy = {f"tcp/{p}" for p in range(2000)}  # ports 0..1999
+    assert flowlogs._ports_label(busy) == "tcp/0-1999"
+
+    # Protocol is preserved: tcp and udp range separately; port-less labels pass through.
+    mixed = {f"tcp/{p}" for p in range(20)} | {"udp/53", "udp/500", "all"}
+    assert flowlogs._ports_label(mixed) == "tcp/0-19, udp/53-500, all"
+
+
+def test_bound_connects_to_port_labels_rebounds_a_loaded_graph():
+    # cloudbreachgraph-to-html loads a graph a previous run wrote; an unbounded connects_to port
+    # list must be re-aggregated (idempotently) so the convert tool renders too.
+    from cloudbreachgraph.mapping import flowlogs
+    from cloudbreachgraph.model.graph import Edge, Graph, Node
+
+    g = Graph(meta={})
+    g.add_node(Node(id="a", type="eni", label="a"))
+    g.add_node(Node(id="b", type="eni", label="b"))
+    unbounded = ", ".join(sorted(f"tcp/{p}" for p in range(500)))
+    g.add_edge(
+        Edge(source="a", target="b", relationship="connects_to", attributes={"ports": unbounded})
+    )
+    g.add_edge(
+        Edge(source="a", target="b", relationship="secured_by", attributes={"ports": unbounded})
+    )
+
+    flowlogs.bound_connects_to_port_labels(g)
+    connects = next(e for e in g.edges if e.relationship == "connects_to")
+    assert connects.attributes["ports"] == "tcp/0-499"
+    # Non-connects_to edges are untouched.
+    secured = next(e for e in g.edges if e.relationship == "secured_by")
+    assert secured.attributes["ports"] == unbounded
+    # Idempotent — a second pass leaves the already-bounded range unchanged.
+    flowlogs.bound_connects_to_port_labels(g)
+    assert connects.attributes["ports"] == "tcp/0-499"
+
+
 def test_external_peer_becomes_flow_peer_node(flow_bundle):
     graph = build_graph(flow_bundle, map_flow_logs=True)
     peer = graph.get_node("flow-peer:203.0.113.5")

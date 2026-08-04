@@ -62,9 +62,21 @@ def _esc(value: object) -> str:
     return str(value).replace("\\", "\\\\").replace('"', '\\"')
 
 
+# Graphviz refuses a quoted string longer than 16384 chars ("missing endquote?"). We stay safely
+# under it and truncate any pathological label — a backstop; the real bound is the per-edge port cap
+# in mapping/flowlogs.py (``_ports_label``). Without this, one busy edge makes the whole .dot
+# unparseable by `dot`.
+_MAX_DOT_LABEL = 16000
+
+
 def _label(lines: list[str]) -> str:
-    """Join label lines with a DOT line break (``\\n``), each line escaped."""
-    return "\\n".join(_esc(line) for line in lines if line not in (None, ""))
+    """Join label lines with a DOT line break (``\\n``), each line escaped, and cap the result under
+    Graphviz's 16 KB quoted-string limit so no single label can make the ``.dot`` unparseable."""
+    joined = "\\n".join(_esc(line) for line in lines if line not in (None, ""))
+    if len(joined) > _MAX_DOT_LABEL:
+        # Trim a trailing lone backslash so we never leave a dangling escape inside the quotes.
+        joined = joined[:_MAX_DOT_LABEL].rstrip("\\") + "…"
+    return joined
 
 
 def _cluster_id(vpc_id: str) -> str:
